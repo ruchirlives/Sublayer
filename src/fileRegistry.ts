@@ -152,6 +152,12 @@ export type MaterialBindingRule = {
   strength: "strongerThanDescendants" | "weakerThanDescendants";
 };
 
+export type TransformTargetRule = {
+  id: string;
+  enabled: boolean;
+  pattern: string;
+};
+
 export type LightOverride = {
   id: string;
   lightPath: string;
@@ -254,6 +260,21 @@ export type HairSettings = {
   width: number;
   taper: number;
   rootScale: number;
+  simEnabled: boolean;
+  simMode: "static" | "animated";
+  settleSteps: number;
+  colliderQuery: string;
+  startFrame: number;
+  endFrame: number;
+  substeps: number;
+  iterations: number;
+  stiffness: number;
+  bendStiffness: number;
+  damping: number;
+  gravity: number;
+  wind: [number, number, number];
+  collisionMargin: number;
+  friction: number;
 };
 
 export const defaultHairSettings: HairSettings = {
@@ -262,6 +283,21 @@ export const defaultHairSettings: HairSettings = {
   width: 1.0,
   taper: 0.0,
   rootScale: 1.0,
+  simEnabled: false,
+  simMode: "static",
+  settleSteps: 24,
+  colliderQuery: "__none__",
+  startFrame: 1,
+  endFrame: 48,
+  substeps: 4,
+  iterations: 8,
+  stiffness: 0.95,
+  bendStiffness: 0.4,
+  damping: 0.04,
+  gravity: 9.81,
+  wind: [0, 0, 0],
+  collisionMargin: 0.005,
+  friction: 0.25,
 };
 
 export type Data = {
@@ -272,6 +308,7 @@ export type Data = {
   materialX?:MaterialXSettings;
   materialXRules?:MaterialXRule[];
   materialBindings?: MaterialBindingRule[];
+  transformTargets?: TransformTargetRule[];
   lightOverrides?: LightOverride[];
   hdri?: HdriSettings;
   hair?: HairSettings;
@@ -771,7 +808,10 @@ export function graphPreview(
       blenderMaterialMode: n.data.blenderMaterialMode,
       blenderConvertProcedurals: Boolean(n.data.blenderConvertProcedurals),
       instanced: Boolean(n.data.instanced),
+      axis: n.data.axis || "preserve",
+      scale: typeof n.data.scale === "number" && n.data.scale > 0 ? n.data.scale : 1,
       transform: n.data.transform || identityTransform,
+      ...(n.data.operation==="transform" && n.data.transformTargets?.length ? {transformTargets: n.data.transformTargets} : {}),
       ...(n.data.operation==="delete" ? {deletePaths:n.data.deletePaths || []}:{}),
       ...(n.data.operation==="material_bind" ? {materialBindings:n.data.materialBindings || []}:{}),
       ...(n.data.operation==="light" ? {lightOverrides:n.data.lightOverrides || []}:{}),

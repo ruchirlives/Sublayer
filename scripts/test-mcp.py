@@ -23,7 +23,7 @@ try:
  invalid=json.loads(json.dumps(project));invalid['edges'].append({'id':'cycle','source':'output','target':'source'})
  call('project_validate',{'project':invalid},True)
  with tempfile.TemporaryDirectory(prefix='orchflow-mcp-') as folder:
-  path=str(pathlib.Path(folder)/'test.orchflow');saved=call('project_save',{'path':path,'project':project});loaded=call('project_load',{'path':path});assert loaded['revision']==saved['revision']
+  path=str(pathlib.Path(folder)/'test.sublayer');saved=call('project_save',{'path':path,'project':project});loaded=call('project_load',{'path':path});assert loaded['revision']==saved['revision']
   call('project_save',{'path':path,'project':project},True)
   call('project_save',{'path':path,'project':project,'expectedRevision':loaded['revision']})
  caps=call('usd_capabilities');assert caps['viewport'],caps

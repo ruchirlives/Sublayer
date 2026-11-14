@@ -111,6 +111,58 @@ def inherit_stage_metrics(stage, upstream):
         getattr(stage,setter)(getattr(upstream,getter)())
 
 
+def _build_transform_matrix(transform):
+    import math
+    from pxr import Gf, Usd, UsdGeom
+    transform = transform or {}
+    values = {}
+    for field, default in [('translation', [0, 0, 0]), ('rotation', [0, 0, 0]), ('scale', [1, 1, 1])]:
+        value = transform.get(field, default)
+        if not isinstance(value, list) or len(value) != 3 or any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in value):
+            raise ValueError('Invalid transform ' + field)
+        values[field] = value
+    temporary = Usd.Stage.CreateInMemory()
+    form = UsdGeom.XformCommonAPI(UsdGeom.Xform.Define(temporary, '/Transform'))
+    form.SetTranslate(Gf.Vec3d(*values['translation']))
+    form.SetRotate(Gf.Vec3f(*values['rotation']), UsdGeom.XformCommonAPI.RotationOrderXYZ)
+    form.SetScale(Gf.Vec3f(*values['scale']))
+    prim = temporary.GetDefaultPrim() if temporary.GetDefaultPrim() else temporary.GetPrimAtPath('/Transform')
+    return UsdGeom.Xformable(prim).GetLocalTransformation()
+
+
+def apply_transform(stage, node, default_target=None):
+    from pxr import UsdGeom
+    matrix = _build_transform_matrix(node.get('transform'))
+    label = 'node_' + hashlib.sha256(str(node.get('id', '')).encode()).hexdigest()[:16]
+    targets = node.get('transformTargets')
+    if not targets:
+        if default_target and default_target.IsValid():
+            prepend_root_transform(default_target, matrix, label)
+        return
+    patterns = [
+        str(row.get('pattern') or '').strip()
+        for row in targets
+        if isinstance(row, dict) and row.get('enabled', True) and str(row.get('pattern') or '').strip()
+    ]
+    if not patterns:
+        return
+    matched_paths = []
+    matched_prims = []
+    for prim in stage.Traverse():
+        if prim.IsInstanceProxy() or not UsdGeom.Xformable(prim):
+            continue
+        path = prim.GetPath()
+        path_str = str(path)
+        if any(_hair_query_matches(pattern, path_str) for pattern in patterns):
+            matched_paths.append(path)
+            matched_prims.append(prim)
+    matched_set = set(matched_paths)
+    for path, prim in zip(matched_paths, matched_prims):
+        if any(parent in matched_set for parent in path.GetPrefixes()[:-1]):
+            continue
+        prepend_root_transform(prim, matrix, label)
+
+
 def prepend_root_transform(prim,matrix,label):
     """Apply an outer transform on an existing scene root without a parent prim."""
     from pxr import UsdGeom,Sdf,Gf
@@ -443,7 +495,7 @@ def _extract_blender_materials(target_scene, material_mode):
                 import hashlib, tempfile
                 data = packed.data
                 if data:
-                    tex_dir = os.path.join(tempfile.gettempdir(), 'orchflow_blender_cache', 'packed_tex')
+                    tex_dir = os.path.join(tempfile.gettempdir(), 'sublayer_blender_cache', 'packed_tex')
                     os.makedirs(tex_dir, exist_ok=True)
                     fmt = (getattr(img, 'file_format', '') or 'PNG').lower()
                     ext = '.jpg' if fmt in ('jpeg', 'jpg') else ('.exr' if fmt == 'open_exr' else f'.{fmt}' if fmt.isalnum() else '.png')
@@ -806,7 +858,7 @@ def _extract_blender_materials(target_scene, material_mode):
 
 def _blender_disk_cache_paths(norm_path, mtime, size):
     import hashlib, tempfile
-    cache_dir = os.path.join(tempfile.gettempdir(), 'orchflow_blender_cache')
+    cache_dir = os.path.join(tempfile.gettempdir(), 'sublayer_blender_cache')
     key = hashlib.sha256(f"{norm_path}|{mtime}|{size}|v5".encode('utf-8')).hexdigest()[:24]
     return cache_dir, os.path.join(cache_dir, f"{key}.usdc"), os.path.join(cache_dir, f"{key}.json")
 
@@ -1121,11 +1173,15 @@ if mat_bundles:
     print('\nORCHFLOW_BLENDER_MATERIALS:' + json.dumps(mat_bundles), flush=True)
 print('\nORCHFLOW_BLENDER_EXPORT:SUCCESS', flush=True)
 """
+    temp_py_path = None
     try:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', encoding='utf-8', delete=False) as py_tmp:
+            py_tmp.write(py_script)
+            temp_py_path = py_tmp.name
         cmd = [blender_exe, "--background"]
         if material_mode == 'off':
             cmd.append("--factory-startup")
-        cmd.extend([blend_path, "--python-exit-code", "1", "--python-expr", py_script])
+        cmd.extend([blend_path, "--python-exit-code", "1", "--python", temp_py_path])
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -1250,11 +1306,12 @@ print('\nORCHFLOW_BLENDER_EXPORT:SUCCESS', flush=True)
         _BLENDER_FULL_LAYER_CACHE[full_key] = raw_entry
         return _materialize_mode(raw_entry)
     finally:
-        if os.path.isfile(temp_usd_path):
-            try:
-                os.remove(temp_usd_path)
-            except Exception:
-                pass
+        for tmp_path in (temp_usd_path, temp_py_path):
+            if tmp_path and os.path.isfile(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
 
 
 def _filter_blender_stage_in_memory(stage, sel_set):
@@ -1475,7 +1532,24 @@ def compile_graph(graph, reload=False):
         keepalive.append(stage)
         return stage, root
 
-    def wrap_source_stage(source, instanced=True, norm_path=None, mtime=0.0):
+    def _source_up_rotation(axis_token, source_stage):
+        resolved = axis_token if axis_token and axis_token != 'preserve' else str(UsdGeom.GetStageUpAxis(source_stage))
+        rot = Gf.Matrix4d(1)
+        if resolved == 'Z':
+            rot.SetRotate(Gf.Rotation(Gf.Vec3d(1, 0, 0), -90))
+        elif resolved == '-Z':
+            rot.SetRotate(Gf.Rotation(Gf.Vec3d(1, 0, 0), 90))
+        elif resolved == '-Y':
+            rot.SetRotate(Gf.Rotation(Gf.Vec3d(1, 0, 0), 180))
+        elif resolved == 'X':
+            rot.SetRotate(Gf.Rotation(Gf.Vec3d(0, 0, 1), 90))
+        elif resolved == '-X':
+            rot.SetRotate(Gf.Rotation(Gf.Vec3d(0, 0, 1), -90))
+        elif resolved not in ('Y', 'preserve'):
+            raise ValueError(f'Unsupported source up-axis: {resolved}')
+        return rot
+
+    def wrap_source_stage(source, instanced=True, norm_path=None, mtime=0.0, axis='preserve', node_scale=1.0):
         roots = list(source.GetPseudoRoot().GetChildren())
         if not roots:
             raise ValueError(f'USD input has no root prims')
@@ -1516,10 +1590,11 @@ def compile_graph(graph, reload=False):
         stage.SetStartTimeCode(source.GetStartTimeCode() * ratio)
         stage.SetEndTimeCode(source.GetEndTimeCode() * ratio)
         conversion = UsdGeom.Xformable(stage.GetDefaultPrim())
-        scale = Gf.Matrix4d().SetScale(UsdGeom.GetStageMetersPerUnit(source))
-        rotation = Gf.Matrix4d(1)
-        if UsdGeom.GetStageUpAxis(source) == UsdGeom.Tokens.z:
-            rotation.SetRotate(Gf.Rotation(Gf.Vec3d(1, 0, 0), -90))
+        import math
+        if isinstance(node_scale, bool) or not isinstance(node_scale, (int, float)) or not math.isfinite(node_scale) or node_scale <= 0:
+            raise ValueError(f'Invalid source scale: {node_scale}')
+        scale = Gf.Matrix4d().SetScale(UsdGeom.GetStageMetersPerUnit(source) * float(node_scale))
+        rotation = _source_up_rotation(axis, source)
         if scale * rotation != Gf.Matrix4d(1):
             conversion.AddTransformOp(opSuffix='sourceUnits').Set(scale * rotation)
         prim = stage.OverridePrim(Sdf.Path('/Scene').AppendChild(reference_prim.name))
@@ -1527,13 +1602,13 @@ def compile_graph(graph, reload=False):
         mark_reference_instanceable(prim, source, enable=instanced)
         return stage
 
-    def source_stage(dependency_id, instanced=True):
+    def source_stage(dependency_id, instanced=True, axis='preserve', node_scale=1.0):
         if not dependency_id or dependency_id not in files:
             raise ValueError('Source USD or published USD file link is missing')
         path = files[dependency_id]
         norm_path = os.path.normcase(os.path.realpath(path))
         mtime = os.path.getmtime(norm_path) if os.path.exists(norm_path) else 0.0
-        key = (norm_path, bool(instanced))
+        key = (norm_path, bool(instanced), str(axis or 'preserve'), float(node_scale))
         if key in assets:
             return assets[key]
 
@@ -1547,17 +1622,26 @@ def compile_graph(graph, reload=False):
                 source = cached_source
 
         if source is None:
-            source = Usd.Stage.Open(path)
-            if source is None:
-                raise ValueError(f'Unable to open USD input: {path}')
+            source = _open_source_stage(path, reload=reload)
             while len(_SOURCE_STAGE_CACHE) >= _MAX_SOURCE_STAGE_CACHE:
                 _SOURCE_STAGE_CACHE.pop(next(iter(_SOURCE_STAGE_CACHE)), None)
             _SOURCE_STAGE_CACHE[norm_path] = (mtime, source)
         elif reload:
-            source.Reload()
+            if os.path.splitext(path)[1].lower() in ('.abc', '.obj', '.vdb', '.goz'):
+                source = _open_source_stage(path, reload=True)
+                _SOURCE_STAGE_CACHE[norm_path] = (mtime, source)
+            else:
+                source.Reload()
 
         keepalive.append(source)
-        stage = wrap_source_stage(source, instanced=instanced, norm_path=norm_path, mtime=mtime)
+        stage = wrap_source_stage(
+            source,
+            instanced=instanced,
+            norm_path=norm_path,
+            mtime=mtime,
+            axis=axis,
+            node_scale=node_scale,
+        )
         assets[key] = stage
         return stage
 
@@ -1579,7 +1663,18 @@ def compile_graph(graph, reload=False):
         inputs = [(edge['id'], results[edge['source']]) for edge in incoming[id]]
         if operation == 'source' and node.get('inputDependencyId'):
             instanced = node.get('instanced', True)
-            inputs.insert(0, ('own-source', source_stage(node['inputDependencyId'], instanced=instanced)))
+            inputs.insert(
+                0,
+                (
+                    'own-source',
+                    source_stage(
+                        node['inputDependencyId'],
+                        instanced=instanced,
+                        axis=node.get('axis', 'preserve'),
+                        node_scale=node.get('scale', 1.0),
+                    ),
+                ),
+            )
         elif operation == 'blender':
             blend_dep = node.get('nativeProjectDependencyId')
             usd_dep = node.get('publishedDependencyId') or node.get('inputDependencyId')
@@ -1683,35 +1778,13 @@ def compile_graph(graph, reload=False):
             overlay=Sdf.Layer.CreateAnonymous('transform.usda');overlay.subLayerPaths=[upstream.GetRootLayer().identifier]
             stage=Usd.Stage.Open(overlay);inherit_stage_metrics(stage,upstream)
             stage.SetDefaultPrim(stage.GetPrimAtPath(upstream.GetDefaultPrim().GetPath()))
-            transform=node.get('transform') or {};values={}
-            import math
-            for field,default in [('translation',[0,0,0]),('rotation',[0,0,0]),('scale',[1,1,1])]:
-                value=transform.get(field,default)
-                if not isinstance(value,list) or len(value)!=3 or any(isinstance(v,bool) or not isinstance(v,(int,float)) or not math.isfinite(v) for v in value):raise ValueError('Invalid transform '+field)
-                values[field]=value
-            temporary=Usd.Stage.CreateInMemory();form=UsdGeom.XformCommonAPI(UsdGeom.Xform.Define(temporary,'/Transform'))
-            form.SetTranslate(Gf.Vec3d(*values['translation']));form.SetRotate(Gf.Vec3f(*values['rotation']),UsdGeom.XformCommonAPI.RotationOrderXYZ);form.SetScale(Gf.Vec3f(*values['scale']))
-            matrix=UsdGeom.Xformable(temporary.GetDefaultPrim() if temporary.GetDefaultPrim() else temporary.GetPrimAtPath('/Transform')).GetLocalTransformation()
-            prepend_root_transform(stage.GetDefaultPrim(),matrix,'node_'+hashlib.sha256(id.encode()).hexdigest()[:16])
+            apply_transform(stage,node,stage.GetDefaultPrim())
             keepalive.extend([upstream,overlay,stage]);results[id]=stage;continue
         if operation in ('source', 'blender', 'assetOverride', 'output') and len(inputs) == 1:
             results[id] = inputs[0][1]
             continue
         stage, root = empty_stage()
         stage.SetStartTimeCode(min(value.GetStartTimeCode() for _,value in inputs));stage.SetEndTimeCode(max(value.GetEndTimeCode() for _,value in inputs))
-        if operation == 'transform':
-            transform = node.get('transform') or {}
-            values = {}
-            import math
-            for field, default in [('translation', [0, 0, 0]), ('rotation', [0, 0, 0]), ('scale', [1, 1, 1])]:
-                vector = transform.get(field, default)
-                if not isinstance(vector, list) or len(vector) != 3 or any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in vector):
-                    raise ValueError(f'Invalid transform {field}')
-                values[field] = vector
-            api = UsdGeom.XformCommonAPI(root)
-            api.SetTranslate(Gf.Vec3d(*values['translation']))
-            api.SetRotate(Gf.Vec3f(*values['rotation']), UsdGeom.XformCommonAPI.RotationOrderXYZ)
-            api.SetScale(Gf.Vec3f(*values['scale']))
         for edge_id, upstream in inputs:
             name = 'Branch_' + hashlib.sha256(edge_id.encode()).hexdigest()[:16]
             prim = stage.OverridePrim('/Scene/' + name)
@@ -1720,6 +1793,7 @@ def compile_graph(graph, reload=False):
             # read-only instance proxies unless upstream has uninstanced prims or node disabled instancing.
             has_instances = any(p.IsInstanceable() or p.IsInstance() for p in upstream.Traverse())
             mark_reference_instanceable(prim, upstream, enable=node.get('instanced', True) and has_instances)
+        if operation == 'transform':apply_transform(stage,node,root)
         if operation == 'delete':apply_delete(stage,node.get('deletePaths',[]))
         if operation == 'materialx':author_materialx_rules(stage,node,files,procedural_graph=graph.get('proceduralGraph'))
         if operation == 'light':apply_light_overrides(stage,node.get('lightOverrides',[]))
@@ -2936,18 +3010,27 @@ def inspect_stage_curves(request):
     graph = request['graph']
     stage, alive, _ = compile_graph(graph, reload=bool(request.get('reload', False)))
     curves = []
+    meshes = []
     for prim in stage.Traverse(Usd.TraverseInstanceProxies()):
-        if not prim.IsA(UsdGeom.BasisCurves):
-            continue
-        bc = UsdGeom.BasisCurves(prim)
-        counts = bc.GetCurveVertexCountsAttr().Get()
-        curves.append({
-            'path': str(prim.GetPath()),
-            'name': prim.GetName(),
-            'curveCount': int(len(counts)) if counts else 0,
-            'instanceProxy': bool(prim.IsInstanceProxy()),
-        })
-    return {'curves': curves}
+        if prim.IsA(UsdGeom.BasisCurves):
+            bc = UsdGeom.BasisCurves(prim)
+            counts = bc.GetCurveVertexCountsAttr().Get()
+            curves.append({
+                'path': str(prim.GetPath()),
+                'name': prim.GetName(),
+                'curveCount': int(len(counts)) if counts else 0,
+                'instanceProxy': bool(prim.IsInstanceProxy()),
+            })
+        elif prim.IsA(UsdGeom.Mesh):
+            mesh = UsdGeom.Mesh(prim)
+            pts = mesh.GetPointsAttr().Get()
+            meshes.append({
+                'path': str(prim.GetPath()),
+                'name': prim.GetName(),
+                'vertexCount': int(len(pts)) if pts else 0,
+                'instanceProxy': bool(prim.IsInstanceProxy()),
+            })
+    return {'curves': curves, 'meshes': meshes}
 
 
 def apply_hair(stage, hair_cfg):
@@ -2968,10 +3051,40 @@ def apply_hair(stage, hair_cfg):
     if not math.isfinite(root_scale) or root_scale <= 0.0 or root_scale > 10.0:
         raise ValueError('Hair root scale must be between 0 and 10')
 
-    if width_mode == 'multiply' and abs(width - 1.0) < 1e-9 and abs(taper) < 1e-9 and abs(root_scale - 1.0) < 1e-9:
+    sim_enabled = bool(cfg.get('simEnabled', False))
+    width_is_identity = (
+        width_mode == 'multiply'
+        and abs(width - 1.0) < 1e-9
+        and abs(taper) < 1e-9
+        and abs(root_scale - 1.0) < 1e-9
+    )
+    if width_is_identity and not sim_enabled:
         return
 
     raw_query = str(cfg.get('targetQuery') or '').strip()
+
+    if not width_is_identity:
+        _apply_hair_widths(stage, raw_query, width_mode, width, taper, root_scale)
+
+    if sim_enabled:
+        import os
+        import sys
+        _here = globals().get('__file__')
+        for _cand in (
+            os.environ.get('ORCHFLOW_WORKER_DIR'),
+            os.path.dirname(os.path.abspath(_here)) if _here else None,
+            os.path.join(os.getcwd(), 'worker'),
+            r'e:\CODINGPROJECTS\Rust\Sublayer\worker',
+        ):
+            if _cand and os.path.isdir(_cand) and _cand not in sys.path:
+                sys.path.insert(0, _cand)
+                break
+        from hair_sim import apply_hair_simulation
+        apply_hair_simulation(stage, cfg, _hair_query_matches)
+
+
+def _apply_hair_widths(stage, raw_query, width_mode, width, taper, root_scale):
+    from pxr import UsdGeom, Vt
 
     has_profile = abs(taper) >= 1e-9 or abs(root_scale - 1.0) >= 1e-9
     for prim in stage.Traverse():
@@ -3054,3 +3167,726 @@ def apply_hair(stage, hair_cfg):
 
         curves.CreateWidthsAttr().Set(Vt.FloatArray(new_widths))
         curves.SetWidthsInterpolation(UsdGeom.Tokens.vertex)
+
+
+def _read_vdb_grid_names(path):
+    """Extract grid names from an OpenVDB file header without requiring pyopenvdb."""
+    import struct
+    names = []
+    try:
+        with open(path, 'rb') as f:
+            magic = f.read(8)
+            if magic != b' VDB\x00\x00\x00\x00':
+                return ['density']
+            file_ver, lib_major, lib_minor, has_grid_offsets = struct.unpack('<III?', f.read(13))
+            f.read(16)  # 16-byte UUID
+            if file_ver >= 224:
+                pass
+            # Read file-level metadata count
+            meta_count = struct.unpack('<I', f.read(4))[0]
+            for _ in range(min(meta_count, 256)):
+                nlen = struct.unpack('<I', f.read(4))[0]
+                f.read(nlen)
+                tlen = struct.unpack('<I', f.read(4))[0]
+                f.read(tlen)
+                vlen = struct.unpack('<I', f.read(4))[0]
+                f.read(vlen)
+            grid_count = struct.unpack('<I', f.read(4))[0]
+            for _ in range(min(grid_count, 64)):
+                glen = struct.unpack('<I', f.read(4))[0]
+                if glen == 0 or glen > 1024:
+                    break
+                gname = f.read(glen).decode('utf-8', errors='replace')
+                names.append(gname)
+                tlen = struct.unpack('<I', f.read(4))[0]
+                f.read(tlen)  # grid type
+                if file_ver >= 222:
+                    ilen = struct.unpack('<I', f.read(4))[0]
+                    f.read(ilen)  # instance parent
+                # Grid stream offsets: gridPos (8), blockPos (8), endPos (8)
+                grid_pos, block_pos, end_pos = struct.unpack('<qqq', f.read(24))
+                if end_pos > f.tell():
+                    f.seek(end_pos)
+                else:
+                    break
+    except Exception:
+        pass
+    return names or ['density']
+
+
+def _open_vdb_source_stage(path):
+    from pxr import Sdf, Tf, Usd, UsdGeom, UsdVol
+
+    abs_path = os.path.abspath(path)
+    if not os.path.isfile(abs_path):
+        raise ValueError(f'VDB file does not exist: {path}')
+    stage = Usd.Stage.CreateInMemory('source-vdb.usda')
+    UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.y)
+    UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+    vol = UsdVol.Volume.Define(stage, '/Volume')
+    stage.SetDefaultPrim(vol.GetPrim())
+
+    grid_names = _read_vdb_grid_names(abs_path)
+    used = set()
+    for gname in grid_names:
+        ident = Tf.MakeValidIdentifier(gname or 'density')
+        if ident in used:
+            ident += f'_{len(used)}'
+        used.add(ident)
+        field = UsdVol.OpenVDBAsset.Define(stage, f'/Volume/{ident}')
+        field.CreateFieldNameAttr().Set(gname or 'density')
+        field.CreateFilePathAttr().Set(Sdf.AssetPath(abs_path))
+        rel_name = Tf.MakeValidIdentifier(gname or 'density')
+        vol.CreateFieldRelationship(rel_name, field.GetPath())
+    return stage
+
+
+def _parse_mtl_file(mtl_path):
+    materials = {}
+    if not os.path.isfile(mtl_path):
+        return materials
+    base_dir = os.path.dirname(mtl_path)
+    current = None
+    with open(mtl_path, encoding='utf-8-sig', errors='replace') as stream:
+        for raw_line in stream:
+            line = raw_line.split('#', 1)[0].strip()
+            if not line:
+                continue
+            parts = line.split()
+            tok = parts[0]
+            vals = parts[1:]
+            if tok == 'newmtl' and vals:
+                name = ' '.join(vals)
+                current = materials.setdefault(name, {})
+            elif current is None:
+                continue
+            elif tok in ('Kd', 'Ks', 'Ke') and len(vals) >= 3:
+                try:
+                    current[tok] = tuple(float(x) for x in vals[:3])
+                except ValueError:
+                    pass
+            elif tok in ('d', 'Ns', 'Ni', 'Pr', 'Pm') and vals:
+                try:
+                    current[tok] = float(vals[0])
+                except ValueError:
+                    pass
+            elif tok == 'Tr' and vals:
+                try:
+                    current['d'] = max(0.0, min(1.0, 1.0 - float(vals[0])))
+                except ValueError:
+                    pass
+            elif tok in ('map_Kd', 'map_Ks', 'map_Ke', 'map_d', 'map_Bump', 'bump', 'map_Pr', 'map_Roughness', 'map_Pm', 'map_Metallic') and vals:
+                # Handle optional MTL texture flags like -bm 1.0 before the filename
+                tex_rel = vals[-1]
+                tex_abs = os.path.abspath(os.path.join(base_dir, tex_rel))
+                if os.path.isfile(tex_abs):
+                    key = 'map_Bump' if tok == 'bump' else ('map_Pr' if tok == 'map_Roughness' else ('map_Pm' if tok == 'map_Metallic' else tok))
+                    current[key] = tex_abs
+    return materials
+
+
+def _open_obj_source_stage(path):
+    import hashlib
+    import math
+    from pxr import Gf, Sdf, Tf, Usd, UsdGeom, UsdShade, Vt
+
+    abs_path = os.path.abspath(path)
+    if not os.path.isfile(abs_path):
+        raise ValueError(f'OBJ file does not exist: {path}')
+    base_dir = os.path.dirname(abs_path)
+
+    points = []
+    vcolors = []
+    has_vcolors = False
+    uvs = []
+    normals = []
+    objects = {}
+    obj_name = 'Mesh'
+    cur_mtl = None
+    declared = {}
+    mtl_defs = {}
+
+    def idx(value, size):
+        n = int(value)
+        r = n - 1 if n > 0 else size + n
+        if n == 0 or r < 0 or r >= size:
+            raise ValueError('OBJ index outside declared array')
+        return r
+
+    def nums(tokens, count):
+        res = [float(v) for v in tokens]
+        if len(res) < count or not all(math.isfinite(v) for v in res):
+            raise ValueError('Invalid OBJ coordinates')
+        return res
+
+    with open(abs_path, encoding='utf-8-sig', errors='replace') as stream:
+        pending = ''
+        for line_no, raw_line in enumerate(stream, 1):
+            line = raw_line.split('#', 1)[0].strip()
+            if line.endswith('\\'):
+                pending += line[:-1] + ' '
+                continue
+            line = pending + line
+            pending = ''
+            if not line:
+                continue
+            token, *values = line.split()
+            try:
+                if token == 'v':
+                    v = nums(values, 3)
+                    if len(v) == 4 and v[3] != 0:
+                        v = [c / v[3] for c in v[:3]]
+                    declared.setdefault(obj_name, []).append(len(points))
+                    points.append((v[0], v[1], v[2]))
+                    if len(v) >= 6:
+                        has_vcolors = True
+                        vcolors.append((v[3], v[4], v[5]))
+                    else:
+                        vcolors.append((1.0, 1.0, 1.0))
+                elif token == 'vt':
+                    v = nums(values, 1)
+                    uvs.append((v[0], v[1] if len(v) > 1 else 0.0))
+                elif token == 'vn':
+                    v = nums(values, 3)
+                    normals.append((v[0], v[1], v[2]))
+                elif token in ('o', 'g') and values:
+                    if token == 'o' or not objects:
+                        obj_name = ' '.join(values) or 'Mesh'
+                elif token == 'mtllib' and values:
+                    mtl_path = os.path.abspath(os.path.join(base_dir, ' '.join(values)))
+                    mtl_defs.update(_parse_mtl_file(mtl_path))
+                elif token == 'usemtl' and values:
+                    cur_mtl = ' '.join(values)
+                elif token == 'f':
+                    if len(values) < 3:
+                        continue
+                    face = []
+                    for corner in values:
+                        fields = corner.split('/')
+                        if not fields[0]:
+                            raise ValueError('Invalid OBJ face corner')
+                        face.append((
+                            idx(fields[0], len(points)),
+                            idx(fields[1], len(uvs)) if len(fields) > 1 and fields[1] else None,
+                            idx(fields[2], len(normals)) if len(fields) > 2 and fields[2] else None,
+                        ))
+                    objects.setdefault(obj_name, []).append((face, cur_mtl))
+            except (ValueError, OverflowError) as error:
+                raise ValueError(f'OBJ line {line_no}: {error}') from error
+
+    if not objects:
+        raise ValueError('OBJ contains no polygon meshes')
+
+    stage = Usd.Stage.CreateInMemory('source-obj.usda')
+    UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.y)
+    UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+    root = UsdGeom.Xform.Define(stage, '/OBJ')
+    stage.SetDefaultPrim(root.GetPrim())
+
+    # Author UsdPreviewSurface materials from MTL definitions
+    usd_materials = {}
+    if mtl_defs:
+        UsdGeom.Scope.Define(stage, '/OBJ/_Materials')
+        used_mat_names = set()
+        for mname, mdata in mtl_defs.items():
+            mid = Tf.MakeValidIdentifier(mname)
+            if mid in used_mat_names:
+                mid += '_' + hashlib.sha256(mname.encode()).hexdigest()[:8]
+            used_mat_names.add(mid)
+            mat_path = f'/OBJ/_Materials/{mid}'
+            mat = UsdShade.Material.Define(stage, mat_path)
+            sh = UsdShade.Shader.Define(stage, f'{mat_path}/PreviewSurface')
+            sh.CreateIdAttr('UsdPreviewSurface')
+            sh.CreateOutput('surface', Sdf.ValueTypeNames.Token)
+            mat.CreateSurfaceOutput().ConnectToSource(sh.ConnectableAPI(), 'surface')
+
+            kd = mdata.get('Kd', (0.8, 0.8, 0.8))
+            sh.CreateInput('diffuseColor', Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*kd))
+            if 'Pr' in mdata:
+                rough = max(0.02, min(1.0, mdata['Pr']))
+            elif 'Ns' in mdata:
+                rough = max(0.04, min(1.0, math.sqrt(2.0 / (max(1.0, mdata['Ns']) + 2.0))))
+            else:
+                rough = 0.5
+            sh.CreateInput('roughness', Sdf.ValueTypeNames.Float).Set(float(rough))
+            if 'Pm' in mdata:
+                sh.CreateInput('metallic', Sdf.ValueTypeNames.Float).Set(max(0.0, min(1.0, mdata['Pm'])))
+            if 'd' in mdata:
+                sh.CreateInput('opacity', Sdf.ValueTypeNames.Float).Set(max(0.0, min(1.0, mdata['d'])))
+            if 'Ni' in mdata:
+                sh.CreateInput('ior', Sdf.ValueTypeNames.Float).Set(max(1.0, mdata['Ni']))
+            if 'Ke' in mdata:
+                sh.CreateInput('emissiveColor', Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*mdata['Ke']))
+
+            def _bind_tex(slot_key, input_name, value_type, out_name, colorspace='sRGB'):
+                tex_fp = mdata.get(slot_key)
+                if not tex_fp:
+                    return
+                st_reader = stage.GetPrimAtPath(f'{mat_path}/PrimvarSt')
+                if not st_reader:
+                    reader = UsdShade.Shader.Define(stage, f'{mat_path}/PrimvarSt')
+                    reader.CreateIdAttr('UsdPrimvarReader_float2')
+                    reader.CreateInput('varname', Sdf.ValueTypeNames.Token).Set('st')
+                    reader.CreateOutput('result', Sdf.ValueTypeNames.Float2)
+                else:
+                    reader = UsdShade.Shader(st_reader)
+                tex = UsdShade.Shader.Define(stage, f'{mat_path}/Tex_{input_name}')
+                tex.CreateIdAttr('UsdUVTexture')
+                tex.CreateInput('file', Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(tex_fp))
+                tex.CreateInput('sourceColorSpace', Sdf.ValueTypeNames.Token).Set(colorspace)
+                tex.CreateInput('st', Sdf.ValueTypeNames.Float2).ConnectToSource(reader.ConnectableAPI(), 'result')
+                tex.CreateOutput(out_name, value_type)
+                sh.CreateInput(input_name, value_type).ConnectToSource(tex.ConnectableAPI(), out_name)
+
+            _bind_tex('map_Kd', 'diffuseColor', Sdf.ValueTypeNames.Color3f, 'rgb', 'sRGB')
+            _bind_tex('map_Pr', 'roughness', Sdf.ValueTypeNames.Float, 'r', 'raw')
+            _bind_tex('map_Pm', 'metallic', Sdf.ValueTypeNames.Float, 'r', 'raw')
+            _bind_tex('map_d', 'opacity', Sdf.ValueTypeNames.Float, 'r', 'raw')
+            _bind_tex('map_Ke', 'emissiveColor', Sdf.ValueTypeNames.Color3f, 'rgb', 'sRGB')
+            _bind_tex('map_Bump', 'normal', Sdf.ValueTypeNames.Normal3f, 'rgb', 'raw')
+            usd_materials[mname] = mat
+
+    used_names = set()
+    for raw, face_entries in objects.items():
+        ident = Tf.MakeValidIdentifier(raw)
+        if ident in used_names:
+            ident += '_' + hashlib.sha256(raw.encode()).hexdigest()[:12]
+        used_names.add(ident)
+        faces = [f for f, _ in face_entries]
+        verts = sorted({c[0] for f in faces for c in f} | set(declared.get(raw, []))) if len(objects) > 1 else list(range(len(points)))
+        remap = {v: i for i, v in enumerate(verts)}
+        corners = [c for f in faces for c in f]
+        mesh = UsdGeom.Mesh.Define(stage, f'/OBJ/{ident}')
+        mesh.CreatePointsAttr(Vt.Vec3fArray([Gf.Vec3f(*points[v]) for v in verts]))
+        mesh.CreateFaceVertexCountsAttr([len(f) for f in faces])
+        mesh.CreateFaceVertexIndicesAttr([remap[c[0]] for c in corners])
+        mesh.CreateSubdivisionSchemeAttr(UsdGeom.Tokens.none)
+        if has_vcolors:
+            dc = UsdGeom.PrimvarsAPI(mesh).CreatePrimvar('displayColor', Sdf.ValueTypeNames.Color3fArray, UsdGeom.Tokens.vertex)
+            dc.Set(Vt.Vec3fArray([Gf.Vec3f(*vcolors[v]) for v in verts]))
+        if all(c[1] is not None for c in corners) and corners:
+            uv = UsdGeom.PrimvarsAPI(mesh).CreatePrimvar('st', Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.faceVarying)
+            uv.Set(Vt.Vec2fArray([Gf.Vec2f(*uvs[c[1]]) for c in corners]))
+        if all(c[2] is not None for c in corners) and corners:
+            mesh.CreateNormalsAttr(Vt.Vec3fArray([Gf.Vec3f(*normals[c[2]]) for c in corners]))
+            mesh.SetNormalsInterpolation(UsdGeom.Tokens.faceVarying)
+
+        mtls_used = {m for _, m in face_entries if m in usd_materials}
+        if len(mtls_used) == 1 and all(m in usd_materials for _, m in face_entries):
+            only_mtl = next(iter(mtls_used))
+            UsdShade.MaterialBindingAPI.Apply(mesh.GetPrim()).Bind(usd_materials[only_mtl])
+        elif mtls_used:
+            by_mtl = {}
+            for fi, (_, m) in enumerate(face_entries):
+                if m in usd_materials:
+                    by_mtl.setdefault(m, []).append(fi)
+            UsdShade.MaterialBindingAPI.Apply(mesh.GetPrim())
+            for mname, face_indices in by_mtl.items():
+                sub = UsdGeom.Subset.Define(stage, f'/OBJ/{ident}/mat_{Tf.MakeValidIdentifier(mname)}')
+                sub.CreateElementTypeAttr(UsdGeom.Tokens.face)
+                sub.CreateFamilyNameAttr(UsdShade.Tokens.materialBind)
+                sub.CreateIndicesAttr(Vt.IntArray(face_indices))
+                UsdShade.MaterialBindingAPI.Apply(sub.GetPrim()).Bind(usd_materials[mname])
+    return stage
+
+
+def _open_alembic_source_stage(path, reload=False):
+    import hashlib
+    import subprocess
+    import tempfile
+    from pxr import Sdf, Usd
+
+    st = os.stat(path)
+    norm_path = os.path.normcase(os.path.abspath(path))
+    key = hashlib.sha256(f'{norm_path}|{st.st_mtime_ns}|{st.st_size}'.encode('utf-8')).hexdigest()[:24]
+    cache_dir = os.path.join(tempfile.gettempdir(), 'sublayer_alembic_cache')
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_usdc = os.path.join(cache_dir, f'{key}.usdc')
+
+    if reload or not os.path.isfile(cache_usdc):
+        tmp_usdc = os.path.join(cache_dir, f'{key}.{os.getpid()}.tmp.usdc')
+        try:
+            if Sdf.FileFormat.FindByExtension('abc'):
+                abc_stage = Usd.Stage.Open(path)
+                if abc_stage is None:
+                    raise ValueError(f'Unable to open Alembic input with usdAbc: {path}')
+                if not abc_stage.GetRootLayer().Export(tmp_usdc):
+                    raise ValueError(f'Unable to export Alembic cache USD: {cache_usdc}')
+            else:
+                repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                imaging_python = os.environ.get('ORCHFLOW_IMAGING_PYTHON') or os.path.join(
+                    repo_root, '.venv-imaging', 'Scripts', 'python.exe'
+                )
+                if not os.path.isfile(imaging_python):
+                    raise ValueError(
+                        'Alembic support requires the upstream OpenUSD usdAbc plugin; it is missing from this runtime'
+                    )
+                usd_root = os.environ.get('ORCHFLOW_USD_ROOT') or r'I:\AI\OpenUSD-runtime\25.08'
+                env = os.environ.copy()
+                py_path = os.path.join(usd_root, 'lib', 'python')
+                if os.path.isdir(py_path):
+                    env['PYTHONPATH'] = py_path + (os.pathsep + env['PYTHONPATH'] if env.get('PYTHONPATH') else '')
+                extra_paths = [p for p in (os.path.join(usd_root, 'lib'), os.path.join(usd_root, 'bin')) if os.path.isdir(p)]
+                if extra_paths:
+                    env['PATH'] = os.pathsep.join(extra_paths) + (os.pathsep + env['PATH'] if env.get('PATH') else '')
+                script = (
+                    "import os, sys\n"
+                    "usd_root = sys.argv[3]\n"
+                    "if hasattr(os, 'add_dll_directory'):\n"
+                    "    for d in (os.path.join(usd_root, 'lib'), os.path.join(usd_root, 'bin')):\n"
+                    "        if os.path.isdir(d):\n"
+                    "            os.add_dll_directory(d)\n"
+                    "from pxr import Sdf, Usd\n"
+                    "if not Sdf.FileFormat.FindByExtension('abc'):\n"
+                    "    raise RuntimeError('usdAbc plugin missing in imaging runtime')\n"
+                    "s = Usd.Stage.Open(sys.argv[1])\n"
+                    "if s is None:\n"
+                    "    raise RuntimeError(f'Unable to open Alembic input: {sys.argv[1]}')\n"
+                    "if not s.GetRootLayer().Export(sys.argv[2]):\n"
+                    "    raise RuntimeError(f'Unable to export Alembic cache: {sys.argv[2]}')\n"
+                )
+                proc = subprocess.run(
+                    [imaging_python, '-c', script, path, tmp_usdc, usd_root],
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    check=False,
+                )
+                if proc.returncode != 0 or not os.path.isfile(tmp_usdc):
+                    detail = (proc.stderr or proc.stdout or '').strip()
+                    raise ValueError(
+                        f'Unable to convert Alembic input to cached USD ({path}): {detail or "usdAbc conversion failed"}'
+                    )
+            os.replace(tmp_usdc, cache_usdc)
+        finally:
+            if os.path.exists(tmp_usdc):
+                try:
+                    os.remove(tmp_usdc)
+                except OSError:
+                    pass
+
+    source = Usd.Stage.Open(cache_usdc)
+    if source is None:
+        raise ValueError(f'Unable to open cached Alembic USD: {cache_usdc}')
+    if reload:
+        source.Reload()
+    return source
+
+
+def _parse_goz_file(path):
+    import struct
+
+    if not os.path.isfile(path):
+        raise ValueError(f'GoZ file does not exist: {path}')
+
+    meshes = []
+    current = None
+
+    def _ensure_mesh():
+        nonlocal current
+        if current is None:
+            current = {
+                'name': 'Mesh',
+                'points': [],
+                'faces': [],
+                'uvs': [],
+                'polypaint': [],
+                'mask': [],
+                'polygroups': [],
+                'diffuse_map': '',
+                'displacement_map': '',
+                'normal_map': '',
+            }
+
+    def _flush_mesh():
+        nonlocal current
+        if current is not None and (current['points'] or current['faces']):
+            meshes.append(current)
+        current = None
+
+    with open(path, 'rb') as stream:
+        header = stream.read(32)
+        if len(header) < 32 or not header.startswith(b'GoZb'):
+            raise ValueError(f'Not a valid GoZ binary file: {path}')
+
+        while True:
+            hdr = stream.read(16)
+            if not hdr or len(hdr) < 16:
+                break
+            tag, length, count = struct.unpack('<IIQ', hdr)
+            if tag == 0:
+                _flush_mesh()
+                continue
+            if length < 16:
+                raise ValueError(f'Invalid GoZ block length {length} for tag {tag:#x}')
+            payload_len = length - 16
+            payload = stream.read(payload_len) if payload_len > 0 else b''
+            if len(payload) < payload_len:
+                raise ValueError(f'Unexpected end of GoZ file in block {tag:#x}')
+
+            if tag == 1:
+                if current is not None and (current['points'] or current['faces']):
+                    _flush_mesh()
+                _ensure_mesh()
+                raw_name = payload.split(b'\x00', 1)[0].decode('utf-8', errors='replace').strip()
+                if raw_name.startswith('GoZMesh_'):
+                    raw_name = raw_name[len('GoZMesh_'):]
+                current['name'] = raw_name or 'Mesh'
+            elif tag == 10001:
+                _ensure_mesh()
+                expected = count * 12
+                if len(payload) < expected:
+                    raise ValueError('Truncated GoZ vertex block')
+                current['points'] = list(struct.iter_unpack('<3f', memoryview(payload)[:expected]))
+            elif tag == 20001:
+                _ensure_mesh()
+                expected = count * 16
+                if len(payload) < expected:
+                    raise ValueError('Truncated GoZ face block')
+                current['faces'] = [
+                    (v0, v1, v2) if v3 < 0 else (v0, v1, v2, v3)
+                    for v0, v1, v2, v3 in struct.iter_unpack('<4i', memoryview(payload)[:expected])
+                ]
+            elif tag == 25001:
+                _ensure_mesh()
+                expected = count * 32
+                if len(payload) >= expected:
+                    current['uvs'] = list(struct.iter_unpack('<8f', memoryview(payload)[:expected]))
+            elif tag == 30001:
+                _ensure_mesh()
+                expected = count * 4
+                if len(payload) >= expected:
+                    current['polypaint'] = [
+                        (r / 255.0, g / 255.0, b / 255.0)
+                        for b, g, r, _ in struct.iter_unpack('<4B', memoryview(payload)[:expected])
+                    ]
+            elif tag == 40001:
+                _ensure_mesh()
+                if count > 0:
+                    stride = len(payload) // count
+                    if stride == 2:
+                        current['mask'] = [
+                            v[0] / 65535.0
+                            for v in struct.iter_unpack('<H', memoryview(payload)[: count * 2])
+                        ]
+                    elif stride == 4:
+                        current['mask'] = [
+                            max(0.0, min(1.0, v[0]))
+                            for v in struct.iter_unpack('<f', memoryview(payload)[: count * 4])
+                        ]
+                    elif stride == 1:
+                        current['mask'] = [
+                            v[0] / 255.0
+                            for v in struct.iter_unpack('<B', memoryview(payload)[:count])
+                        ]
+            elif tag == 50001:
+                _ensure_mesh()
+                if count > 0:
+                    stride = len(payload) // count
+                    if stride == 2:
+                        current['polygroups'] = [
+                            v[0]
+                            for v in struct.iter_unpack('<H', memoryview(payload)[: count * 2])
+                        ]
+                    elif stride == 4:
+                        current['polygroups'] = [
+                            v[0]
+                            for v in struct.iter_unpack('<I', memoryview(payload)[: count * 4])
+                        ]
+            elif tag == 60001:
+                _ensure_mesh()
+                current['diffuse_map'] = payload.split(b'\x00', 1)[0].decode('utf-8', errors='replace').strip()
+            elif tag == 70001:
+                _ensure_mesh()
+                current['displacement_map'] = payload.split(b'\x00', 1)[0].decode('utf-8', errors='replace').strip()
+            elif tag == 80001:
+                _ensure_mesh()
+                current['normal_map'] = payload.split(b'\x00', 1)[0].decode('utf-8', errors='replace').strip()
+
+    _flush_mesh()
+    if not meshes:
+        raise ValueError('GoZ file contains no polygon meshes')
+    return meshes
+
+
+def _open_goz_source_stage(path):
+    import hashlib
+    from pxr import Gf, Sdf, Tf, Usd, UsdGeom, UsdShade, Vt
+
+    meshes = _parse_goz_file(path)
+    base_dir = os.path.dirname(os.path.abspath(path))
+
+    stage = Usd.Stage.CreateInMemory('source-goz.usda')
+    UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.y)
+    UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+    root = UsdGeom.Xform.Define(stage, '/GoZ')
+    stage.SetDefaultPrim(root.GetPrim())
+
+    def _resolve_tex(tex_path):
+        if not tex_path:
+            return ''
+        if os.path.isabs(tex_path):
+            return os.path.abspath(tex_path)
+        return os.path.abspath(os.path.join(base_dir, tex_path))
+
+    used_names = set()
+    mat_scope_created = False
+
+    for entry in meshes:
+        raw_name = entry['name'] or 'Mesh'
+        ident = Tf.MakeValidIdentifier(raw_name)
+        if ident in used_names:
+            ident += '_' + hashlib.sha256(f'{raw_name}:{len(used_names)}'.encode()).hexdigest()[:8]
+        used_names.add(ident)
+
+        points = entry['points']
+        faces = entry['faces']
+        point_count = len(points)
+        for face in faces:
+            for idx in face:
+                if idx < 0 or idx >= point_count:
+                    raise ValueError(f'GoZ face index {idx} out of range for {point_count} vertices')
+
+        mesh = UsdGeom.Mesh.Define(stage, f'/GoZ/{ident}')
+        mesh.CreatePointsAttr(Vt.Vec3fArray([Gf.Vec3f(*p) for p in points]))
+        mesh.CreateFaceVertexCountsAttr([len(f) for f in faces])
+        mesh.CreateFaceVertexIndicesAttr([idx for f in faces for idx in f])
+        mesh.CreateSubdivisionSchemeAttr(UsdGeom.Tokens.none)
+        if points:
+            xs = [p[0] for p in points]
+            ys = [p[1] for p in points]
+            zs = [p[2] for p in points]
+            mesh.CreateExtentAttr(
+                Vt.Vec3fArray([Gf.Vec3f(min(xs), min(ys), min(zs)), Gf.Vec3f(max(xs), max(ys), max(zs))])
+            )
+
+        if entry['uvs'] and len(entry['uvs']) == len(faces) and faces:
+            st_vals = []
+            for fi, face in enumerate(faces):
+                uv8 = entry['uvs'][fi]
+                for k in range(len(face)):
+                    st_vals.append(Gf.Vec2f(uv8[2 * k], 1.0 - uv8[2 * k + 1]))
+            uv = UsdGeom.PrimvarsAPI(mesh).CreatePrimvar(
+                'st', Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.faceVarying
+            )
+            uv.Set(Vt.Vec2fArray(st_vals))
+
+        has_polypaint = bool(entry['polypaint']) and len(entry['polypaint']) == point_count
+        if has_polypaint:
+            dc = UsdGeom.PrimvarsAPI(mesh).CreatePrimvar(
+                'displayColor', Sdf.ValueTypeNames.Color3fArray, UsdGeom.Tokens.vertex
+            )
+            dc.Set(Vt.Vec3fArray([Gf.Vec3f(*c) for c in entry['polypaint']]))
+
+        if entry['mask'] and len(entry['mask']) == point_count:
+            mk = UsdGeom.PrimvarsAPI(mesh).CreatePrimvar(
+                'zbrush_mask', Sdf.ValueTypeNames.FloatArray, UsdGeom.Tokens.vertex
+            )
+            mk.Set(Vt.FloatArray(entry['mask']))
+
+        if entry['polygroups'] and len(entry['polygroups']) == len(faces):
+            pg_primvar = UsdGeom.PrimvarsAPI(mesh).CreatePrimvar(
+                'zbrush_polygroup', Sdf.ValueTypeNames.IntArray, UsdGeom.Tokens.uniform
+            )
+            pg_primvar.Set(Vt.IntArray(entry['polygroups']))
+            by_pg = {}
+            for fi, pg_id in enumerate(entry['polygroups']):
+                by_pg.setdefault(pg_id, []).append(fi)
+            if len(by_pg) > 1 or (len(by_pg) == 1 and next(iter(by_pg)) != 0):
+                for pg_id, face_indices in sorted(by_pg.items()):
+                    sub = UsdGeom.Subset.Define(stage, f'/GoZ/{ident}/polygroup_{pg_id}')
+                    sub.CreateElementTypeAttr(UsdGeom.Tokens.face)
+                    sub.CreateFamilyNameAttr('polygroup')
+                    sub.CreateIndicesAttr(Vt.IntArray(face_indices))
+
+        diff_path = _resolve_tex(entry['diffuse_map'])
+        norm_path = _resolve_tex(entry['normal_map'])
+        disp_path = _resolve_tex(entry['displacement_map'])
+        if diff_path or norm_path or disp_path:
+            if not mat_scope_created:
+                UsdGeom.Scope.Define(stage, '/GoZ/_Materials')
+                mat_scope_created = True
+            mat_path = f'/GoZ/_Materials/{ident}_Mat'
+            mat = UsdShade.Material.Define(stage, mat_path)
+            sh = UsdShade.Shader.Define(stage, f'{mat_path}/PreviewSurface')
+            sh.CreateIdAttr('UsdPreviewSurface')
+            sh.CreateInput('roughness', Sdf.ValueTypeNames.Float).Set(0.5)
+            sh.CreateOutput('surface', Sdf.ValueTypeNames.Token)
+            mat.CreateSurfaceOutput().ConnectToSource(sh.ConnectableAPI(), 'surface')
+
+            reader = UsdShade.Shader.Define(stage, f'{mat_path}/PrimvarSt')
+            reader.CreateIdAttr('UsdPrimvarReader_float2')
+            reader.CreateInput('varname', Sdf.ValueTypeNames.Token).Set('st')
+            reader.CreateOutput('result', Sdf.ValueTypeNames.Float2)
+
+            def _bind_goz_tex(tex_fp, tex_name, input_name, value_type, out_name, colorspace):
+                tex = UsdShade.Shader.Define(stage, f'{mat_path}/{tex_name}')
+                tex.CreateIdAttr('UsdUVTexture')
+                tex.CreateInput('file', Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(tex_fp))
+                tex.CreateInput('sourceColorSpace', Sdf.ValueTypeNames.Token).Set(colorspace)
+                tex.CreateInput('st', Sdf.ValueTypeNames.Float2).ConnectToSource(reader.ConnectableAPI(), 'result')
+                tex.CreateOutput(out_name, value_type)
+                sh.CreateInput(input_name, value_type).ConnectToSource(tex.ConnectableAPI(), out_name)
+
+            if diff_path:
+                _bind_goz_tex(diff_path, 'Tex_diffuseColor', 'diffuseColor', Sdf.ValueTypeNames.Color3f, 'rgb', 'sRGB')
+            elif has_polypaint:
+                dc_reader = UsdShade.Shader.Define(stage, f'{mat_path}/PrimvarDisplayColor')
+                dc_reader.CreateIdAttr('UsdPrimvarReader_float3')
+                dc_reader.CreateInput('varname', Sdf.ValueTypeNames.Token).Set('displayColor')
+                dc_reader.CreateOutput('result', Sdf.ValueTypeNames.Float3)
+                sh.CreateInput('diffuseColor', Sdf.ValueTypeNames.Color3f).ConnectToSource(
+                    dc_reader.ConnectableAPI(), 'result'
+                )
+
+            if norm_path:
+                _bind_goz_tex(norm_path, 'Tex_normal', 'normal', Sdf.ValueTypeNames.Normal3f, 'rgb', 'raw')
+            if disp_path:
+                _bind_goz_tex(disp_path, 'Tex_displacement', 'displacement', Sdf.ValueTypeNames.Float, 'r', 'raw')
+
+            UsdShade.MaterialBindingAPI.Apply(mesh.GetPrim()).Bind(mat)
+
+    return stage
+
+
+def _open_source_stage(path, reload=False):
+    from pxr import Usd
+
+    ext = os.path.splitext(path)[1].lower()
+    if ext == '.abc':
+        return _open_alembic_source_stage(path, reload=reload)
+    if ext == '.obj':
+        return _open_obj_source_stage(path)
+    if ext == '.vdb':
+        return _open_vdb_source_stage(path)
+    if ext == '.goz':
+        return _open_goz_source_stage(path)
+    source = Usd.Stage.Open(path)
+    if source is None:
+        raise ValueError(f'Unable to open USD input: {path}')
+    return source
+
+
+def convert_source_to_usd(request):
+    path = request.get('path')
+    destination = request.get('destination')
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError('A source file path is required')
+    if not isinstance(destination, str) or not destination.strip():
+        raise ValueError('A destination USD path is required')
+    ext = os.path.splitext(destination)[1].lower()
+    if ext not in ('.usd', '.usda', '.usdc'):
+        raise ValueError('Destination must be a .usd, .usda, or .usdc file')
+    stage = _open_source_stage(path)
+    out_dir = os.path.dirname(os.path.abspath(destination))
+    if out_dir and not os.path.isdir(out_dir):
+        os.makedirs(out_dir, exist_ok=True)
+    if not stage.Export(destination):
+        raise ValueError(f'Failed exporting converted USD to {destination}')
+    abs_dest = os.path.abspath(destination)
+    return {
+        'exported': abs_dest,
+        'destination': abs_dest,
+        'primCount': sum(1 for _ in stage.Traverse()),
+        'sourceFormat': os.path.splitext(path)[1].lstrip('.').lower(),
+    }

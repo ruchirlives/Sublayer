@@ -241,6 +241,8 @@ pub struct NodeData {
     pub asset_dependency_ids: Vec<String>,
     #[serde(default)]
     pub transform: Transform,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transform_targets: Option<Vec<TransformTargetRule>>,
     #[serde(default)]
     pub instanced: Option<bool>,
     #[serde(default)]
@@ -297,6 +299,15 @@ fn default_binding_strength() -> String {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TransformTargetRule {
+    pub id: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub pattern: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LightOverride {
     pub id: String,
     pub light_path: String,
@@ -325,12 +336,81 @@ pub struct HairSettings {
     pub taper: f64,
     #[serde(default = "default_hair_width")]
     pub root_scale: f64,
+    #[serde(default)]
+    pub sim_enabled: bool,
+    #[serde(default = "default_hair_sim_mode")]
+    pub sim_mode: String,
+    #[serde(default = "default_hair_settle_steps")]
+    pub settle_steps: u32,
+    #[serde(default = "default_hair_collider_query")]
+    pub collider_query: String,
+    #[serde(default = "default_hair_start_frame")]
+    pub start_frame: f64,
+    #[serde(default = "default_hair_end_frame")]
+    pub end_frame: f64,
+    #[serde(default = "default_hair_substeps")]
+    pub substeps: u32,
+    #[serde(default = "default_hair_iterations")]
+    pub iterations: u32,
+    #[serde(default = "default_hair_stiffness")]
+    pub stiffness: f64,
+    #[serde(default = "default_hair_bend_stiffness")]
+    pub bend_stiffness: f64,
+    #[serde(default = "default_hair_damping")]
+    pub damping: f64,
+    #[serde(default = "default_hair_gravity")]
+    pub gravity: f64,
+    #[serde(default)]
+    pub wind: [f64; 3],
+    #[serde(default = "default_hair_collision_margin")]
+    pub collision_margin: f64,
+    #[serde(default = "default_hair_friction")]
+    pub friction: f64,
 }
 fn default_hair_width_mode() -> String {
     "multiply".into()
 }
 fn default_hair_width() -> f64 {
     1.0
+}
+fn default_hair_collider_query() -> String {
+    "__none__".into()
+}
+fn default_hair_sim_mode() -> String {
+    "static".into()
+}
+fn default_hair_settle_steps() -> u32 {
+    24
+}
+fn default_hair_start_frame() -> f64 {
+    1.0
+}
+fn default_hair_end_frame() -> f64 {
+    48.0
+}
+fn default_hair_substeps() -> u32 {
+    4
+}
+fn default_hair_iterations() -> u32 {
+    8
+}
+fn default_hair_stiffness() -> f64 {
+    0.95
+}
+fn default_hair_bend_stiffness() -> f64 {
+    0.4
+}
+fn default_hair_damping() -> f64 {
+    0.04
+}
+fn default_hair_gravity() -> f64 {
+    9.81
+}
+fn default_hair_collision_margin() -> f64 {
+    0.005
+}
+fn default_hair_friction() -> f64 {
+    0.25
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -919,7 +999,7 @@ impl Project {
                 || n.data.scale <= 0.0
                 || !n.position.x.is_finite()
                 || !n.position.y.is_finite()
-                || !["preserve", "Y", "Z"].contains(&n.data.axis.as_str())
+                || !["preserve", "Y", "-Y", "Z", "-Z", "X", "-X"].contains(&n.data.axis.as_str())
             {
                 return Err("Invalid axis, scale, or position".into());
             }
@@ -1152,6 +1232,39 @@ impl Project {
                     {
                         return Err("Invalid hair width or taper settings".into());
                     }
+                    if !["static", "animated"].contains(&hair.sim_mode.as_str())
+                        || hair.settle_steps == 0
+                        || hair.settle_steps > 500
+                        || !hair.start_frame.is_finite()
+                        || !hair.end_frame.is_finite()
+                        || hair.end_frame < hair.start_frame
+                        || (hair.end_frame - hair.start_frame) > 10000.0
+                        || hair.substeps == 0
+                        || hair.substeps > 64
+                        || hair.iterations == 0
+                        || hair.iterations > 128
+                        || !hair.stiffness.is_finite()
+                        || hair.stiffness < 0.0
+                        || hair.stiffness > 1.0
+                        || !hair.bend_stiffness.is_finite()
+                        || hair.bend_stiffness < 0.0
+                        || hair.bend_stiffness > 1.0
+                        || !hair.damping.is_finite()
+                        || hair.damping < 0.0
+                        || hair.damping > 1.0
+                        || !hair.gravity.is_finite()
+                        || hair.gravity < -100.0
+                        || hair.gravity > 100.0
+                        || hair.wind.iter().any(|w| !w.is_finite() || w.abs() > 200.0)
+                        || !hair.collision_margin.is_finite()
+                        || hair.collision_margin < 0.0
+                        || hair.collision_margin > 1.0
+                        || !hair.friction.is_finite()
+                        || hair.friction < 0.0
+                        || hair.friction > 1.0
+                    {
+                        return Err("Invalid hair simulation settings".into());
+                    }
                 }
             }
             if n.data.operation == "light" {
@@ -1369,8 +1482,8 @@ pub fn save(path: &str, project: &Project) -> Result<(), String> {
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    if !["orchflow", "json"].contains(&extension.as_str()) {
-        return Err("Save an OrchFlow JSON (.orchflow or .json) file".into());
+    if !["sublayer", "json"].contains(&extension.as_str()) {
+        return Err("Save a Sublayer JSON (.sublayer or .json) file".into());
     }
     let target = file_key(path);
     if project
@@ -1472,7 +1585,7 @@ mod tests {
         std::fs::create_dir(&folder).unwrap();
         let usd = folder.join("original.usd");
         let native = folder.join("original.json");
-        let json = folder.join("scene.orchflow");
+        let json = folder.join("scene.sublayer");
         std::fs::write(&usd, b"original USD bytes").unwrap();
         std::fs::write(&native, b"original native bytes").unwrap();
         let mut p = project();

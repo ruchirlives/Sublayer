@@ -1,7 +1,7 @@
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 # Prefer the newest successful build; a replacement can be built while the old app is open.
-$executable = @('I:\AI\OrchFlow-build\debug\orchflow-updated.exe', 'I:\AI\OrchFlow-build\debug\orchflow-dragfix.exe') |
+$executable = @('I:\AI\OrchFlow-build\debug\sublayer-updated.exe', 'I:\AI\OrchFlow-build\debug\orchflow-updated.exe', 'I:\AI\OrchFlow-build\debug\orchflow-dragfix.exe') |
     Where-Object { Test-Path -LiteralPath $_ } |
     Get-Item | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
 if (-not $executable) { throw 'No desktop build found. Run scripts/build.ps1 first.' }

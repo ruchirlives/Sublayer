@@ -11,6 +11,7 @@ import {
   type MaterialXSettings,
   type ProceduralConfig,
   type ProceduralGraph,
+  type ProceduralGraphNode,
   type StoredProject,
 } from "./fileRegistry";
 
@@ -103,6 +104,8 @@ export function MaterialXPanel({
   procDraft.current = procGraph;
   const [_activeTab, _setActiveTab] = useState<"surface" | "transmission" | "coat" | "textures" | "procedural">("surface");
   const [tableView, setTableView] = useState<"levels" | "pbr" | "coat" | "trans" | "sss" | "textures">("levels");
+  const [focusOutputNodeId, setFocusOutputNodeId] = useState<string | null>(null);
+  const [highlightedCell, setHighlightedCell] = useState<{ ruleId: string; parameter: string } | null>(null);
   const [position, setPosition] = useState(() => ({
     x: Math.max(16, Math.min(60, Math.floor((window.innerWidth - 1000) / 2))),
     y: Math.max(20, Math.min(50, Math.floor((window.innerHeight - 660) / 2))),
@@ -299,6 +302,62 @@ export function MaterialXPanel({
   void _defaultProceduralFloat;
   void _browse;
 
+  function findProceduralDriver(ruleId: string, parameter: string): ProceduralGraphNode | undefined {
+    return procGraph.nodes.find((n) => {
+      const d = n.data;
+      if (d.kind !== "output" || d.enabled === false) return false;
+      if (d.materialXNodeId !== nodeId) return false;
+      if (d.ruleId && d.ruleId !== "*" && d.ruleId !== ruleId) return false;
+      if ((d.parameter || "base_color") !== parameter) return false;
+      return procGraph.edges.some((e) => e.target === n.id);
+    });
+  }
+
+  function cellProcProps(ruleId: string, parameter: string, baseClass?: string) {
+    const driver = findProceduralDriver(ruleId, parameter);
+    const isHighlighted = highlightedCell?.ruleId === ruleId && highlightedCell?.parameter === parameter;
+    const cls = [baseClass, driver ? "materialx-proc-driven" : "", isHighlighted ? "materialx-proc-flash" : ""]
+      .filter(Boolean)
+      .join(" ");
+    return {
+      className: cls || undefined,
+      title: driver
+        ? `Driven by procedural (${driver.data.mappingType || "replace"}). Double-click to open Output node.`
+        : undefined,
+      onDoubleClick: driver
+        ? () => {
+            setFocusOutputNodeId(driver.id);
+            setPanelView("procedural");
+          }
+        : undefined,
+    };
+  }
+
+  function viewForParameter(parameter: string): typeof tableView {
+    if (["specular_color", "specular_IOR"].includes(parameter)) return "pbr";
+    if (["coat_color", "sheen_color", "sheen_roughness"].includes(parameter)) return "coat";
+    if (["transmission_color", "emission_color"].includes(parameter)) return "trans";
+    if (["subsurface_scale", "subsurface_radius", "subsurface_color"].includes(parameter)) return "sss";
+    return "levels";
+  }
+
+  function handleInspectOutputNode(outNode: ProceduralGraphNode) {
+    const targetRuleId =
+      outNode.data.ruleId && outNode.data.ruleId !== "*" && rows.some((r) => r.id === outNode.data.ruleId)
+        ? outNode.data.ruleId
+        : rows[0]?.id || "";
+    const param = outNode.data.parameter || "base_color";
+    if (targetRuleId) setSelectedId(targetRuleId);
+    setTableView(viewForParameter(param));
+    setPanelView("material");
+    setHighlightedCell({ ruleId: targetRuleId, parameter: param });
+    window.setTimeout(() => {
+      setHighlightedCell((prev) =>
+        prev?.ruleId === targetRuleId && prev?.parameter === param ? null : prev,
+      );
+    }, 1800);
+  }
+
   return (
     <section
       ref={windowRef}
@@ -345,6 +404,9 @@ export function MaterialXPanel({
             setProcGraph(next);
             setDirty(true);
           }}
+          focusNodeId={focusOutputNodeId}
+          onFocusHandled={() => setFocusOutputNodeId(null)}
+          onInspectOutput={handleInspectOutputNode}
         />
       ) : (
         <>
@@ -496,7 +558,7 @@ export function MaterialXPanel({
                   </td>
                   {tableView === "levels" && (
                     <>
-                  <td className="materialx-color-cell">
+                  <td {...cellProcProps(row.id, "base_color", "materialx-color-cell")}>
                     <input
                       type="color"
                       disabled={busy}
@@ -505,7 +567,7 @@ export function MaterialXPanel({
                       onChange={(e) => material(row.id, { baseColor: hexToRgb(e.target.value) })}
                     />
                   </td>
-                  <td>
+                  <td {...cellProcProps(row.id, "metalness")}>
                     <NumberInput
                       aria-label={`Metalness row ${index + 1}`}
                       disabled={busy}
@@ -516,7 +578,7 @@ export function MaterialXPanel({
                       onChange={(e) => material(row.id, { metalness: Number(e.target.value) })}
                     />
                   </td>
-                  <td>
+                  <td {...cellProcProps(row.id, "specular_roughness")}>
                     <NumberInput
                       aria-label={`Roughness row ${index + 1}`}
                       disabled={busy}
@@ -527,7 +589,7 @@ export function MaterialXPanel({
                       onChange={(e) => material(row.id, { roughness: Number(e.target.value) })}
                     />
                   </td>
-                  <td>
+                  <td {...cellProcProps(row.id, "specular")}>
                     <NumberInput
                       aria-label={`Specular row ${index + 1}`}
                       disabled={busy}
@@ -538,7 +600,7 @@ export function MaterialXPanel({
                       onChange={(e) => material(row.id, { specular: Number(e.target.value) })}
                     />
                   </td>
-                  <td>
+                  <td {...cellProcProps(row.id, "opacity")}>
                     <NumberInput
                       aria-label={`Opacity row ${index + 1}`}
                       disabled={busy}
@@ -549,7 +611,7 @@ export function MaterialXPanel({
                       onChange={(e) => material(row.id, { opacity: Number(e.target.value) })}
                     />
                   </td>
-                  <td>
+                  <td {...cellProcProps(row.id, "coat")}>
                     <NumberInput
                       aria-label={`Coat row ${index + 1}`}
                       disabled={busy}
@@ -560,7 +622,7 @@ export function MaterialXPanel({
                       onChange={(e) => material(row.id, { coat: Number(e.target.value) })}
                     />
                   </td>
-                  <td>
+                  <td {...cellProcProps(row.id, "coat_roughness")}>
                     <NumberInput
                       aria-label={`Coat Roughness row ${index + 1}`}
                       disabled={busy}
@@ -571,7 +633,7 @@ export function MaterialXPanel({
                       onChange={(e) => material(row.id, { coatRoughness: Number(e.target.value) })}
                     />
                   </td>
-                  <td>
+                  <td {...cellProcProps(row.id, "sheen")}>
                     <NumberInput
                       aria-label={`Sheen row ${index + 1}`}
                       disabled={busy}
@@ -582,7 +644,7 @@ export function MaterialXPanel({
                       onChange={(e) => material(row.id, { sheen: Number(e.target.value) })}
                     />
                   </td>
-                  <td>
+                  <td {...cellProcProps(row.id, "transmission")}>
                     <NumberInput
                       aria-label={`Transmission row ${index + 1}`}
                       disabled={busy}
@@ -593,7 +655,7 @@ export function MaterialXPanel({
                       onChange={(e) => material(row.id, { transmission: Number(e.target.value) })}
                     />
                   </td>
-                  <td>
+                  <td {...cellProcProps(row.id, "emission")}>
                     <NumberInput
                       aria-label={`Emission row ${index + 1}`}
                       disabled={busy}
@@ -604,7 +666,7 @@ export function MaterialXPanel({
                       onChange={(e) => material(row.id, { emission: Number(e.target.value) })}
                     />
                   </td>
-                  <td>
+                  <td {...cellProcProps(row.id, "subsurface")}>
                     <NumberInput
                       aria-label={`Subsurface row ${index + 1}`}
                       disabled={busy}
@@ -619,50 +681,50 @@ export function MaterialXPanel({
                   )}
                   {tableView === "pbr" && (
                     <>
-                      <td className="materialx-color-cell">
+                      <td {...cellProcProps(row.id, "base_color", "materialx-color-cell")}>
                         <input disabled={busy} type="color" value={rgbToHex(rowMat.baseColor)} onChange={(e) => material(row.id, { baseColor: hexToRgb(e.target.value) })} />
                       </td>
-                      <td><NumberInput disabled={busy} min="0" max="1" step="0.05" value={rowMat.metalness} onChange={(e) => material(row.id, { metalness: Number(e.target.value) })} /></td>
-                      <td><NumberInput disabled={busy} min="0" max="1" step="0.05" value={rowMat.specular} onChange={(e) => material(row.id, { specular: Number(e.target.value) })} /></td>
-                      <td className="materialx-color-cell">
+                      <td {...cellProcProps(row.id, "metalness")}><NumberInput disabled={busy} min="0" max="1" step="0.05" value={rowMat.metalness} onChange={(e) => material(row.id, { metalness: Number(e.target.value) })} /></td>
+                      <td {...cellProcProps(row.id, "specular")}><NumberInput disabled={busy} min="0" max="1" step="0.05" value={rowMat.specular} onChange={(e) => material(row.id, { specular: Number(e.target.value) })} /></td>
+                      <td {...cellProcProps(row.id, "specular_color", "materialx-color-cell")}>
                         <input disabled={busy} type="color" value={rgbToHex(rowMat.specularColor ?? [1, 1, 1])} onChange={(e) => material(row.id, { specularColor: hexToRgb(e.target.value) })} />
                       </td>
-                      <td><NumberInput disabled={busy} min="0" max="1" step="0.05" value={rowMat.roughness} onChange={(e) => material(row.id, { roughness: Number(e.target.value) })} /></td>
-                      <td><NumberInput disabled={busy} min="1" max="5" step="0.05" value={rowMat.specularIor ?? 1.5} onChange={(e) => material(row.id, { specularIor: Number(e.target.value) })} /></td>
-                      <td><NumberInput disabled={busy} min="0" max="1" step="0.05" value={rowMat.opacity} onChange={(e) => material(row.id, { opacity: Number(e.target.value) })} /></td>
+                      <td {...cellProcProps(row.id, "specular_roughness")}><NumberInput disabled={busy} min="0" max="1" step="0.05" value={rowMat.roughness} onChange={(e) => material(row.id, { roughness: Number(e.target.value) })} /></td>
+                      <td {...cellProcProps(row.id, "specular_IOR")}><NumberInput disabled={busy} min="1" max="5" step="0.05" value={rowMat.specularIor ?? 1.5} onChange={(e) => material(row.id, { specularIor: Number(e.target.value) })} /></td>
+                      <td {...cellProcProps(row.id, "opacity")}><NumberInput disabled={busy} min="0" max="1" step="0.05" value={rowMat.opacity} onChange={(e) => material(row.id, { opacity: Number(e.target.value) })} /></td>
                     </>
                   )}
                   {tableView === "coat" && (
                     <>
-                      <td><NumberInput disabled={busy} min="0" max="1" step="0.05" value={rowMat.coat ?? 0} onChange={(e) => material(row.id, { coat: Number(e.target.value) })} /></td>
-                      <td className="materialx-color-cell">
+                      <td {...cellProcProps(row.id, "coat")}><NumberInput disabled={busy} min="0" max="1" step="0.05" value={rowMat.coat ?? 0} onChange={(e) => material(row.id, { coat: Number(e.target.value) })} /></td>
+                      <td {...cellProcProps(row.id, "coat_color", "materialx-color-cell")}>
                         <input disabled={busy} type="color" value={rgbToHex(rowMat.coatColor ?? [1, 1, 1])} onChange={(e) => material(row.id, { coatColor: hexToRgb(e.target.value) })} />
                       </td>
-                      <td><NumberInput disabled={busy} min="0" max="1" step="0.05" value={rowMat.coatRoughness ?? 0.1} onChange={(e) => material(row.id, { coatRoughness: Number(e.target.value) })} /></td>
-                      <td><NumberInput disabled={busy} min="0" max="1" step="0.05" value={rowMat.sheen ?? 0} onChange={(e) => material(row.id, { sheen: Number(e.target.value) })} /></td>
-                      <td className="materialx-color-cell">
+                      <td {...cellProcProps(row.id, "coat_roughness")}><NumberInput disabled={busy} min="0" max="1" step="0.05" value={rowMat.coatRoughness ?? 0.1} onChange={(e) => material(row.id, { coatRoughness: Number(e.target.value) })} /></td>
+                      <td {...cellProcProps(row.id, "sheen")}><NumberInput disabled={busy} min="0" max="1" step="0.05" value={rowMat.sheen ?? 0} onChange={(e) => material(row.id, { sheen: Number(e.target.value) })} /></td>
+                      <td {...cellProcProps(row.id, "sheen_color", "materialx-color-cell")}>
                         <input disabled={busy} type="color" value={rgbToHex(rowMat.sheenColor ?? [1, 1, 1])} onChange={(e) => material(row.id, { sheenColor: hexToRgb(e.target.value) })} />
                       </td>
-                      <td><NumberInput disabled={busy} min="0" max="1" step="0.05" value={rowMat.sheenRoughness ?? 0.3} onChange={(e) => material(row.id, { sheenRoughness: Number(e.target.value) })} /></td>
+                      <td {...cellProcProps(row.id, "sheen_roughness")}><NumberInput disabled={busy} min="0" max="1" step="0.05" value={rowMat.sheenRoughness ?? 0.3} onChange={(e) => material(row.id, { sheenRoughness: Number(e.target.value) })} /></td>
                     </>
                   )}
                   {tableView === "trans" && (
                     <>
-                      <td><NumberInput disabled={busy} min="0" max="1" step="0.05" value={rowMat.transmission ?? 0} onChange={(e) => material(row.id, { transmission: Number(e.target.value) })} /></td>
-                      <td className="materialx-color-cell">
+                      <td {...cellProcProps(row.id, "transmission")}><NumberInput disabled={busy} min="0" max="1" step="0.05" value={rowMat.transmission ?? 0} onChange={(e) => material(row.id, { transmission: Number(e.target.value) })} /></td>
+                      <td {...cellProcProps(row.id, "transmission_color", "materialx-color-cell")}>
                         <input disabled={busy} type="color" value={rgbToHex(rowMat.transmissionColor ?? [1, 1, 1])} onChange={(e) => material(row.id, { transmissionColor: hexToRgb(e.target.value) })} />
                       </td>
-                      <td><NumberInput disabled={busy} min="0" max="1000" step="0.1" value={rowMat.emission ?? 0} onChange={(e) => material(row.id, { emission: Number(e.target.value) })} /></td>
-                      <td className="materialx-color-cell">
+                      <td {...cellProcProps(row.id, "emission")}><NumberInput disabled={busy} min="0" max="1000" step="0.1" value={rowMat.emission ?? 0} onChange={(e) => material(row.id, { emission: Number(e.target.value) })} /></td>
+                      <td {...cellProcProps(row.id, "emission_color", "materialx-color-cell")}>
                         <input disabled={busy} type="color" value={rgbToHex(rowMat.emissionColor ?? [1, 1, 1])} onChange={(e) => material(row.id, { emissionColor: hexToRgb(e.target.value) })} />
                       </td>
                     </>
                   )}
                   {tableView === "sss" && (
                     <>
-                      <td><NumberInput disabled={busy} min="0" max="1" step="0.05" value={rowMat.subsurface ?? 0} onChange={(e) => material(row.id, { subsurface: Number(e.target.value) })} /></td>
-                      <td><NumberInput disabled={busy} min="0" max="100" step="0.05" value={rowMat.subsurfaceScale ?? 1.0} onChange={(e) => material(row.id, { subsurfaceScale: Number(e.target.value) })} /></td>
-                      <td>
+                      <td {...cellProcProps(row.id, "subsurface")}><NumberInput disabled={busy} min="0" max="1" step="0.05" value={rowMat.subsurface ?? 0} onChange={(e) => material(row.id, { subsurface: Number(e.target.value) })} /></td>
+                      <td {...cellProcProps(row.id, "subsurface_scale")}><NumberInput disabled={busy} min="0" max="100" step="0.05" value={rowMat.subsurfaceScale ?? 1.0} onChange={(e) => material(row.id, { subsurfaceScale: Number(e.target.value) })} /></td>
+                      <td {...cellProcProps(row.id, "subsurface_radius")}>
                         <div className="materialx-rgb">
                           {(rowMat.subsurfaceRadius ?? [1, 1, 1]).map((v, ci) => (
                             <NumberInput

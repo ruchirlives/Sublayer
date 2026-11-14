@@ -3,7 +3,8 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { LatestRenderQueue, previewSize } from "./renderQueue";
 import { NumberInput } from "./NumberInput";
-import type { ViewportCamera, ViewportSettings } from "./fileRegistry";
+import type { Transform, ViewportCamera, ViewportSettings } from "./fileRegistry";
+import { TransformGizmo } from "./TransformGizmo";
 
 type Delegate = { id: string; name: string; support: string };
 type OvrtxMode = "realtime" | "pathTracing";
@@ -74,6 +75,7 @@ export function NativeViewport({
   cameraKey,
   comparison,
   viewportSettings,
+  transformGizmo,
   onRuntime,
   onMode,
   onSelectPrim,
@@ -90,6 +92,11 @@ export function NativeViewport({
   cameraKey?:string;
   comparison?:string;
   viewportSettings?: ViewportSettings;
+  transformGizmo?: {
+    transform: Transform;
+    onChange: (next: Transform) => void;
+    onCommit?: () => void;
+  } | null;
   onRuntime: (text: string) => void;
   onMode: (scene: boolean) => void;
   onSelectPrim?: (path: string) => void;
@@ -125,6 +132,34 @@ export function NativeViewport({
   const previousReload = useRef(0);
   const [retry, setRetry] = useState(0);
   const [time, setTime] = useState(0);
+  const [playing, setPlaying] = useState(false);
+  const [playStart, setPlayStart] = useState(1);
+  const [playEnd, setPlayEnd] = useState(48);
+  const [playLoop, setPlayLoop] = useState(true);
+  const [combMode, setCombMode] = useState(false);
+  const [brushRadius, setBrushRadius] = useState(0.06);
+  const [brushRadiusText, setBrushRadiusText] = useState("0.06");
+  const [brushStrength, setBrushStrength] = useState(1.0);
+  const [brushStrengthText, setBrushStrengthText] = useState("1.0");
+  const [hairBrush, setHairBrush] = useState<{
+    nx: number;
+    ny: number;
+    prevNx: number;
+    prevNy: number;
+    radius: number;
+    strength: number;
+    newStroke?: boolean;
+    strokeId?: number;
+    settleOnly?: boolean;
+    commitUsd?: boolean;
+    seq: number;
+  } | null>(null);
+  const [hairSettleTicks, setHairSettleTicks] = useState(0);
+  const [brushingActive, setBrushingActive] = useState(false);
+  const brushSeqRef = useRef(0);
+  const brushStrokeIdRef = useRef(0);
+  const brushNewStrokeRef = useRef(false);
+  const brushDragRef = useRef<{ nx: number; ny: number } | null>(null);
   const materials = "auto";
   const [interacting, setInteracting] = useState(false);
 
@@ -188,6 +223,78 @@ export function NativeViewport({
 
 
   useEffect(() => {
+    if (error || !path || !capabilities?.viewport) {
+      setPlaying(false);
+    }
+  }, [error, path, capabilities?.viewport]);
+
+  useEffect(() => {
+    if (hairSettleTicks <= 0 || busy || brushDragRef.current) return;
+    const timer = window.setTimeout(() => {
+      const next = hairSettleTicks - 1;
+      setHairSettleTicks(next);
+      if (next > 0) {
+        setHairBrush({
+          nx: 0.5,
+          ny: 0.5,
+          prevNx: 0.5,
+          prevNy: 0.5,
+          radius: brushRadius,
+          strength: brushStrength,
+          settleOnly: true,
+          commitUsd: next === 1,
+          seq: ++brushSeqRef.current,
+        });
+      } else {
+        setHairBrush(null);
+        setInteracting(false);
+      }
+    }, 16);
+    return () => window.clearTimeout(timer);
+  }, [hairSettleTicks, busy, brushRadius, brushStrength]);
+
+  useEffect(() => {
+    if (!brushingActive || busy) return;
+    const timer = window.setTimeout(() => {
+      const cur = brushDragRef.current;
+      if (!cur) return;
+      const isNewStroke = brushNewStrokeRef.current;
+      brushNewStrokeRef.current = false;
+      setHairBrush({
+        nx: cur.nx,
+        ny: cur.ny,
+        prevNx: cur.nx,
+        prevNy: cur.ny,
+        radius: brushRadius,
+        strength: brushStrength,
+        newStroke: isNewStroke,
+        strokeId: brushStrokeIdRef.current,
+        seq: ++brushSeqRef.current,
+      });
+    }, 16);
+    return () => window.clearTimeout(timer);
+  }, [brushingActive, busy, hairBrush, brushRadius, brushStrength]);
+
+  useEffect(() => {
+    if (!playing || busy || error || !path || !capabilities?.viewport) return;
+    const delayMs = renderer === "OmniverseRTX" ? 80 : 35;
+    const timer = window.setTimeout(() => {
+      setTime((cur) => {
+        if (cur < playStart) return playStart;
+        if (cur >= playEnd) {
+          if (!playLoop) {
+            setPlaying(false);
+            return playEnd;
+          }
+          return playStart;
+        }
+        return cur + 1;
+      });
+    }, delayMs);
+    return () => window.clearTimeout(timer);
+  }, [playing, busy, error, path, capabilities?.viewport, renderer, playStart, playEnd, playLoop, time]);
+
+  useEffect(() => {
     const registeredGraphs=new Set<string>();
     const scheduler = new LatestRenderQueue<Record<string, unknown>, Frame>({
       render: async (request) => {
@@ -199,6 +306,10 @@ export function NativeViewport({
           anchor?.session === request.cameraSession && anchor?.fit === request.frameFit ? anchor : undefined;
         const isExplicitReload = typeof request.reloadTrigger === "number" && request.reloadTrigger > 0 && request.reloadTrigger !== previousReload.current;
         if (typeof request.reloadTrigger === "number") previousReload.current = request.reloadTrigger;
+        const hb = cameraRequest.hairBrush as { nx?: number; ny?: number } | undefined;
+        if (hb && typeof hb.nx === "number" && typeof hb.ny === "number" && brushDragRef.current) {
+          brushDragRef.current = { nx: hb.nx, ny: hb.ny };
+        }
         const render=async(register:boolean)=>invoke<Frame>("usd_request",{request:{...cameraRequest,cameraAnchor:retainedAnchor,...(register?{graph}:{}),reload:isExplicitReload}});
         let result:Frame;
         try{result=await render(!!graph&&(!graphKey||!registeredGraphs.has(registrationKey)));}
@@ -319,6 +430,19 @@ export function NativeViewport({
     if (wheelEnd.current !== null) clearTimeout(wheelEnd.current);
   }, [cameraKey || path]);
   const graphKey=useMemo(()=>graph?hashContent(graph):undefined,[graph]);
+  const hasSimulatedHair = useMemo(() => {
+    if (!graph) return false;
+    try {
+      const g = JSON.parse(graph);
+      const t = g?.nodes?.find((n: { id?: string }) => n.id === g.targetNodeId);
+      return t?.operation === "hair" && Boolean(t?.hair?.simEnabled);
+    } catch {
+      return false;
+    }
+  }, [graph]);
+  useEffect(() => {
+    if (!hasSimulatedHair && combMode) setCombMode(false);
+  }, [hasSimulatedHair, combMode]);
   const request = useMemo(
     () => ({
       operation: "render",
@@ -340,6 +464,7 @@ export function NativeViewport({
       interactive: interacting,
       frame: time,
       materials,
+      hairBrush: hairBrush || undefined,
       revision,
       reloadTrigger,
     }),
@@ -353,6 +478,7 @@ export function NativeViewport({
       camera,
       time,
       materials,
+      hairBrush,
       revision,
       reloadTrigger,
       interacting,
@@ -379,7 +505,7 @@ export function NativeViewport({
   const currentContextKey = `${context}:${reloadTrigger}`;
   latestContextKeyRef.current = currentContextKey;
   const showBusyStatus =
-    busy && (!frame || presentedContext !== currentContextKey || activeStatus !== null);
+    busy && !hairBrush && !playing && (!frame || presentedContext !== currentContextKey || activeStatus !== null);
   const [busyElapsedSec, setBusyElapsedSec] = useState(0);
   useEffect(() => {
     if (!showBusyStatus) {
@@ -454,8 +580,20 @@ export function NativeViewport({
     },
     [request, onSelectPrim],
   );
-  const graphPickRef = useRef({ sceneMode, pickPrimAtClientPoint });
-  graphPickRef.current = { sceneMode, pickPrimAtClientPoint };
+  const switchToGraphMode = useCallback(() => {
+    setSceneMode(false);
+    setContextMenu(null);
+    drag.current = null;
+    setInteracting(false);
+    if (wheelEnd.current !== null) clearTimeout(wheelEnd.current);
+    onMode(false);
+  }, [onMode]);
+  const switchToSceneMode = useCallback(() => {
+    setSceneMode(true);
+    onMode(true);
+  }, [onMode]);
+  const graphPickRef = useRef({ sceneMode, pickPrimAtClientPoint, switchToSceneMode });
+  graphPickRef.current = { sceneMode, pickPrimAtClientPoint, switchToSceneMode };
   useEffect(() => {
     let pending: { x: number; y: number } | null = null;
     const onDown = (event: globalThis.PointerEvent) => {
@@ -491,13 +629,57 @@ export function NativeViewport({
     const onCancel = () => {
       pending = null;
     };
+    const onDblClick = (event: globalThis.MouseEvent) => {
+      if (graphPickRef.current.sceneMode) return;
+      if (event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+      if (!host.current) return;
+      if (
+        !(event.target instanceof Element) ||
+        !event.target.closest(".react-flow__pane") ||
+        event.target.closest(
+          ".react-flow__node, .react-flow__edge, .react-flow__controls, .react-flow__minimap, .viewport-controls, .viewport-bar, .viewport-caption, .override-backdrop, .floating-inspector, button, input, select, textarea, a",
+        )
+      ) {
+        return;
+      }
+      const rect = host.current.getBoundingClientRect();
+      if (
+        event.clientX < rect.left ||
+        event.clientX > rect.right ||
+        event.clientY < rect.top ||
+        event.clientY > rect.bottom
+      ) {
+        return;
+      }
+      event.preventDefault();
+      window.getSelection()?.removeAllRanges();
+      graphPickRef.current.switchToSceneMode();
+    };
+    const onMouseDown = (event: globalThis.MouseEvent) => {
+      if (graphPickRef.current.sceneMode || event.detail < 2) return;
+      if (event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+      if (
+        !(event.target instanceof Element) ||
+        !event.target.closest(".react-flow__pane") ||
+        event.target.closest(
+          ".react-flow__node, .react-flow__edge, .react-flow__controls, .react-flow__minimap, .viewport-controls, .viewport-bar, .viewport-caption, .override-backdrop, .floating-inspector, button, input, select, textarea, a",
+        )
+      ) {
+        return;
+      }
+      event.preventDefault();
+    };
     window.addEventListener("pointerdown", onDown, true);
     window.addEventListener("pointerup", onUp, true);
     window.addEventListener("pointercancel", onCancel, true);
+    window.addEventListener("mousedown", onMouseDown, true);
+    window.addEventListener("dblclick", onDblClick, true);
     return () => {
       window.removeEventListener("pointerdown", onDown, true);
       window.removeEventListener("pointerup", onUp, true);
       window.removeEventListener("pointercancel", onCancel, true);
+      window.removeEventListener("mousedown", onMouseDown, true);
+      window.removeEventListener("dblclick", onDblClick, true);
     };
   }, []);
 
@@ -518,6 +700,32 @@ export function NativeViewport({
       // Don't start orbit/pan drag when Ctrl-clicking for selection
       return;
     }
+    if (combMode && hasSimulatedHair && event.button === 0 && !event.shiftKey && !isDolly) {
+      const rect = host.current?.getBoundingClientRect();
+      if (rect && rect.width > 0 && rect.height > 0) {
+        const nx = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
+        const ny = Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height));
+        brushDragRef.current = { nx, ny };
+        brushNewStrokeRef.current = false;
+        const nextStrokeId = ++brushStrokeIdRef.current;
+        setHairSettleTicks(0);
+        setBrushingActive(true);
+        setInteracting(true);
+        setHairBrush({
+          nx,
+          ny,
+          prevNx: nx,
+          prevNy: ny,
+          radius: brushRadius,
+          strength: brushStrength,
+          newStroke: true,
+          strokeId: nextStrokeId,
+          seq: ++brushSeqRef.current,
+        });
+        event.currentTarget.setPointerCapture(event.pointerId);
+        return;
+      }
+    }
     setInteracting(true);
     event.currentTarget.setPointerCapture(event.pointerId);
     drag.current = {
@@ -530,12 +738,22 @@ export function NativeViewport({
   }
   function endInteraction() {
     drag.current = null;
+    brushDragRef.current = null;
+    setBrushingActive(false);
+    setHairSettleTicks(0);
+    setHairBrush(null);
     setInteracting(false);
   }
   async function handlePointerUp(event: PointerEvent<HTMLDivElement>) {
     const cs = clickStart.current;
     clickStart.current = null;
     const dist = cs ? Math.hypot(event.clientX - cs.x, event.clientY - cs.y) : Infinity;
+    if (brushDragRef.current) {
+      brushDragRef.current = null;
+      setBrushingActive(false);
+      setHairSettleTicks(30);
+      return;
+    }
     if (drag.current) {
       if (dist >= 6) {
         pointerMove(event);
@@ -562,6 +780,28 @@ export function NativeViewport({
     }
   }
   function pointerMove(event: PointerEvent<HTMLDivElement>) {
+    if (brushDragRef.current) {
+      const rect = host.current?.getBoundingClientRect();
+      if (!rect || rect.width <= 0 || rect.height <= 0) return;
+      const nx = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
+      const ny = Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height));
+      const prev = brushDragRef.current;
+      brushDragRef.current = { nx, ny };
+      const isNewStroke = brushNewStrokeRef.current;
+      brushNewStrokeRef.current = false;
+      setHairBrush({
+        nx,
+        ny,
+        prevNx: prev.nx,
+        prevNy: prev.ny,
+        radius: brushRadius,
+        strength: brushStrength,
+        newStroke: isNewStroke,
+        strokeId: brushStrokeIdRef.current,
+        seq: ++brushSeqRef.current,
+      });
+      return;
+    }
     const start = drag.current;
     if (!start) return;
     const dx = event.clientX - start.x,
@@ -617,11 +857,20 @@ export function NativeViewport({
         <div
           className={"scene-input " + (sceneMode ? "enabled" : "")}
           onContextMenu={(e) => e.preventDefault()}
+          onMouseDown={(e) => {
+            if (e.detail > 1) e.preventDefault();
+          }}
           onPointerDown={pointerDown}
           onPointerMove={pointerMove}
           onPointerUp={handlePointerUp}
           onPointerCancel={endInteraction}
           onLostPointerCapture={endInteraction}
+          onDoubleClick={(e) => {
+            if (!sceneMode || e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
+            e.preventDefault();
+            window.getSelection()?.removeAllRanges();
+            switchToGraphMode();
+          }}
           onWheel={(e) => {
             if (sceneMode) {
               setInteracting(true);
@@ -640,6 +889,19 @@ export function NativeViewport({
             }
           }}
         />
+        {transformGizmo && frame && (
+          <TransformGizmo
+            transform={transformGizmo.transform}
+            camera={camera}
+            upAxis={upAxis}
+            width={size.width}
+            height={size.height}
+            radius={frame.cameraAnchor?.radius ?? cameraAnchor.current?.radius ?? 1}
+            interactive={sceneMode}
+            onChange={transformGizmo.onChange}
+            onCommit={transformGizmo.onCommit}
+          />
+        )}
         {sceneMode && contextMenu && (
           <div
             className="scene-context-menu"
@@ -760,21 +1022,13 @@ export function NativeViewport({
         <div className="mode-buttons">
           <button
             className={!sceneMode ? "chosen" : ""}
-            onClick={() => {
-              setSceneMode(false);
-              endInteraction();
-              if (wheelEnd.current !== null) clearTimeout(wheelEnd.current);
-              onMode(false);
-            }}
+            onClick={switchToGraphMode}
           >
             Graph
           </button>
           <button
             className={sceneMode ? "chosen" : ""}
-            onClick={() => {
-              setSceneMode(true);
-              onMode(true);
-            }}
+            onClick={switchToSceneMode}
           >
             Scene
           </button>
@@ -857,18 +1111,200 @@ export function NativeViewport({
               {frame.cachedScenes ? ` (${frame.cachedScenes})` : ""}
             </span>
           )}
-          <label>
-            Time
-            <NumberInput
-              aria-label="USD time code"
-              step={1}
-              value={time}
-              onChange={(e) => {
-                const value = Number(e.target.value);
-                if (Number.isFinite(value)) setTime(value);
+          {hasSimulatedHair && (
+            <div style={{ display: "inline-flex", alignItems: "center", gap: "4px" }}>
+              <button
+                type="button"
+                className={combMode ? "chosen" : ""}
+                title="Toggle mouse hair comb / grab brush in Scene mode"
+                onClick={() => setCombMode((v) => !v)}
+              >
+                {combMode ? "Comb (Active)" : "Comb Hair"}
+              </button>
+              {combMode && (
+                <>
+                  <label title="Brush radius (m)">
+                    Rad
+                    <input
+                      type="text"
+                      inputMode="decimal"
+                      value={brushRadiusText}
+                      onChange={(e) => {
+                        const raw = e.target.value;
+                        setBrushRadiusText(raw);
+                        const v = Number(raw);
+                        if (raw.trim() !== "" && Number.isFinite(v) && v >= 0.005 && v <= 2.0) {
+                          setBrushRadius(v);
+                        }
+                      }}
+                      onBlur={() => {
+                        const v = Number(brushRadiusText);
+                        const clamped = Number.isFinite(v)
+                          ? Math.min(2.0, Math.max(0.005, v))
+                          : brushRadius;
+                        setBrushRadius(clamped);
+                        setBrushRadiusText(String(Number(clamped.toFixed(3))));
+                      }}
+                      style={{ width: "50px" }}
+                    />
+                  </label>
+                  <label title="Brush strength">
+                    Str
+                    <input
+                      type="text"
+                      inputMode="decimal"
+                      value={brushStrengthText}
+                      onChange={(e) => {
+                        const raw = e.target.value;
+                        setBrushStrengthText(raw);
+                        const v = Number(raw);
+                        if (raw.trim() !== "" && Number.isFinite(v) && v >= 0.1 && v <= 5.0) {
+                          setBrushStrength(v);
+                        }
+                      }}
+                      onBlur={() => {
+                        const v = Number(brushStrengthText);
+                        const clamped = Number.isFinite(v)
+                          ? Math.min(5.0, Math.max(0.1, v))
+                          : brushStrength;
+                        setBrushStrength(clamped);
+                        setBrushStrengthText(String(Number(clamped.toFixed(2))));
+                      }}
+                      style={{ width: "44px" }}
+                    />
+                  </label>
+                </>
+              )}
+              <button
+                type="button"
+                disabled={!isTauri()}
+                title="Reset interactive hair pose back to simulated rest state"
+                onClick={async () => {
+                  if (!isTauri()) return;
+                  try {
+                    await invoke("usd_request", { request: { operation: "reset_hair" } });
+                  } catch {
+                    // ignore
+                  }
+                  setRevision((r) => r + 1);
+                }}
+              >
+                Reset hair
+              </button>
+            </div>
+          )}
+          <div style={{ display: "inline-flex", alignItems: "center", gap: "4px" }}>
+            <button
+              type="button"
+              disabled={!path || !capabilities?.viewport}
+              title="Jump to start frame"
+              onClick={() => {
+                setPlaying(false);
+                setTime(playStart);
               }}
+            >
+              ⏮
+            </button>
+            <button
+              type="button"
+              disabled={!path || !capabilities?.viewport}
+              title="Previous frame"
+              onClick={() => {
+                setPlaying(false);
+                setTime((t) => t - 1);
+              }}
+            >
+              ◀
+            </button>
+            <button
+              type="button"
+              disabled={!path || !capabilities?.viewport}
+              className={playing ? "chosen" : ""}
+              title={playing ? "Pause timeline preview" : "Play timeline preview"}
+              onClick={() => {
+                if (!playing && (time < playStart || time > playEnd)) {
+                  setTime(playStart);
+                }
+                setPlaying((p) => !p);
+              }}
+            >
+              {playing ? "⏸" : "▶"}
+            </button>
+            <button
+              type="button"
+              disabled={!path || !capabilities?.viewport}
+              title="Next frame"
+              onClick={() => {
+                setPlaying(false);
+                setTime((t) => t + 1);
+              }}
+            >
+              ▶|
+            </button>
+            <input
+              type="range"
+              aria-label="Timeline scrubber"
+              disabled={!path || !capabilities?.viewport}
+              min={playStart}
+              max={Math.max(playStart, playEnd)}
+              step={1}
+              value={Math.max(playStart, Math.min(playEnd, time))}
+              onChange={(e) => {
+                setPlaying(false);
+                setTime(Number(e.target.value));
+              }}
+              style={{ width: "88px" }}
             />
-          </label>
+            <label title="Current USD time code">
+              Time
+              <NumberInput
+                aria-label="USD time code"
+                step={1}
+                value={time}
+                onChange={(e) => {
+                  const value = Number(e.target.value);
+                  if (Number.isFinite(value)) {
+                    setPlaying(false);
+                    setTime(value);
+                  }
+                }}
+              />
+            </label>
+            <NumberInput
+              aria-label="Playback start frame"
+              title="Playback start frame"
+              step={1}
+              value={playStart}
+              onChange={(e) => {
+                const v = Math.round(Number(e.target.value));
+                if (Number.isFinite(v)) {
+                  setPlayStart(v);
+                  if (v > playEnd) setPlayEnd(v);
+                }
+              }}
+              style={{ width: "44px" }}
+            />
+            <span style={{ opacity: 0.5, fontSize: "11px" }}>–</span>
+            <NumberInput
+              aria-label="Playback end frame"
+              title="Playback end frame"
+              step={1}
+              value={playEnd}
+              onChange={(e) => {
+                const v = Math.round(Number(e.target.value));
+                if (Number.isFinite(v) && v >= playStart) setPlayEnd(v);
+              }}
+              style={{ width: "44px" }}
+            />
+            <button
+              type="button"
+              className={playLoop ? "chosen" : ""}
+              title={playLoop ? "Loop playback enabled" : "Loop playback disabled"}
+              onClick={() => setPlayLoop((l) => !l)}
+            >
+              Loop
+            </button>
+          </div>
           <select
             aria-label="Renderer"
             disabled={!capabilities?.viewport}
@@ -936,8 +1372,8 @@ export function NativeViewport({
       <div className="viewport-caption">
         <span>
           {sceneMode
-            ? "Drag to orbit · Shift/right-drag to pan · Right-click for menu · Ctrl+right-drag or scroll to dolly · Ctrl-click to pick"
-            : "Graph mode · Ctrl-click to pick · switch to Scene to move the camera"}
+            ? "Drag to orbit · Shift/right-drag to pan · Right-click for menu · Double-click for Graph · Ctrl+right-drag or scroll to dolly · Ctrl-click to pick"
+            : "Graph mode · Double-click canvas for Scene · Ctrl-click to pick"}
         </span>
         {showBusyStatus ? (
           <span className="viewport-status-active">

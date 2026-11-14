@@ -181,6 +181,8 @@ impl DesktopBridge {
     }
 }
 
+// Used by the `orchflow-mcp` binary (`mcp_main.rs`), not by `tauri-app` lib.
+#[allow(dead_code)]
 pub fn send_command(action: &str, args: Value) -> Result<Value, String> {
     let path = bridge_file_path();
     let raw = std::fs::read_to_string(&path).map_err(|_| {

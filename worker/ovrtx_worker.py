@@ -1,3 +1,11 @@
+# SPDX-License-Identifier: GPL-3.0-or-later WITH GPL-3.0-linking-exception
+#
+# Additional Permission under GNU GPL version 3 section 7:
+# As a special exception, the copyright holders of Sublayer give you permission
+# to combine and run this file with the external, separately installed NVIDIA
+# Omniverse RTX runtime libraries (`ovrtx` and `ovstage`), and to distribute
+# Sublayer under GPL-3.0-or-later without including those proprietary libraries
+# in the Corresponding Source (see LICENSE-EXCEPTION.md).
 """Standalone NVIDIA Omniverse RTX (ovrtx) worker process.
 
 Runs in an isolated Python environment (.venv-ovrtx) to avoid ABI or symbol
@@ -353,8 +361,17 @@ class OvrtxViewport:
         focus_distance = max(0.01, float(request.get("focusDistance") or 5.0))
         f_stop = max(0.1, float(request.get("fStop") or 5.6))
         distance = radius / math.sin(math.atan(math.tan(math.radians(22.5))*min(width/height, 1))) * 1.15 * float(request.get("zoom", 1))
+        eye = center + forward * distance
+        self.last_camera_basis = {
+            "origin": (float(eye[0]), float(eye[1]), float(eye[2])),
+            "forward": (float(-forward[0]), float(-forward[1]), float(-forward[2])),
+            "right": (float(right[0]), float(right[1]), float(right[2])),
+            "up": (float(camera_up[0]), float(camera_up[1]), float(camera_up[2])),
+            "tan_half_fov": float(math.tan(half_fov)),
+            "aspect": float(width) / float(max(height, 1)),
+        }
         camera = UsdGeom.Camera.Define(stage, "/Render/Camera")
-        camera.MakeMatrixXform().Set(Gf.Matrix4d().SetLookAt(center + forward*distance, center, up).GetInverse())
+        camera.MakeMatrixXform().Set(Gf.Matrix4d().SetLookAt(eye, center, up).GetInverse())
         camera.CreateHorizontalApertureAttr().Set(36.0 * width / height)
         camera.CreateVerticalApertureAttr().Set(36.0)
         camera.CreateFocalLengthAttr().Set(36.0 / (2 * math.tan(half_fov)))
@@ -364,8 +381,11 @@ class OvrtxViewport:
         if product_prim and product_prim.IsValid():
             product_prim.CreateAttribute("omni:rtx:post:dof:enabled", Sdf.ValueTypeNames.Bool, custom=False).Set(dof_enabled)
             product_prim.CreateAttribute("omni:rtx:post:dof:overrideEnabled", Sdf.ValueTypeNames.Bool, custom=False).Set(dof_enabled)
-        near_clip = max(1e-5, min(radius * 0.0001, distance * 0.02), distance - radius * 2)
-        camera.CreateClippingRangeAttr().Set((near_clip, distance + radius * 4))
+        scene_radius = self.scene_camera_anchor[1] if hasattr(self, "scene_camera_anchor") else radius
+        clip_radius = max(radius, scene_radius)
+        near_clip = max(1e-5, min(clip_radius * 0.0001, distance * 0.01), distance - clip_radius * 2)
+        far_clip = max(distance + clip_radius * 4, clip_radius * 8)
+        camera.CreateClippingRangeAttr().Set((near_clip, far_clip))
 
     def _read_pick_hit(self, frame):
         render_vars = frame.render_vars
@@ -421,6 +441,93 @@ class OvrtxViewport:
         # (which has omni:rtx:pt:samplesPerPixel = 1); mark it to be raised to target_spp.
         self._pt_spp_at_one = True
         self.overlay_path = new_path
+
+    def _write_hair_points_to_ovstage(self, updates):
+        if not updates:
+            return
+        self.ordinal += 1
+        dl_vec3 = ovstage.DLDataType(ovstage.DLDataTypeCode.kDLFloat, 32, 3)
+        with ovstage.PathDictionary(self.stage) as paths:
+            for prim_path, pts_buf in updates:
+                pl = paths.create_path_list_from_strings([prim_path])
+                try:
+                    q = self.stage.query_from_path_list(pl)
+                    dt = ovstage.make_dltensor(pts_buf, dtype=dl_vec3, shape=[len(pts_buf)])
+                    placement = (
+                        ovstage.Placement.from_dlpack_device(pts_buf)
+                        if not isinstance(pts_buf, np.ndarray) and hasattr(pts_buf, "__dlpack_device__")
+                        else None
+                    )
+                    self.stage.write_attribute(
+                        q,
+                        "points",
+                        self.ordinal,
+                        [dt],
+                        is_array=True,
+                        semantic=ovstage.AttributeSemantic.POINT,
+                        placement=placement,
+                    ).wait()
+                finally:
+                    paths.destroy_path_list(pl)
+        self.stage.advance_write_floor(self.ordinal).wait()
+
+    def _try_fast_hair_delta(self, prev_graph, next_graph, sample_frame):
+        """Update BasisCurves.points in-place on the live ovstage when only Hair sim settings change."""
+        if not isinstance(prev_graph, dict) or not isinstance(next_graph, dict):
+            return False
+        if (
+            prev_graph.get("targetNodeId") != next_graph.get("targetNodeId")
+            or prev_graph.get("edges") != next_graph.get("edges")
+            or prev_graph.get("dependencies") != next_graph.get("dependencies")
+        ):
+            return False
+        prev_nodes = prev_graph.get("nodes") or []
+        next_nodes = next_graph.get("nodes") or []
+        if len(prev_nodes) != len(next_nodes):
+            return False
+        diff_pair = None
+        for pn, nn in zip(prev_nodes, next_nodes):
+            if pn == nn:
+                continue
+            if diff_pair is not None:
+                return False
+            diff_pair = (pn, nn)
+        if diff_pair is None:
+            return False
+        pn, nn = diff_pair
+        if nn.get("operation") != "hair" or nn.get("id") != next_graph.get("targetNodeId"):
+            return False
+        pn_copy = dict(pn)
+        nn_copy = dict(nn)
+        prev_hair = pn_copy.pop("hair", None) or {}
+        next_hair = nn_copy.pop("hair", None) or {}
+        if pn_copy != nn_copy:
+            return False
+        for width_key in ("widthMode", "width", "taper", "rootScale"):
+            if prev_hair.get(width_key) != next_hair.get(width_key):
+                return False
+        try:
+            stage, graph_stages, graph_stats = usd_graph.compile_graph(next_graph, False)
+            tc = Usd.TimeCode(sample_frame)
+            updates = []
+            for prim in stage.Traverse():
+                if prim.IsInstanceProxy() or not prim.IsA(UsdGeom.BasisCurves):
+                    continue
+                pts = UsdGeom.BasisCurves(prim).GetPointsAttr().Get(tc)
+                if not pts or len(pts) == 0:
+                    continue
+                pts_np = np.ascontiguousarray(np.asarray(pts, dtype=np.float32))
+                updates.append((str(prim.GetPath()), pts_np))
+            if not updates:
+                return False
+            self._write_hair_points_to_ovstage(updates)
+            self.current_usd_stage = stage
+            self.graph_stages = graph_stages
+            self.graph_stats = graph_stats
+            return True
+        except Exception as error:
+            sys.stderr.write(f"Ovrtx incremental hair update failed; rebuilding scene: {error}\n")
+            return False
 
     def _try_fast_materialx_delta(self, prev_graph, new_graph):
         """Author MaterialX-only parameter updates directly into a sparse delta layer.
@@ -656,6 +763,12 @@ class OvrtxViewport:
                     "graph_stages": self.graph_stages,
                     "graph_stats": self.graph_stats,
                 }
+                scene_changed = False
+            elif self._try_fast_hair_delta(self.last_graph, graph, float(request.get("frame", 0))):
+                self.last_outline_key = raw_outline_key
+                self.last_graph_hash = graph_hash
+                self.last_graph = graph
+                self.last_update_kind = "hair-delta"
                 scene_changed = False
         if scene_changed or not self.temp_usd_path:
             phase("compiling USD graph", timeout=300)
@@ -1045,7 +1158,43 @@ class OvrtxViewport:
             and bool(getattr(self, "_pt_spp_at_one", False))
             and target_spp > 1
         )
-        first_frame = switched_scene or scene_changed or camera_changed or size_changed
+        hair_brush = request.get("hairBrush")
+        hair_brushed = False
+        if (
+            isinstance(hair_brush, dict)
+            and self.stage is not None
+            and self.current_usd_stage is not None
+            and hasattr(self, "last_camera_basis")
+        ):
+            active_graph = graph if isinstance(graph, dict) else self.last_graph
+            hair_cfg = None
+            if isinstance(active_graph, dict):
+                tid = active_graph.get("targetNodeId")
+                for n in active_graph.get("nodes") or []:
+                    if n.get("id") == tid and n.get("operation") == "hair":
+                        hair_cfg = n.get("hair")
+                        break
+            if isinstance(hair_cfg, dict) and hair_cfg.get("simEnabled"):
+                _wdir = os.path.dirname(os.path.abspath(__file__))
+                if _wdir not in sys.path:
+                    sys.path.insert(0, _wdir)
+                import hair_sim
+                commit_usd = bool(hair_brush.get("commitUsd", False))
+                updates = hair_sim.step_hair_brush(
+                    self.current_usd_stage,
+                    hair_cfg,
+                    usd_graph._hair_query_matches,
+                    hair_brush,
+                    self.last_camera_basis,
+                    write_usd=commit_usd,
+                    return_gpu=(not commit_usd),
+                )
+                if updates:
+                    self._write_hair_points_to_ovstage(updates)
+                    self.last_update_kind = "hair-brush"
+                    hair_brushed = True
+
+        first_frame = switched_scene or scene_changed or camera_changed or size_changed or hair_brushed
         step_count = 1 if (interactive or need_pt_spp_raise) else (
             8 if (switched_scene and self.last_update_kind in ("material-delta", "material-delta-fast"))
             else (4 if (switched_scene and self.last_update_kind == "cache-hit")
@@ -1235,8 +1384,27 @@ def dispatch(request):
     if operation == "clear_scene":
         viewport().clear_scene()
         usd_graph.clear_graph_caches()
+        try:
+            import hair_sim
+            hair_sim.reset_hair_sessions()
+        except Exception:
+            pass
         used_mb, total_mb = _query_gpu_vram()
         return {"cleared": True, "vramUsedMb": used_mb, "vramTotalMb": total_mb, "cachedScenes": 0}
+
+    if operation == "reset_hair":
+        try:
+            _wdir = os.path.dirname(os.path.abspath(__file__))
+            if _wdir not in sys.path:
+                sys.path.insert(0, _wdir)
+            import hair_sim
+            hair_sim.reset_hair_sessions()
+        except Exception:
+            pass
+        vp = viewport()
+        vp.last_graph_hash = None
+        vp._flush_stage_pool()
+        return {"reset": True}
 
     if operation in ("render", "update_nvidia_materials"):
         return viewport().render(request)

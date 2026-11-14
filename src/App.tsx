@@ -24,7 +24,6 @@ import {
   fileKey,
   graphPreview,
   identityTransform,
-  type Transform,
   editNodeData,
   expandProject,
   storeProject,
@@ -45,6 +44,7 @@ import { MaterialBindingInspector } from "./MaterialBindingInspector";
 import { LightInspector } from "./LightInspector";
 import { HairInspector } from "./HairInspector";
 import { BlenderInspector } from "./BlenderInspector";
+import { TransformInspector } from "./TransformInspector";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import {
   ReactFlow,
@@ -63,6 +63,7 @@ import {
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import "./App.css";
+const LAST_PROJECT_STORAGE_KEY = "sublayer.lastProjectPath";
 const seed: StageNode[] = [
   {
     id: "source",
@@ -80,6 +81,138 @@ const seed: StageNode[] = [
     },
   },
 ];
+const THEME_STORAGE_KEY = "sublayer-theme";
+const THEMES: Record<string, { label: string; vars: Record<string, string> }> = {
+  forest: {
+    label: "Forest Slate",
+    vars: {
+      "--bg-app": "#101719",
+      "--bg-header": "#141e22",
+      "--bg-sidebar": "#152025",
+      "--bg-control": "#1b292e",
+      "--bg-control-muted": "#162024",
+      "--bg-card": "#19282deb",
+      "--bg-canvas-center": "#263638",
+      "--bg-canvas-mid": "#142024",
+      "--bg-canvas-edge": "#10191d",
+      "--border-subtle": "#2b383c",
+      "--border-strong": "#34454b",
+      "--accent": "#9fe2b6",
+      "--accent-soft": "#213a34",
+      "--accent-border": "#66a587",
+      "--accent-text": "#ccf5d9",
+    },
+  },
+  obsidian: {
+    label: "Obsidian",
+    vars: {
+      "--bg-app": "#111214",
+      "--bg-header": "#16181b",
+      "--bg-sidebar": "#17191d",
+      "--bg-control": "#1e2126",
+      "--bg-control-muted": "#191b1f",
+      "--bg-card": "#1c1f24eb",
+      "--bg-canvas-center": "#282c34",
+      "--bg-canvas-mid": "#17191e",
+      "--bg-canvas-edge": "#111317",
+      "--border-subtle": "#2a2e35",
+      "--border-strong": "#373c45",
+      "--accent": "#93c5fd",
+      "--accent-soft": "#1e2c3f",
+      "--accent-border": "#5b89c4",
+      "--accent-text": "#dbeafe",
+    },
+  },
+  indigo: {
+    label: "Midnight Indigo",
+    vars: {
+      "--bg-app": "#0e121b",
+      "--bg-header": "#131926",
+      "--bg-sidebar": "#141b29",
+      "--bg-control": "#1a2335",
+      "--bg-control-muted": "#151d2b",
+      "--bg-card": "#182133eb",
+      "--bg-canvas-center": "#24304a",
+      "--bg-canvas-mid": "#141b2b",
+      "--bg-canvas-edge": "#0e131e",
+      "--border-subtle": "#27324a",
+      "--border-strong": "#334261",
+      "--accent": "#7dd3fc",
+      "--accent-soft": "#1b2f45",
+      "--accent-border": "#4f8eb8",
+      "--accent-text": "#d6f0ff",
+    },
+  },
+  graphite: {
+    label: "Warm Graphite",
+    vars: {
+      "--bg-app": "#141210",
+      "--bg-header": "#1b1815",
+      "--bg-sidebar": "#1d1916",
+      "--bg-control": "#26211d",
+      "--bg-control-muted": "#1f1b18",
+      "--bg-card": "#241f1beb",
+      "--bg-canvas-center": "#342c26",
+      "--bg-canvas-mid": "#1d1815",
+      "--bg-canvas-edge": "#14110f",
+      "--border-subtle": "#362f29",
+      "--border-strong": "#473e36",
+      "--accent": "#f6c478",
+      "--accent-soft": "#382c1d",
+      "--accent-border": "#b5894b",
+      "--accent-text": "#fde6bd",
+    },
+  },
+  plum: {
+    label: "Deep Plum",
+    vars: {
+      "--bg-app": "#131018",
+      "--bg-header": "#191521",
+      "--bg-sidebar": "#1b1624",
+      "--bg-control": "#241d30",
+      "--bg-control-muted": "#1d1826",
+      "--bg-card": "#221b2eeb",
+      "--bg-canvas-center": "#322742",
+      "--bg-canvas-mid": "#1b1525",
+      "--bg-canvas-edge": "#120e19",
+      "--border-subtle": "#342a45",
+      "--border-strong": "#433659",
+      "--accent": "#c4b5fd",
+      "--accent-soft": "#2d2345",
+      "--accent-border": "#7f69b8",
+      "--accent-text": "#e9e2ff",
+    },
+  },
+  nordic: {
+    label: "Nordic Teal",
+    vars: {
+      "--bg-app": "#0d1619",
+      "--bg-header": "#111e23",
+      "--bg-sidebar": "#122026",
+      "--bg-control": "#172a31",
+      "--bg-control-muted": "#132228",
+      "--bg-card": "#15272eeb",
+      "--bg-canvas-center": "#1d3840",
+      "--bg-canvas-mid": "#112026",
+      "--bg-canvas-edge": "#0c161a",
+      "--border-subtle": "#243b42",
+      "--border-strong": "#2f4d57",
+      "--accent": "#6ee7d8",
+      "--accent-soft": "#16383b",
+      "--accent-border": "#469c97",
+      "--accent-text": "#ccfbf4",
+    },
+  },
+};
+
+function applyTheme(id: string) {
+  const theme = THEMES[id] || THEMES.indigo;
+  const root = document.documentElement.style;
+  for (const [k, v] of Object.entries(theme.vars)) {
+    root.setProperty(k, v);
+  }
+}
+
 function CameraNumberInput({
   value,
   step,
@@ -146,33 +279,45 @@ const PinContext = createContext<{
 }>({ pinnedId: null, toggle: () => {} });
 function Card({ id, data, selected }: NodeProps<StageNode>) {
   const pin = useContext(PinContext);
+  const pinned = pin.pinnedId === id;
   return (
-    <div data-node-type={data.operation} className={"card " + (selected ? "selected" : "")}>
+    <div
+      data-node-type={data.operation}
+      data-pinned={pinned ? "true" : undefined}
+      className={"card " + (selected ? "selected" : "")}
+    >
       <Handle type="target" position={Position.Left} />
-      <button
-        className="pin-toggle nodrag nopan"
-        aria-label={`${pin.pinnedId === id ? "Unpin" : "Pin"} ${data.label} output`}
-        aria-pressed={pin.pinnedId === id}
-        title="Pin background preview to this node"
-        onClick={(e) => {
-          e.stopPropagation();
-          pin.toggle(id);
-        }}
-      >
-        {pin.pinnedId === id ? "●" : "◇"}
-      </button>
-      <small>USD / {data.operation.toUpperCase()}</small>
-      <strong>{data.label}</strong>
-      <p>
-        {["delete", "transform", "output", "assetOverride", "materialx", "material_bind", "light", "hdri", "hair"].includes(data.operation)
-          ? "Combined USD inputs"
-          : data.operation === "blender"
-            ? (data.nativeProject?.split(/[\\/]/).pop() || "No .blend linked")
-            : data.operation === "application"
-            ? data.nativeProject.split(/[\\/]/).pop() || "No native project linked"
-            : data.path.split(/[\\/]/).pop() || "No stage assigned"}
-      </p>
-      <footer>
+      <div className="card-header">
+        <span className="card-kind">
+          <span className="card-dot" aria-hidden="true" />
+          USD / {data.operation.toUpperCase()}
+        </span>
+        <button
+          className="pin-toggle nodrag nopan"
+          aria-label={`${pinned ? "Unpin" : "Pin"} ${data.label} output`}
+          aria-pressed={pinned}
+          title={pinned ? "Pinned to viewport (click to unpin)" : "Pin background preview to this node"}
+          onClick={(e) => {
+            e.stopPropagation();
+            pin.toggle(id);
+          }}
+        >
+          {pinned ? "●" : "○"}
+        </button>
+      </div>
+      <div className="card-body">
+        <strong>{data.label}</strong>
+        <p>
+          {["delete", "transform", "output", "assetOverride", "materialx", "material_bind", "light", "hdri", "hair"].includes(data.operation)
+            ? "Combined USD inputs"
+            : data.operation === "blender"
+              ? (data.nativeProject?.split(/[\\/]/).pop() || "No .blend linked")
+              : data.operation === "application"
+              ? data.nativeProject.split(/[\\/]/).pop() || "No native project linked"
+              : data.path.split(/[\\/]/).pop() || "No stage assigned"}
+        </p>
+      </div>
+      <footer className="card-footer">
         {data.operation === "blender"
           ? (data.nativeProject
               ? (() => {
@@ -351,6 +496,37 @@ function Workspace() {
   const selectedPrim=primSelection.key===sceneKey?primSelection.path:"";
   const flowInstance=useRef<ReactFlowInstance<StageNode,Edge>|null>(null);
   const [dropTarget,setDropTarget]=useState<DropTarget>(null);
+  const [lastProjectPath, setLastProjectPath] = useState<string | null>(() => {
+    try {
+      return localStorage.getItem(LAST_PROJECT_STORAGE_KEY);
+    } catch {
+      return null;
+    }
+  });
+  function recordLastProject(path: string) {
+    setLastProjectPath(path);
+    try {
+      localStorage.setItem(LAST_PROJECT_STORAGE_KEY, path);
+    } catch {
+      /* ignore storage errors */
+    }
+  }
+  const [themeId, setThemeId] = useState<string>(() => {
+    try {
+      const saved = localStorage.getItem(THEME_STORAGE_KEY);
+      return saved && THEMES[saved] ? saved : "indigo";
+    } catch {
+      return "indigo";
+    }
+  });
+  useEffect(() => {
+    applyTheme(themeId);
+    try {
+      localStorage.setItem(THEME_STORAGE_KEY, themeId);
+    } catch {
+      /* ignore storage errors */
+    }
+  }, [themeId]);
   function targetAt(element:EventTarget|null):DropTarget {
     if(!(element instanceof Element))return null;
     const node=element.closest(".react-flow__node");
@@ -426,16 +602,6 @@ function Workspace() {
     applyProject({...projectRef.current,...storeProject(added,edges,dependencies)},"Add node");
     select(id);
   }
-  function transformValue(
-    field: keyof Transform,
-    index: number,
-    value: number,
-  ) {
-    if (!node || !Number.isFinite(value)) return;
-    const transform = structuredClone(node.data.transform || identityTransform);
-    transform[field][index] = value;
-    update({ transform });
-  }
 
   function update(patch: Partial<Data>) {
     applyProject(editNodeData(projectRef.current, selected, patch),"Edit node",`field:${selected}:${Object.keys(patch).join()}`);
@@ -466,8 +632,7 @@ function Workspace() {
       for (const dependency of initial.dependencies) {
         if (
           !dependency.usdReferences?.length &&
-          (dependency.kind === "usd" ||
-            /\.(usd|usda|usdc|usdz)$/i.test(dependency.path))
+          /\.(usd|usda|usdc|usdz)$/i.test(dependency.path)
         )
           rootIds.add(dependency.id);
       }
@@ -475,7 +640,7 @@ function Workspace() {
       const failures: string[] = [];
       for (const sourceId of rootIds) {
         const source = initial.dependencies.find((d) => d.id === sourceId);
-        if (!source) continue;
+        if (!source || !/\.(usd|usda|usdc|usdz)$/i.test(source.path)) continue;
         try {
           const result = await invoke<{
             files: { path: string; kind: "usd" | "asset" }[];
@@ -513,7 +678,15 @@ function Workspace() {
     const path = await open({
       multiple: false,
       filters: [
+        {
+          name: "Scene / Volume source",
+          extensions: ["usd", "usda", "usdc", "usdz", "abc", "obj", "vdb", "goz"],
+        },
         { name: "USD stage", extensions: ["usd", "usda", "usdc", "usdz"] },
+        { name: "Alembic", extensions: ["abc"] },
+        { name: "Wavefront OBJ", extensions: ["obj"] },
+        { name: "OpenVDB", extensions: ["vdb"] },
+        { name: "ZBrush GoZ", extensions: ["goz"] },
       ],
     });
     if (path) {
@@ -527,9 +700,37 @@ function Workspace() {
       setStatus(
         existing
           ? `Warning: already registered as ${existing.id}. Reused the existing dependency; this node now uses that original file link.`
-          : "Linked the original USD file.",
+          : "Linked the original source file.",
       );
     }
+  }
+
+  async function convertSourceToUsd() {
+    if (!node || !node.data.path.trim()) return;
+    const { save } = await import("@tauri-apps/plugin-dialog");
+    const defaultName =
+      node.data.path.replace(/\.(abc|obj|vdb|goz)$/i, "") + ".usdc";
+    const destination = await save({
+      defaultPath: defaultName,
+      filters: [
+        { name: "USD stage", extensions: ["usdc", "usda", "usd"] },
+      ],
+    });
+    if (!destination) return;
+    const result = await invoke<{
+      destination: string;
+      primCount: number;
+      sourceFormat: string;
+    }>("usd_request", {
+      request: {
+        operation: "convert_source_to_usd",
+        path: node.data.path,
+        destination,
+      },
+    });
+    setStatus(
+      `Converted ${result.sourceFormat.toUpperCase()} (${result.primCount} prims) to ${result.destination}.`,
+    );
   }
   async function openProjectAtPath(path: string) {
     setOperationProgress("Loading project...");
@@ -541,7 +742,8 @@ function Workspace() {
     setOperationProgress("Discovering USD dependencies...");
     await rescanUsdDependencies();
     projectPathRef.current = path;
-    setProjectName(path.split(/[\\/]/).pop()?.replace(/\.(orchflow|json)$/i,"") || "Untitled");
+    recordLastProject(path);
+    setProjectName(path.split(/[\\/]/).pop()?.replace(/\.(sublayer|orchflow|json)$/i,"") || "Untitled");
     setStatus(`Opened ${path}`);
   }
   const bridgeStateRef = useRef({
@@ -674,12 +876,15 @@ function Workspace() {
   }, []);
   async function project(saveProject: boolean) {
     const { open, save } = await import("@tauri-apps/plugin-dialog");
-    const options = {
-      filters: [{ name: "OrchFlow", extensions: ["orchflow"] }],
-    };
     const path = saveProject
-      ? await save(options)
-      : await open({ ...options, multiple: false });
+      ? await save({ filters: [{ name: "Sublayer", extensions: ["sublayer"] }] })
+      : await open({
+          filters: [
+            { name: "Sublayer", extensions: ["sublayer", "orchflow"] },
+            { name: "Legacy OrchFlow", extensions: ["orchflow"] },
+          ],
+          multiple: false,
+        });
     if (!path) return;
     if (saveProject) {
       setOperationProgress("Saving project and live adjustments...");
@@ -693,7 +898,7 @@ function Workspace() {
       }
       setDependencies(latestProject.dependencies);
       projectPathRef.current = path;
-      setProjectName(path.split(/[\\/]/).pop()?.replace(/\.(orchflow|json)$/i,"") || "Untitled");
+      setProjectName(path.split(/[\\/]/).pop()?.replace(/\.(sublayer|orchflow|json)$/i,"") || "Untitled");
       setStatus(`Saved ${path}`);
     } else {
       await openProjectAtPath(path);
@@ -716,23 +921,25 @@ function Workspace() {
         <div className="brand">
           ◈{" "}
           <div>
-            OrchFlow<small>USD WORKSPACE</small>
+            Sublayer<small>USD WORKSPACE</small>
           </div>
         </div>
         <nav>
-          <button disabled={!history.current.past.length || busy || activeTab!=="canvas"} title="Undo project edit (Ctrl+Z)" onClick={()=>travel("undo")}>Undo</button>
-          <button disabled={!history.current.future.length || busy || activeTab!=="canvas"} title="Redo project edit (Ctrl+Shift+Z / Ctrl+Y)" onClick={()=>travel("redo")}>Redo</button>
-          <button className={activeTab==="canvas"?"chosen":""} onClick={()=>setActiveTab("canvas")}>Canvas</button>
-          <button className={activeTab==="applications"?"chosen":""} onClick={()=>setActiveTab("applications")}>Applications</button>
+          <button className="nav-action" disabled={!history.current.past.length || busy || activeTab!=="canvas"} title="Undo project edit (Ctrl+Z)" onClick={()=>travel("undo")}>Undo</button>
+          <button className="nav-action" disabled={!history.current.future.length || busy || activeTab!=="canvas"} title="Redo project edit (Ctrl+Shift+Z / Ctrl+Y)" onClick={()=>travel("redo")}>Redo</button>
+          <span className="nav-divider" aria-hidden="true" />
+          <button className={"nav-tab" + (activeTab==="canvas"?" chosen":"")} onClick={()=>setActiveTab("canvas")}>Canvas</button>
+          <button className={"nav-tab" + (activeTab==="applications"?" chosen":"")} onClick={()=>setActiveTab("applications")}>Applications</button>
           {backendOutdated && (
             <button
+              className="nav-action"
               onClick={() =>
                 run(async () => {
                   await navigator.clipboard.writeText(
                     JSON.stringify(projectModel, null, 2),
                   );
                   setStatus(
-                    "Project JSON copied. Paste it into a .orchflow file before restarting.",
+                    "Project JSON copied. Paste it into a .sublayer file before restarting.",
                   );
                 })
               }
@@ -740,23 +947,49 @@ function Workspace() {
               Copy project JSON
             </button>
           )}
-          {toolbarOperations.map(operation=><button key={operation} draggable title="Click to add, or drag onto an edge or node to connect and make space"
+          <span className="nav-divider" aria-hidden="true" />
+          {toolbarOperations.map(operation=><button key={operation} className="nav-draggable" draggable title="Click to add, or drag onto an edge or node to connect and make space"
             onDragStart={e=>{setGraphModeRequest(n=>n+1);e.dataTransfer.setData("application/orchflow-node",operation);e.dataTransfer.effectAllowed="copy";}}
             onDragEnd={()=>setDropTarget(null)} onClick={()=>addNode(operation)}>
+            <span className="drag-grip" aria-hidden="true" />
             ＋ {operation === "materialx"?"MaterialX":operation === "material_bind"?"Material Bind":operation === "light"?"Light":operation === "hdri"?"HDRI":operation === "hair"?"Hair":operation === "camera"?"Camera":operation === "blender"?"Blender":operation === "assetOverride"?"Asset Override":operation[0].toUpperCase()+operation.slice(1)}
           </button>)}
-          <button disabled={busy || (!nodes.length && !dependencies.length)}
+          <span className="nav-divider" aria-hidden="true" />
+          <button className="nav-action nav-action-danger" disabled={busy || (!nodes.length && !dependencies.length)}
             title="Clear the scene and start a new project" onClick={()=>setClearScenePrompt(true)}>
             Clear scene
           </button>
-          <button disabled={busy} onClick={() => run(() => project(false))}>
+          <button className="nav-action" disabled={busy} onClick={() => run(() => project(false))}>
             Open project
           </button>
-          <button disabled={busy} onClick={() => run(() => project(true))}>
+          <button
+            className="nav-action"
+            disabled={busy || !lastProjectPath}
+            title={lastProjectPath ? `Reopen ${lastProjectPath}` : "No recent project"}
+            onClick={() => lastProjectPath && run(() => openProjectAtPath(lastProjectPath))}
+          >
+            Last project
+          </button>
+          <button className="nav-action" disabled={busy} onClick={() => run(() => project(true))}>
             Save project
           </button>
         </nav>
-        <small className="badge">HYDRA / 02</small>
+        <div className="header-right">
+          <select
+            className="theme-select"
+            aria-label="Workspace theme"
+            title="Workspace theme"
+            value={themeId}
+            onChange={(e) => setThemeId(e.target.value)}
+          >
+            {Object.entries(THEMES).map(([id, t]) => (
+              <option key={id} value={id}>
+                {t.label}
+              </option>
+            ))}
+          </select>
+          <small className="badge">HYDRA / 02</small>
+        </div>
       </header>
       {operationProgress&&<div className="project-progress"><OperationProgress label={operationProgress}/></div>}
       {status.includes("Warning:") && (
@@ -822,6 +1055,22 @@ function Workspace() {
                   false,
                 )
               }
+              transformGizmo={
+                node?.data.operation === "transform"
+                  ? {
+                      transform: node.data.transform || identityTransform,
+                      onChange: (nextTransform) =>
+                        applyProject(
+                          editNodeData(projectRef.current, node.id, {
+                            transform: nextTransform,
+                          }),
+                          "Transform gizmo",
+                          "transform-gizmo",
+                        ),
+                      onCommit: () => history.current.endGroup(),
+                    }
+                  : null
+              }
               onSelectPrim={path=>setPrimSelection({key:sceneKey,path})}
             />
             {pinnedNode && (
@@ -839,6 +1088,7 @@ function Workspace() {
             >
               <ReactFlow
                 onInit={instance=>{flowInstance.current=instance;}}
+                zoomOnDoubleClick={false}
                 nodes={nodes.map(n=>dropTarget?.kind === "node" && dropTarget.id===n.id?{...n,className:[n.className,"toolbar-drop-target"].filter(Boolean).join(" ")}:n)}
                 edges={edges.map(e=>dropTarget?.kind === "edge" && dropTarget.id===e.id?{...e,style:{...e.style,stroke:"#a4e4bd",strokeWidth:4}}:e)}
                 defaultEdgeOptions={{interactionWidth:32}}
@@ -943,48 +1193,13 @@ function Workspace() {
                 {node.data.operation === "assetOverride" && <button onClick={() => setOverrideNodeId(node.id)}>Edit Asset Overrides… ({node.data.assetOverrides?.length || 0})</button>}
                 {node.data.operation === "delete" && <label><span className="field-label">Prim paths<InspectorHint text="One absolute path per line. Deactivates these prims on this branch; original files are unchanged. Instance-proxy children cannot be deleted separately."/></span><textarea value={(node.data.deletePaths || []).join("\n")} onChange={e=>update({deletePaths:e.target.value.split("\n").map(v=>v.trim()).filter(Boolean)})}/></label>}
                 {node.data.operation === "transform" && (
-                  <div className="transform-settings">
-                    <h3 className="field-label">Transform<InspectorHint text="Applied after merging incoming stages. Translation is in metres; rotation uses XYZ order in degrees."/></h3>
-                    {(["translation", "rotation", "scale"] as const).map(
-                      (field) => (
-                        <div key={field}>
-                          <span className="vector-label">{field==="translation"?"Translation · m":field==="rotation"?"Rotation · °":"Scale"}</span>
-                          <div className="vector-input">
-                            {["X", "Y", "Z"].map((axis, index) => (
-                              <label key={axis}>
-                                {axis}
-                                <NumberInput
-                                  aria-label={`${field} ${axis}`}
-                                  step={field === "rotation" ? 1 : 0.1}
-                                  value={
-                                    (node.data.transform || identityTransform)[
-                                      field
-                                    ][index]
-                                  }
-                                  onChange={(e) =>
-                                    transformValue(
-                                      field,
-                                      index,
-                                      Number(e.target.value),
-                                    )
-                                  }
-                                />
-                              </label>
-                            ))}
-                          </div>
-                        </div>
-                      ),
-                    )}
-                    <button
-                      onClick={() =>
-                        update({
-                          transform: structuredClone(identityTransform),
-                        })
-                      }
-                    >
-                      Reset transform
-                    </button>
-                  </div>
+                  <TransformInspector
+                    value={node.data.transform}
+                    targets={node.data.transformTargets}
+                    selectedPrim={selectedPrim}
+                    onTransformChange={(transform) => update({ transform })}
+                    onTargetsChange={(transformTargets) => update({ transformTargets })}
+                  />
                 )}
                 {node.data.operation === "materialx" && <button onClick={()=>setMaterialXEditorId(node.id)}>Edit MaterialX shading rules...</button>}
                 {node.data.operation === "output" && (
@@ -993,8 +1208,11 @@ function Workspace() {
                 {["source", "application"].includes(node.data.operation) && (
                   <>
                     {node.data.operation==="source"&&<>
-                      <label>USD root layer<input placeholder="C:\\assets\\scene.usda" value={node.data.path} onChange={e=>update({path:e.target.value})}/></label>
-                      <button disabled={busy || !isTauri()} onClick={()=>run(browse)}>Browse stage...</button>
+                      <label>Source file (USD / ABC / OBJ / VDB / GoZ)<input placeholder="C:\\assets\\scene.usda" value={node.data.path} onChange={e=>update({path:e.target.value})}/></label>
+                      <button disabled={busy || !isTauri()} onClick={()=>run(browse)}>Browse source...</button>
+                      {/\.(abc|obj|vdb|goz)$/i.test(node.data.path.trim()) && (
+                        <button disabled={busy || !isTauri()} onClick={()=>run(convertSourceToUsd)}>Convert to USD...</button>
+                      )}
                       <label className="checkbox-field" style={{marginTop: "8px", display: "flex", alignItems: "center", gap: "8px", cursor: "pointer"}}>
                         <input
                           type="checkbox"
@@ -1015,8 +1233,12 @@ function Workspace() {
                           onChange={(e) => update({ axis: e.target.value })}
                         >
                           <option value="preserve">Preserve source</option>
-                          <option>Y</option>
-                          <option>Z</option>
+                          <option value="Y">+Y</option>
+                          <option value="-Y">-Y</option>
+                          <option value="Z">+Z</option>
+                          <option value="-Z">-Z</option>
+                          <option value="X">+X</option>
+                          <option value="-X">-X</option>
                         </select>
                       </label>
                       <label>

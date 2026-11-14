@@ -5,7 +5,7 @@ Push-Location $projectRoot
 try {
     & npm.cmd run build
     if ($LASTEXITCODE -ne 0) { throw 'Frontend build failed' }
-    & cargo rustc --manifest-path src-tauri/Cargo.toml --target-dir $buildRoot --bin tauri-app --features tauri/custom-protocol -- -o "$buildRoot/debug/orchflow-updated.exe"
+    & cargo rustc --manifest-path src-tauri/Cargo.toml --target-dir $buildRoot --bin tauri-app --features tauri/custom-protocol -- -o "$buildRoot/debug/sublayer-updated.exe"
     if ($LASTEXITCODE -ne 0) { throw 'Desktop build failed; close the existing app if its executable is locked' }
     $mcpRunning = Get-Process -Name 'orchflow-mcp*' -ErrorAction SilentlyContinue
     if ($mcpRunning) {

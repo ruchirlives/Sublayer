@@ -177,3 +177,19 @@ class ImagingTests(unittest.TestCase):
             second = self.request(path=path, reload=True)
             self.assertNotEqual(first['image'], second['image'])
             self.request()  # release the temporary stage before cleanup on Windows
+
+    def test_aurora_delegate_renders_and_switches_to_storm(self):
+        caps = dispatch({'operation': 'capabilities'})
+        ids = [p['id'] for p in caps['renderers']]
+        if 'HdAuroraRendererPlugin' not in ids:
+            self.skipTest('HdAuroraRendererPlugin not installed')
+        aurora = self.request(renderer='HdAuroraRendererPlugin')
+        self.assertEqual(aurora['renderer'], 'HdAuroraRendererPlugin')
+        self.assertTrue(aurora['image'].startswith('data:image/png;base64,'))
+        from PySide6.QtGui import QImage
+        image = QImage.fromData(base64.b64decode(aurora['image'].split(',')[1]), 'PNG')
+        self.assertFalse(image.isNull())
+        self.assertNotEqual(image.pixelColor(240, 160), image.pixelColor(0, 0))
+        storm = self.request(renderer='HdStormRendererPlugin')
+        self.assertEqual(storm['renderer'], 'HdStormRendererPlugin')
+        self.assertTrue(storm['image'].startswith('data:image/png;base64,'))

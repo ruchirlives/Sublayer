@@ -971,15 +971,21 @@ function ProceduralEditorInner({
   activeRuleId,
   graph,
   onGraphChange,
+  focusNodeId,
+  onFocusHandled,
+  onInspectOutput,
 }: {
   project: StoredProject;
   activeMaterialXNodeId: string;
   activeRuleId?: string;
   graph: ProceduralGraph;
   onGraphChange: (next: ProceduralGraph) => void;
+  focusNodeId?: string | null;
+  onFocusHandled?: () => void;
+  onInspectOutput?: (node: ProceduralGraphNode) => void;
 }) {
   const [statusMessage, setStatusMessage] = useState("");
-  const { screenToFlowPosition } = useReactFlow();
+  const { screenToFlowPosition, setCenter } = useReactFlow();
   const ruleOptions = useMemo(() => collectRuleTargetOptions(project), [project]);
   const graphRef = useRef(graph);
   graphRef.current = graph;
@@ -1053,6 +1059,21 @@ function ProceduralEditorInner({
   useEffect(() => {
     setRfEdges(toFlowEdges(graph.edges));
   }, [graph.edges, toFlowEdges, setRfEdges]);
+
+  useEffect(() => {
+    if (!focusNodeId) return;
+    const target = graphRef.current.nodes.find((n) => n.id === focusNodeId);
+    if (!target) {
+      onFocusHandled?.();
+      return;
+    }
+    setRfNodes((prev) => prev.map((n) => ({ ...n, selected: n.id === focusNodeId })));
+    const timer = window.setTimeout(() => {
+      void setCenter(target.position.x + 115, target.position.y + 80, { zoom: 1, duration: 250 });
+      onFocusHandled?.();
+    }, 30);
+    return () => window.clearTimeout(timer);
+  }, [focusNodeId, setRfNodes, setCenter, onFocusHandled]);
 
   const handleNodesChange = useCallback(
     (changes: NodeChange<Node<FlowNodeData>>[]) => {
@@ -1217,7 +1238,12 @@ function ProceduralEditorInner({
           onNodesChange={handleNodesChange}
           onEdgesChange={handleEdgesChange}
           onConnect={handleConnect}
-          fitView
+          onNodeDoubleClick={(_evt, rfNode) => {
+            if (rfNode.data?.kind !== "output" || !onInspectOutput) return;
+            const procNode = graphRef.current.nodes.find((n) => n.id === rfNode.id);
+            if (procNode) onInspectOutput(procNode);
+          }}
+          fitView={!focusNodeId}
           deleteKeyCode={["Delete", "Backspace"]}
         >
           <Background color="#294448" gap={16} />
@@ -1234,6 +1260,9 @@ export function ProceduralEditor(props: {
   activeRuleId?: string;
   graph: ProceduralGraph;
   onGraphChange: (next: ProceduralGraph) => void;
+  focusNodeId?: string | null;
+  onFocusHandled?: () => void;
+  onInspectOutput?: (node: ProceduralGraphNode) => void;
 }) {
   return (
     <ReactFlowProvider>

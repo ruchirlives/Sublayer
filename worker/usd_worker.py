@@ -14,7 +14,7 @@ import sys
 import time
 import functools
 if 'compile_graph' not in globals():
-    from usd_graph import compile_graph, coordinate_preflight, export_handoff, materialx_document, materialx_rule_matches, reuse_handoff, inspect_stage_materials, inspect_stage_lights, inspect_stage_curves, clear_graph_caches, query_scene_children, compute_material_users
+    from usd_graph import compile_graph, coordinate_preflight, export_handoff, materialx_document, materialx_rule_matches, reuse_handoff, inspect_stage_materials, inspect_stage_lights, inspect_stage_curves, convert_source_to_usd, clear_graph_caches, query_scene_children, compute_material_users, _open_source_stage
 
 if 'review_publication' not in globals():
     from usd_publish import review_publication, publish_reviewed, reconcile_upstream, validate_manual_baseline, create_live_adjustment
@@ -36,6 +36,44 @@ def report_status(phase, details=None):
         pass
 
 
+def _configure_aurora_runtime():
+    """Register an installed Autodesk Aurora Hydra delegate if present."""
+    aurora_root = os.environ.get('ORCHFLOW_AURORA_ROOT') or 'I:/AI/OrchFlow-renderers/aurora'
+    aurora_root = os.path.abspath(aurora_root)
+    if not os.path.isdir(aurora_root):
+        return
+    manifest_path = os.path.join(aurora_root, 'runtime.json')
+    binary_rel = 'bin'
+    plugin_rel = os.path.join('bin', 'usd', 'hdAurora', 'resources', 'plugInfo.json')
+    if os.path.isfile(manifest_path):
+        try:
+            with open(manifest_path, 'r', encoding='utf-8-sig') as handle:
+                manifest = json.load(handle)
+            binary_rel = manifest.get('binaryRoot') or binary_rel
+            plugin_rel = manifest.get('pluginInfo') or plugin_rel
+        except Exception as exc:
+            sys.stderr.write(f'Aurora manifest unreadable ({manifest_path}): {exc}\n')
+            return
+    binary_root = os.path.abspath(os.path.join(aurora_root, binary_rel))
+    plugin_info = os.path.abspath(os.path.join(aurora_root, plugin_rel))
+    if not os.path.isdir(binary_root) or not os.path.isfile(plugin_info):
+        sys.stderr.write(f'Aurora runtime incomplete at {aurora_root}; skipping Hydra plugin registration.\n')
+        return
+    dll_dirs = [binary_root]
+    usd_plugin_dir = os.path.join(binary_root, 'usd')
+    if os.path.isdir(usd_plugin_dir):
+        dll_dirs.append(usd_plugin_dir)
+    for directory in dll_dirs:
+        if hasattr(os, 'add_dll_directory'):
+            _dll_dirs.append(os.add_dll_directory(directory))
+    current_path = os.environ.get('PATH', '')
+    os.environ['PATH'] = os.pathsep.join(dll_dirs + ([current_path] if current_path else []))
+    plugin_dir = os.path.dirname(plugin_info)
+    existing_plugins = [p for p in os.environ.get('PXR_PLUGINPATH_NAME', '').split(os.pathsep) if p]
+    if plugin_dir not in existing_plugins:
+        os.environ['PXR_PLUGINPATH_NAME'] = os.pathsep.join(existing_plugins + [plugin_dir])
+
+
 def configure_runtime():
     # USD stack tracing and OIIO must share the OS debugging libraries, not
     # incompatible copies found on PATH (for example Oculus runtime dbghelp).
@@ -55,6 +93,7 @@ def configure_runtime():
             _dll_dirs.append(os.add_dll_directory(directory))
     os.environ['PATH'] = os.pathsep.join([os.path.join(root, 'bin'), os.path.join(root, 'lib'), os.environ.get('PATH', '')])
     os.environ.setdefault('PXR_MTLX_STDLIB_SEARCH_PATHS', os.path.join(root, 'libraries'))
+    _configure_aurora_runtime()
 
 
 
@@ -214,8 +253,7 @@ class Viewport:
         self.gl_version = GL.glGetString(GL.GL_VERSION).decode('utf-8', errors='replace')
         self.plugins = [{'id': str(p), 'name': UsdImagingGL.Engine.GetRendererDisplayName(p),
                          'support': 'discovered; validated when selected'}
-                        for p in UsdImagingGL.Engine.GetRendererPlugins()
-                        if str(p) == 'HdStormRendererPlugin']
+                        for p in UsdImagingGL.Engine.GetRendererPlugins()]
         self.engine = None
         self.renderer = None
         self.stage = None
@@ -369,6 +407,10 @@ class Viewport:
                 if not reference:raise ValueError('Comparison handoff could not be opened')
                 bounds_conversion=conversion
             if target_prim:
+                if not hasattr(self, 'scene_radius') or self.path != path or request.get('reload'):
+                    visible_bounds = compute_visible_geometry_bounds(reference, Usd.TimeCode(frame))
+                    scene_canonical = Gf.BBox3d(visible_bounds, bounds_conversion).ComputeAlignedRange()
+                    self.scene_radius = 1.0 if scene_canonical.IsEmpty() else max(scene_canonical.GetSize().GetLength() * .5, .001)
                 sel_range = compute_selection_bounds(reference, [target_prim], Usd.TimeCode(frame))
                 if sel_range is not None and not sel_range.IsEmpty():
                     canonical=Gf.BBox3d(sel_range, bounds_conversion).ComputeAlignedRange()
@@ -378,6 +420,7 @@ class Viewport:
             else:
                 visible_bounds = compute_visible_geometry_bounds(reference, Usd.TimeCode(frame))
                 canonical=Gf.BBox3d(visible_bounds, bounds_conversion).ComputeAlignedRange()
+                self.scene_radius = 1.0 if canonical.IsEmpty() else max(canonical.GetSize().GetLength() * .5, .001)
             self.camera_anchor=((Gf.Vec3d(0),1.0) if canonical.IsEmpty() else (canonical.GetMidpoint(),max(canonical.GetSize().GetLength()*.5,.001)))
             self.camera_fit_key=fit_key
         center,radius=Gf.Vec3d(self.camera_anchor[0]),self.camera_anchor[1]
@@ -397,9 +440,49 @@ class Viewport:
         fit_distance = radius / math.sin(math.atan(math.tan(half_fov) * min(aspect, 1))) * 1.15
         distance = fit_distance * zoom
         eye = center + forward * distance
+        hair_brush = request.get('hairBrush')
+        if isinstance(hair_brush, dict) and isinstance(self.current_graph, dict):
+            tid = self.current_graph.get('targetNodeId')
+            hair_cfg = None
+            for n in self.current_graph.get('nodes') or []:
+                if n.get('id') == tid and n.get('operation') == 'hair':
+                    hair_cfg = n.get('hair')
+                    break
+            if isinstance(hair_cfg, dict) and hair_cfg.get('simEnabled'):
+                _here = globals().get('__file__')
+                for _cand in (
+                    os.environ.get('ORCHFLOW_WORKER_DIR'),
+                    os.path.dirname(os.path.abspath(_here)) if _here else None,
+                    os.path.join(os.getcwd(), 'worker'),
+                    r'e:\CODINGPROJECTS\Rust\Sublayer\worker',
+                ):
+                    if _cand and os.path.isdir(_cand) and _cand not in sys.path:
+                        sys.path.insert(0, _cand)
+                        break
+                import hair_sim
+                _query_fn = globals().get('_hair_query_matches')
+                if _query_fn is None:
+                    from usd_graph import _hair_query_matches as _query_fn
+                inv_vc = view_conversion.GetInverse()
+                s_eye = inv_vc.Transform(eye)
+                s_fwd = inv_vc.TransformDir(-forward).GetNormalized()
+                s_right = inv_vc.TransformDir(right).GetNormalized()
+                s_up = inv_vc.TransformDir(camera_up).GetNormalized()
+                cam_basis = {
+                    'origin': (float(s_eye[0]), float(s_eye[1]), float(s_eye[2])),
+                    'forward': (float(s_fwd[0]), float(s_fwd[1]), float(s_fwd[2])),
+                    'right': (float(s_right[0]), float(s_right[1]), float(s_right[2])),
+                    'up': (float(s_up[0]), float(s_up[1]), float(s_up[2])),
+                    'tan_half_fov': float(math.tan(math.radians(fov * 0.5))),
+                    'aspect': float(aspect),
+                }
+                hair_sim.step_hair_brush(stage, hair_cfg, _query_fn, hair_brush, cam_basis)
         view = view_conversion * Gf.Matrix4d().SetLookAt(eye, center, up)
         frustum = Gf.Frustum()
-        frustum.SetPerspective(fov, aspect, max(radius * 0.0001, distance - radius * 2), distance + radius * 4)
+        clip_radius = max(radius, getattr(self, 'scene_radius', radius))
+        near_clip = max(1e-5, min(clip_radius * 0.0001, distance * 0.01), distance - clip_radius * 2)
+        far_clip = max(distance + clip_radius * 4, clip_radius * 8)
+        frustum.SetPerspective(fov, aspect, near_clip, far_clip)
         if self.size != (width, height):
             self.fbo = None
             fmt = self.QtOpenGL.QOpenGLFramebufferObjectFormat()
@@ -448,7 +531,8 @@ class Viewport:
         params.highlight=bool(selection)
         params.colorCorrectionMode = 'sRGB'
         if stage_changed:
-            report_status('Hydra Storm: Rendering scene...')
+            renderer_name = next((p['name'] for p in self.plugins if p['id'] == renderer), renderer)
+            report_status(f'Hydra {renderer_name}: Rendering scene...')
         render_start = time.perf_counter()
         iterations = 0
         while True:
@@ -497,6 +581,12 @@ class Viewport:
                     'stop': engine.IsStopRendererSupported(),
                     'featureParity': 'not inferred; renderer-specific schema/material support requires verification'},
                 'gpu': self.gpu, 'converged': converged, 'frame': frame,
+                'cameraAnchor': {
+                    'session': str(request.get('cameraSession') or ''),
+                    'fit': int(request.get('frameFit', 0)),
+                    'center': [float(self.camera_anchor[0][0]), float(self.camera_anchor[0][1]), float(self.camera_anchor[0][2])],
+                    'radius': float(self.camera_anchor[1]),
+                },
                 'renderMs': round(render_ms, 2), 'captureMs': round(capture_ms, 2),
                 'totalMs': round((time.perf_counter() - started) * 1000, 2),
                 'pngBytes': len(encoded) if encoding == 'png' else 0,
@@ -515,7 +605,7 @@ class Viewport:
             result = engine.TestIntersection(view, narrowed.ComputeProjectionMatrix(),
                                              stage.GetPseudoRoot(), params)
         except Exception as e:
-            sys.stderr.write(f'Storm pick error: {e}\n')
+            sys.stderr.write(f'Hydra pick error: {e}\n')
             return None
         if not result:
             return None
@@ -566,7 +656,39 @@ def dispatch(request):
     operation = request.get('operation')
     if operation == 'clear_scene':
         clear_graph_caches()
+        try:
+            _here = globals().get('__file__')
+            for _cand in (
+                os.environ.get('ORCHFLOW_WORKER_DIR'),
+                os.path.dirname(os.path.abspath(_here)) if _here else None,
+                os.path.join(os.getcwd(), 'worker'),
+                r'e:\CODINGPROJECTS\Rust\Sublayer\worker',
+            ):
+                if _cand and os.path.isdir(_cand) and _cand not in sys.path:
+                    sys.path.insert(0, _cand)
+                    break
+            import hair_sim
+            hair_sim.reset_hair_sessions()
+        except Exception:
+            pass
         return {'cleared': True, 'cachedScenes': 0}
+    if operation == 'reset_hair':
+        try:
+            _here = globals().get('__file__')
+            for _cand in (
+                os.environ.get('ORCHFLOW_WORKER_DIR'),
+                os.path.dirname(os.path.abspath(_here)) if _here else None,
+                os.path.join(os.getcwd(), 'worker'),
+                r'e:\CODINGPROJECTS\Rust\Sublayer\worker',
+            ):
+                if _cand and os.path.isdir(_cand) and _cand not in sys.path:
+                    sys.path.insert(0, _cand)
+                    break
+            import hair_sim
+            hair_sim.reset_hair_sessions()
+        except Exception:
+            pass
+        return {'reset': True}
     if operation == 'scene_children':
         return scene_children(request)
     if operation == 'materialx_rule_matches':
@@ -577,6 +699,8 @@ def dispatch(request):
         return inspect_stage_lights(request)
     if operation == 'inspect_stage_curves':
         return inspect_stage_curves(request)
+    if operation == 'convert_source_to_usd':
+        return convert_source_to_usd(request)
     if operation == 'materialx_document':
         return materialx_document(request)
     if operation == 'reconcile_upstream':
@@ -643,7 +767,11 @@ def dispatch(request):
         graph=request['graph']
         stage,keepalive,_=compile_graph(json.loads(graph) if isinstance(graph,str) else graph)
     else:
-        stage = Usd.Stage.Open(path, load=Usd.Stage.LoadNone)
+        ext = os.path.splitext(path)[1].lower()
+        if ext in ('.abc', '.obj', '.vdb', '.goz'):
+            stage = _open_source_stage(path)
+        else:
+            stage = Usd.Stage.Open(path, load=Usd.Stage.LoadNone)
     if stage is None:
         raise RuntimeError('Unable to open USD stage')
     roots = [{'path': str(p.GetPath()), 'type': p.GetTypeName()} for p in stage.GetPseudoRoot().GetChildren()]

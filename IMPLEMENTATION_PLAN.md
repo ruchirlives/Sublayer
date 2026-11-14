@@ -1387,10 +1387,11 @@ NVIDIA request phase tracing is quiet by default. Set ORCHFLOW_OVRTX_DEBUG=1 bef
 
 NVIDIA preview disk usage: found 25 abandoned preview snapshots totaling 16.6 GB on C: with about 60 MB free after a renderer switch reported corrupt crate values. Removed the inactive snapshots. New worker-owned scratch directories under the NVIDIA runtime root are cleaned on worker shutdown. Failed or empty exports return a concise error before population. Verified partial-write cleanup, successful snapshot reopen, frontend build, Rust check, and three consecutive NVIDIA replacements with an empty scratch directory afterward. Desktop switching on the original project remains to be checked.
 
-## Renderer scope: Storm and NVIDIA Omniverse RTX
+## Renderer scope: Storm, Autodesk Aurora and NVIDIA Omniverse RTX
 
 - [x] Removed Aurora runtime registration, render settings, frontend controls, setup scripts, and the experimental MDL launcher. The Aurora milestones above record historical work.
 - [x] Limited OpenUSD renderer discovery to Storm. NVIDIA Omniverse RTX remains available through its standalone worker. External Aurora downloads and build caches are outside the app removal scope.
+- [x] Re-enabled Autodesk Aurora (`HdAuroraRendererPlugin`) as a Hydra delegate in `worker/usd_worker.py` (`_configure_aurora_runtime()`), reading `ORCHFLOW_AURORA_ROOT` (defaulting to `I:/AI/OrchFlow-renderers/aurora`) and `runtime.json` (`binaryRoot` / `pluginInfo`) to register its DLLs and `PXR_PLUGINPATH_NAME`, and removing the `HdStormRendererPlugin`-only filter on `UsdImagingGL.Engine.GetRendererPlugins()`.
 - [x] Verified the frontend build, Rust formatting and test suite, and worker capability discovery. The OpenUSD worker advertised only Storm and the standalone worker reported NVIDIA RTX available. GPU render tests were skipped.
 
 MaterialX SSS authoring uses the Standard Surface inputs subsurface, subsurface_color, subsurface_radius and subsurface_scale. Removed the three legacy camel-case shader aliases and included radius and scale in portable .mtlx exports. Verified authored USD ports, numeric values, the universal fallback connection, exported values, and six MaterialX tests without rendering. Frontend build and Rust format/check passed. NVIDIA visual response to SSS scale and radius remains unverified.
@@ -1437,3 +1438,21 @@ NVIDIA viewport exposes Real-Time Path Tracing and Path Tracing. The mode is par
     - Test 4: Omniverse RTX render on `project.blend` in `.venv-ovrtx` with 18 live status events, `updateKind: full-rebuild`, timing and VRAM accounting.
   - Full desktop release build: verified cleanly with exit code 0 (`scripts\build.ps1`).
 - [ ] User interactive verification: check smooth orbit responsiveness and real-time activity HUD pill while switching nodes in the desktop UI.
+
+## GoZ (ZBrush) Source Node Support — 2026-11-14
+
+- [x] Implemented binary `.goz` parser (`_parse_goz_file`) and in-memory OpenUSD stage builder (`_open_goz_source_stage`) in `worker/usd_graph.py`, supporting multi-mesh/SubTool streams, triangles/quads, UVs (`st` with V-flip), Polypaint (`displayColor`), Mask (`primvars:zbrush_mask`), Polygroups (`primvars:zbrush_polygroup` and `UsdGeom.Subset`), and Diffuse/Normal/Displacement texture maps (`UsdPreviewSurface`).
+- [x] Wired `.goz` into `_open_source_stage`, `compile_graph` reload cache handling, `convert_source_to_usd`, and `usd_worker.py` `inspect` operation.
+- [x] Enabled `convert_source_to_usd` in `src-tauri/src/usd.rs` (`UsdService::request`) so Source node USD conversion works through Tauri IPC.
+- [x] Updated `src/App.tsx` file browser filters, Source inspector label, `Convert to USD...` action, and `rescanUsdDependencies` (skipping non-USD source files).
+- [x] Verified with `worker/test_goz_source.py` (2 passed), `npm run build` (passed), and `cargo fmt --check` (passed). Real `.goz` file loading and desktop viewport rendering remain with the user for manual verification.
+
+## Hair Node GPU Physics Simulation (NVIDIA Warp) — 2026-11-14
+
+- [x] Added encapsulated GPU hair strand simulation in `worker/hair_sim.py` using NVIDIA Warp (`warp-lang` + `numpy` installed on `I:\AI\OrchFlow-packages\py312` and loaded lazily only when `simEnabled` is true).
+- [x] Implemented GPU-parallel local–global stretch/bend Discrete Elastic Rod constraints, root pinning, gravity/wind, stage up-axis & unit scaling, and `wp.Mesh` BVH collider response with Coulomb-style friction.
+- [x] Authors time-sampled `points` into the anonymous `hair.usda` overlay layer with an in-memory LRU simulation cache (`_SIM_CACHE`); source layers remain untouched.
+- [x] Extended `HairSettings` and validation in `src-tauri/src/project.rs`, `src/fileRegistry.ts`, `worker/usd_graph.py` (`apply_hair`, `inspect_stage_curves` returning both curves and meshes), and `src/HairInspector.tsx` (collapsible GPU Physics Simulation section).
+- [x] Added viewport timeline playback controls (`⏮`, `◀`, `▶`/`⏸`, `▶|`, scrubber, `Time`, start/end range, `Loop`) in `src/NativeViewport.tsx` that advance frames only after each render completes.
+- [x] Vectorized NumPy/OpenUSD array conversion (`Vt.Vec3fArray.FromNumpy`), merged AABB-culled collider `wp.Mesh` BVH, and defaulted `colliderQuery` to `__none__`; verified 48-frame simulation of `MikoCharacter` (12,600 strands / 259,080 vertices) in ~2.29s–2.79s and end-to-end `usd_worker.py` Storm render in 5.17s.
+- [x] Verified with `worker/test_hair_sim.py` (3 passed on `cuda:0` NVIDIA GeForce RTX 3090), `npm run build` (passed), and `cargo fmt --check` (passed). Desktop viewport playback in the restarted app remains with the user.

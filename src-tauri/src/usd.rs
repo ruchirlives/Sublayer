@@ -70,6 +70,11 @@ impl Worker {
     fn start(status_listener: Option<StatusListener>) -> Result<Self, String> {
         let python = std::env::var("ORCHFLOW_PYTHON").unwrap_or_else(|_| "python".into());
         let mut command = Command::new(python);
+        if let Some(worker_dir) = find_ovrtx_worker_script().parent() {
+            if worker_dir.exists() {
+                command.env("ORCHFLOW_WORKER_DIR", worker_dir);
+            }
+        }
         command
             .args([
                 "-u",
@@ -295,6 +300,7 @@ fn find_ovrtx_python() -> Option<std::path::PathBuf> {
         }
     }
     let candidates = [
+        "e:/CODINGPROJECTS/Rust/Sublayer/.venv-ovrtx/Scripts/python.exe",
         "e:/CODINGPROJECTS/Rust/OrchFlow/.venv-ovrtx/Scripts/python.exe",
         ".venv-ovrtx/Scripts/python.exe",
     ];
@@ -317,6 +323,7 @@ fn find_ovrtx_python() -> Option<std::path::PathBuf> {
 
 fn find_ovrtx_worker_script() -> std::path::PathBuf {
     let candidates = [
+        "e:/CODINGPROJECTS/Rust/Sublayer/worker/ovrtx_worker.py",
         "e:/CODINGPROJECTS/Rust/OrchFlow/worker/ovrtx_worker.py",
         "worker/ovrtx_worker.py",
     ];
@@ -375,6 +382,9 @@ impl UsdService {
             Some("materialx_rule_matches"),
             Some("inspect_stage_materials"),
             Some("inspect_stage_lights"),
+            Some("inspect_stage_curves"),
+            Some("reset_hair"),
+            Some("convert_source_to_usd"),
         ]
         .contains(&request.get("operation").and_then(Value::as_str))
         {
@@ -384,6 +394,23 @@ impl UsdService {
         let is_render = request.get("operation").and_then(Value::as_str) == Some("render");
         let is_scene_children =
             request.get("operation").and_then(Value::as_str) == Some("scene_children");
+        let is_reset_hair = request.get("operation").and_then(Value::as_str) == Some("reset_hair");
+        if is_reset_hair {
+            if let Ok(mut hydra) = self.worker.lock() {
+                if let Some(w) = hydra.as_mut() {
+                    let _ = w.request(&request);
+                }
+            }
+            if let Ok(mut rtx) = self.ovrtx_worker.lock() {
+                if let Some(w) = rtx.as_mut() {
+                    if let Ok(resp) = w.worker.request(&request) {
+                        return Ok(resp);
+                    }
+                }
+            }
+            return Ok(serde_json::json!({"reset": true}));
+        }
+
         let is_clear = request.get("operation").and_then(Value::as_str) == Some("clear_scene");
         if is_clear {
             {
