@@ -1,0 +1,193 @@
+{
+  "version": 1,
+  "applications": [
+    {
+      "id": "blender",
+      "revision": 2,
+      "app": "Blender",
+      "applicationVersion": "5.2.x",
+      "adapterVersion": 2,
+      "upAxis": "Z",
+      "metersPerUnit": 1,
+      "scale": 1,
+      "executable": "",
+      "importBehavior": "Preserve linked textures; importer unit conversion disabled; Blender normalizes incoming Y-up to Z-up.",
+      "exportBehavior": "Publish against the captured round-trip baseline with matching exporter settings. Author permitted changes as sparse layers; preserve input data outside node scope and block unresolved correspondence.",
+      "capabilities": {
+        "transforms": {
+          "status": "unverified",
+          "reason": "Native editing/import is available; USD round-trip preservation for this edit category has not been verified."
+        },
+        "points": {
+          "status": "unverified",
+          "reason": "Native editing/import is available; USD round-trip preservation for this edit category has not been verified."
+        },
+        "topology": {
+          "status": "unverified",
+          "reason": "Native editing/import is available; USD round-trip preservation for this edit category has not been verified."
+        },
+        "uvs": {
+          "status": "unverified",
+          "reason": "Native editing/import is available; USD round-trip preservation for this edit category has not been verified."
+        },
+        "materials": {
+          "status": "unverified",
+          "reason": "Native editing/import is available; USD round-trip preservation for this edit category has not been verified."
+        },
+        "animation": {
+          "status": "unverified",
+          "reason": "Native editing/import is available; USD round-trip preservation for this edit category has not been verified."
+        },
+        "skeletons": {
+          "status": "unverified",
+          "reason": "Native editing/import is available; USD round-trip preservation for this edit category has not been verified."
+        },
+        "deletions": {
+          "status": "unverified",
+          "reason": "Native editing/import is available; USD round-trip preservation for this edit category has not been verified."
+        }
+      }
+    },
+    {
+      "id": "zbrush",
+      "revision": 1,
+      "app": "ZBrush",
+      "applicationVersion": "Unverified",
+      "adapterVersion": 1,
+      "upAxis": "Y",
+      "metersPerUnit": 1,
+      "scale": 1,
+      "executable": "",
+      "importBehavior": "USD Format plugin imports/exports meshes, not full scenes. Y-up and 1 m/unit are editable provisional handoff preferences, not verified native physical units; ZBrush Tool Export scale/offset can affect round trips. No OrchFlow native import/launch adapter is implemented. https://help.maxon.net/zbr/en-us/Content/html/user-guide/zbrush-other-programs/usd-format/usd-format.html",
+      "exportBehavior": "Geometry-only workflow; retain incoming materials and scene schemas. Use .zpr/.ztl as editable source. Verify installed version, axis/units and baseline correspondence before enabling any edit scope.",
+      "capabilities": {
+        "transforms": {
+          "status": "unverified",
+          "reason": "Mesh transform/Tool export scale behavior is not verified. https://help.maxon.net/zbr/en-us/Content/html/user-guide/zbrush-other-programs/usd-format/usd-format.html"
+        },
+        "points": {
+          "status": "unverified",
+          "reason": "Mesh sculpt editing is documented; point correspondence and scale round trip are unverified. https://help.maxon.net/zbr/en-us/Content/html/user-guide/zbrush-other-programs/usd-format/usd-format.html"
+        },
+        "topology": {
+          "status": "unverified",
+          "reason": "Mesh topology editing is possible; topology/UV/skin remapping requires verification. https://help.maxon.net/zbr/en-us/Content/html/user-guide/zbrush-other-programs/usd-format/usd-format.html"
+        },
+        "uvs": {
+          "status": "unverified",
+          "reason": "Mesh UV interchange needs installed plugin verification. https://help.maxon.net/zbr/en-us/Content/html/user-guide/zbrush-other-programs/usd-format/usd-format.html"
+        },
+        "materials": {
+          "status": "unsupported",
+          "reason": "Mesh-only USD plugin is not a full scene/material-network preservation adapter. https://help.maxon.net/zbr/en-us/Content/html/user-guide/zbrush-other-programs/usd-format/usd-format.html"
+        },
+        "animation": {
+          "status": "unsupported",
+          "reason": "Mesh-only USD plugin does not provide a verified scene animation workflow. https://help.maxon.net/zbr/en-us/Content/html/user-guide/zbrush-other-programs/usd-format/usd-format.html"
+        },
+        "skeletons": {
+          "status": "unsupported",
+          "reason": "Mesh-only USD plugin is not a skeleton/skinning round-trip adapter. https://help.maxon.net/zbr/en-us/Content/html/user-guide/zbrush-other-programs/usd-format/usd-format.html"
+        },
+        "deletions": {
+          "status": "unverified",
+          "reason": "SubTool deletion is not automatically authorized as scene deletion. https://help.maxon.net/zbr/en-us/Content/html/user-guide/zbrush-other-programs/usd-format/usd-format.html"
+        }
+      }
+    },
+    {
+      "id": "marvelous-designer",
+      "revision": 1,
+      "app": "Marvelous Designer",
+      "applicationVersion": "Unverified",
+      "adapterVersion": 1,
+      "upAxis": "Y",
+      "metersPerUnit": 0.001,
+      "scale": 1,
+      "executable": "",
+      "importBehavior": "USD import/export supports avatars, garments, trims and scene props. Y-up is documented. 0.001 m/unit is a provisional millimeter handoff preference; match actual USD import/export scale selections. No OrchFlow native import/launch adapter is implemented. https://www.marvelousdesigner.com/manuals/articles/47358343098777",
+      "exportBehavior": "Garment mesh, material and cloth/avatar animation interchange is documented. Preserve .zprj as editable source and unsupported input scene data. Verify installed version, axis/units and baseline correspondence before enabling any edit scope.",
+      "capabilities": {
+        "transforms": {
+          "status": "unverified",
+          "reason": "Axis conversion is documented; exact transform round trip is unverified. https://www.marvelousdesigner.com/manuals/articles/47358343098777"
+        },
+        "points": {
+          "status": "unverified",
+          "reason": "Garment geometry export is documented; correspondence is not verified. https://www.marvelousdesigner.com/manuals/articles/47358343098777"
+        },
+        "topology": {
+          "status": "unverified",
+          "reason": "Garment remeshing can change topology; safe publication/remapping is unverified. https://www.marvelousdesigner.com/manuals/articles/47358343098777"
+        },
+        "uvs": {
+          "status": "unverified",
+          "reason": "UV interchange and seam correspondence are unverified. https://www.marvelousdesigner.com/manuals/articles/47358343098777"
+        },
+        "materials": {
+          "status": "unverified",
+          "reason": "Mesh/material USD export is documented; shader network preservation is unverified. https://www.marvelousdesigner.com/manuals/articles/47358343098777"
+        },
+        "animation": {
+          "status": "unverified",
+          "reason": "Cloth/avatar animation import/export is documented; sample/rig correspondence is unverified. https://www.marvelousdesigner.com/manuals/articles/47358343098777"
+        },
+        "skeletons": {
+          "status": "unverified",
+          "reason": "Not verified for USD interchange; leave disabled. https://www.marvelousdesigner.com/manuals/articles/47358343098777"
+        },
+        "deletions": {
+          "status": "unverified",
+          "reason": "Not verified for USD interchange; leave disabled. https://www.marvelousdesigner.com/manuals/articles/47358343098777"
+        }
+      }
+    },
+    {
+      "id": "substance-painter",
+      "revision": 1,
+      "app": "Substance Painter",
+      "applicationVersion": "Unverified",
+      "adapterVersion": 1,
+      "upAxis": "Y",
+      "metersPerUnit": 1,
+      "scale": 1,
+      "executable": "",
+      "importBehavior": "Native USD asset workflow; preserve .spp as editable source. Y-up and 1 m/unit are provisional handoff preferences; verify imported metadata and export settings. No OrchFlow native import/launch adapter is implemented. https://experienceleague.adobe.com/en/docs/substance-3d-painter/using/export/export-window/export-settings",
+      "exportBehavior": "USD Asset export produces texture files, a material USD and optionally an assembly referencing the original mesh. Prefer material-only edits and preserve upstream geometry. Verify installed version, axis/units and baseline correspondence before enabling any edit scope.",
+      "capabilities": {
+        "transforms": {
+          "status": "unsupported",
+          "reason": "This profile preserves source geometry transforms. https://experienceleague.adobe.com/en/docs/substance-3d-painter/using/export/export-window/export-settings"
+        },
+        "points": {
+          "status": "unsupported",
+          "reason": "This profile is for material authoring, not mesh deformation. https://experienceleague.adobe.com/en/docs/substance-3d-painter/using/export/export-window/export-settings"
+        },
+        "topology": {
+          "status": "unsupported",
+          "reason": "This profile preserves input topology; it is not a geometry modeling adapter. https://experienceleague.adobe.com/en/docs/substance-3d-painter/using/export/export-window/export-settings"
+        },
+        "uvs": {
+          "status": "unverified",
+          "reason": "Painting uses UVs; USD UV editing/export modifications are unverified. https://experienceleague.adobe.com/en/docs/substance-3d-painter/using/export/export-window/export-settings"
+        },
+        "materials": {
+          "status": "unverified",
+          "reason": "USD material/texture export is documented; render context, texture paths and prim binding correspondence need verification. https://experienceleague.adobe.com/en/docs/substance-3d-painter/using/export/export-window/export-settings"
+        },
+        "animation": {
+          "status": "unsupported",
+          "reason": "This profile does not authorize animation edits. https://experienceleague.adobe.com/en/docs/substance-3d-painter/using/export/export-window/export-settings"
+        },
+        "skeletons": {
+          "status": "unsupported",
+          "reason": "This profile does not authorize skeleton/skinning edits. https://experienceleague.adobe.com/en/docs/substance-3d-painter/using/export/export-window/export-settings"
+        },
+        "deletions": {
+          "status": "unsupported",
+          "reason": "Material authoring does not authorize deleting input scene prims. https://experienceleague.adobe.com/en/docs/substance-3d-painter/using/export/export-window/export-settings"
+        }
+      }
+    }
+  ]
+}

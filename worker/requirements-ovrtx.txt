@@ -1,0 +1,6 @@
+# Pinned isolated NVIDIA runtime; do not add this USD build to the Hydra worker.
+ovrtx==0.6.0.1791947691
+ovstage==0.3.0.1791986420
+usd-core==26.11
+numpy==2.5.4
+pillow==13.0.0

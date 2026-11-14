@@ -1,0 +1,12 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "app": {
+    "windows": [{
+      "label": "main",
+      "title": "OrchFlow - Development (live reload)",
+      "width": 1440,
+      "height": 900,
+      "dragDropEnabled": false
+    }]
+  }
+}
