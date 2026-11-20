@@ -54,7 +54,24 @@ export const PROCEDURAL_NODE_SPECS: Record<Exclude<ProceduralNodeKind, "triplana
     label: "UV Coords",
     category: "Coordinates",
     outType: "vector2",
-    inputs: [{ name: "geomprop", label: "Attr", type: "string", defaultValue: "st", connectable: false }],
+    inputs: [
+      {
+        name: "geomprop",
+        label: "Attr",
+        type: "string",
+        defaultValue: "st",
+        connectable: false,
+        options: [
+          { value: "st", label: "st (Mesh UV)" },
+          { value: "uv", label: "uv (Mesh UV)" },
+          { value: "groom_root_uv", label: "groom_root_uv (Fur/Hair Root)" },
+          { value: "root_uv", label: "root_uv (Root UV)" },
+          { value: "uv_root", label: "uv_root (Root UV)" },
+          { value: "strand_uv", label: "strand_uv (Along Strand 0→1)" },
+          { value: "orchflow:strand_uv", label: "orchflow:strand_uv (Along Strand 0→1)" },
+        ],
+      },
+    ],
   },
   place2d: {
     kind: "place2d",
@@ -543,6 +560,7 @@ export function wouldCreateProceduralCycle(
 export function isSocketCompatible(sourceType: SocketType | undefined, targetType: SocketType | undefined): boolean {
   if (!sourceType || !targetType) return false;
   if (sourceType === targetType) return true;
+  if (sourceType === "vector2" && targetType === "float") return true;
   if (sourceType === "vector2" || targetType === "vector2") return false;
   if (targetType === "dynamic" || sourceType === "dynamic") return true;
   if (sourceType === "float" && targetType === "vector3") return true;
@@ -614,10 +632,12 @@ function ProceduralNodeCard({ id, data }: NodeProps<Node<FlowNodeData>>) {
   function renderInputControl(port: ProceduralPortSpec) {
     const val = params[port.name] ?? port.defaultValue;
     if (port.options) {
+      const strVal = String(val ?? port.defaultValue ?? "");
+      const hasCurrent = port.options.some((opt) => String(opt.value) === strVal);
       return (
         <select
           className="nodrag nopan proc-input"
-          value={String(val ?? port.defaultValue ?? "")}
+          value={strVal}
           onChange={(e) => setParam(port.name, port.type === "integer" ? Number(e.target.value) : e.target.value)}
         >
           {port.options.map((opt) => (
@@ -625,6 +645,11 @@ function ProceduralNodeCard({ id, data }: NodeProps<Node<FlowNodeData>>) {
               {opt.label}
             </option>
           ))}
+          {!hasCurrent && strVal && (
+            <option key={strVal} value={strVal}>
+              {strVal}
+            </option>
+          )}
         </select>
       );
     }

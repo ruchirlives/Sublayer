@@ -143,6 +143,7 @@ export type MaterialXSettings = {
   transmissionTextureDependencyId?: string | null;
   proceduralBaseColor?: ProceduralConfig | null;
   proceduralRoughness?: ProceduralConfig | null;
+  uvMode?: "auto" | "root" | "strand" | null;
 };
 export type MaterialBindingRule = {
   id: string;
@@ -233,6 +234,7 @@ export const defaultMaterialX: MaterialXSettings = {
   transmissionTextureDependencyId: null,
   proceduralBaseColor: null,
   proceduralRoughness: null,
+  uvMode: null,
 };
 export type BlenderObjectInfo = {
   name: string;
@@ -252,6 +254,16 @@ export type HdriSettings = {
   rotation: number;
   color: [number, number, number];
   textureFormat: "latlong" | "automatic" | "angular" | "mirroredBall";
+};
+
+export type HairGroomDelta = {
+  pointCount: number;
+  curveCount: number;
+  deltasZB64: string;
+  pointIndicesZB64?: string;
+  countsZB64?: string;
+  pointsZB64?: string;
+  widthsZB64?: string;
 };
 
 export type HairSettings = {
@@ -275,6 +287,7 @@ export type HairSettings = {
   wind: [number, number, number];
   collisionMargin: number;
   friction: number;
+  groomDeltas?: Record<string, HairGroomDelta>;
 };
 
 export const defaultHairSettings: HairSettings = {
@@ -300,11 +313,225 @@ export const defaultHairSettings: HairSettings = {
   friction: 0.25,
 };
 
+export type CacheEditDelta = {
+  count: number;
+  indicesZB64?: string;
+  deltasZB64: string;
+};
+
+export type CacheEditMask = {
+  count: number;
+  weightsZB64: string;
+};
+
+export type CacheEditLayerMode = "allFrames" | "frameRange" | "singleFrame";
+export type CacheEditFalloff = "smoothstep" | "gaussian" | "linear" | "constant";
+
+export type CacheEditLayer = {
+  id: string;
+  name: string;
+  enabled: boolean;
+  weight: number;
+  mode: CacheEditLayerMode;
+  centerFrame: number;
+  fadeIn: number;
+  fadeOut: number;
+  falloff: CacheEditFalloff;
+  deltas?: Record<string, CacheEditDelta>;
+};
+
+export type CacheEditSimMode = "animated" | "static";
+export type CacheEditFabricPreset = "custom" | "silk" | "cotton" | "denim" | "wool" | "leather";
+
+export type CacheEditSettings = {
+  targetQuery: string;
+  colliderQuery: string;
+  activeLayerId: string;
+  temporalSmoothFrames: number;
+  temporalSmoothStrength: number;
+  clothSubsteps: number;
+  clothIterations: number;
+  clothStretchStiffness: number;
+  clothBendStiffness: number;
+  clothDamping: number;
+  clothGravity: number;
+  clothCollisionMargin: number;
+  clothFriction: number;
+  clothDragPinFalloff: number;
+  clothSimScale?: number;
+  simEnabled?: boolean;
+  simMode?: CacheEditSimMode;
+  simStartFrame?: number;
+  simEndFrame?: number;
+  simFps?: number;
+  simSettleSteps?: number;
+  simFabricPreset?: CacheEditFabricPreset;
+  simAirDrag?: number;
+  simWind?: [number, number, number];
+  simSelfCollision?: boolean;
+  simSelfThickness?: number;
+  simPinToCollider?: boolean;
+  simCacheVersion?: number;
+  maskWeights?: Record<string, CacheEditMask>;
+  layers: CacheEditLayer[];
+};
+
+export function createCacheEditLayer(index: number, centerFrame = 0): CacheEditLayer {
+  return {
+    id: `layer-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+    name: `Sculpt Layer ${index}`,
+    enabled: true,
+    weight: 1.0,
+    mode: "frameRange",
+    centerFrame,
+    fadeIn: 8,
+    fadeOut: 8,
+    falloff: "smoothstep",
+  };
+}
+
+export const defaultCacheEditSettings: CacheEditSettings = {
+  targetQuery: "",
+  colliderQuery: "__none__",
+  activeLayerId: "layer-1",
+  temporalSmoothFrames: 0,
+  temporalSmoothStrength: 0.0,
+  clothSubsteps: 4,
+  clothIterations: 8,
+  clothStretchStiffness: 0.95,
+  clothBendStiffness: 0.35,
+  clothDamping: 0.08,
+  clothGravity: 9.81,
+  clothCollisionMargin: 0.004,
+  clothFriction: 0.35,
+  clothDragPinFalloff: 1.4,
+  clothSimScale: 1.0,
+  simEnabled: false,
+  simMode: "animated",
+  simStartFrame: 0,
+  simEndFrame: 48,
+  simFps: 24,
+  simSettleSteps: 12,
+  simFabricPreset: "custom",
+  simAirDrag: 0.05,
+  simWind: [0, 0, 0],
+  simSelfCollision: true,
+  simSelfThickness: 0.004,
+  simPinToCollider: true,
+  simCacheVersion: 0,
+  layers: [
+    {
+      id: "layer-1",
+      name: "Sculpt Layer 1",
+      enabled: true,
+      weight: 1.0,
+      mode: "frameRange",
+      centerFrame: 0,
+      fadeIn: 8,
+      fadeOut: 8,
+      falloff: "smoothstep",
+    },
+  ],
+};
+
+export type CharacterJointAttachment = {
+  id: string;
+  enabled: boolean;
+  targetQuery: string;
+  skeletonPath: string;
+  jointName: string;
+  offsetTranslation: [number, number, number];
+  offsetRotation: [number, number, number];
+  offsetScale: [number, number, number];
+};
+
+export type CharacterSkeletonBinding = {
+  id: string;
+  enabled: boolean;
+  targetQuery: string;
+  skeletonPath: string;
+  deactivateSourceSkeletons: boolean;
+};
+
+export type CharacterAnimationOverride = {
+  id: string;
+  enabled: boolean;
+  skeletonPath: string;
+  animationPath: string;
+  mode: "pose" | "clip";
+  poseTime: number;
+};
+
+export type CharacterClothCache = {
+  id: string;
+  enabled: boolean;
+  dependencyId: string | null;
+  attachToRoot: boolean;
+  axis: string;
+  frontAxis: string;
+  scale: number;
+  timeOffset: number;
+};
+
+export type CharacterSettings = {
+  baseSkeletonPath: string;
+  animationOverrides: CharacterAnimationOverride[];
+  jointAttachments: CharacterJointAttachment[];
+  skeletonBindings: CharacterSkeletonBinding[];
+  clothCaches: CharacterClothCache[];
+};
+
+export const defaultCharacterSettings: CharacterSettings = {
+  baseSkeletonPath: "",
+  animationOverrides: [],
+  jointAttachments: [],
+  skeletonBindings: [],
+  clothCaches: [],
+};
+
+export type ScatterPrototypeRule = {
+  id: string;
+  enabled: boolean;
+  primPath: string;
+};
+
+export type ScatterSettings = {
+  count: number;
+  seed: number;
+  distribution: "random" | "grid" | "circle" | "surface";
+  areaSize: [number, number, number];
+  scaleMin: number;
+  scaleMax: number;
+  randomYaw: boolean;
+  passThrough?: boolean;
+  surfacePrimPath?: string;
+  alignToNormal?: boolean;
+  maxSlopeDeg?: number;
+  minSpacing?: number;
+  prototypes?: ScatterPrototypeRule[];
+};
+export const defaultScatter: ScatterSettings = {
+  count: 100,
+  seed: 42,
+  distribution: "random",
+  areaSize: [20, 0, 20],
+  scaleMin: 0.8,
+  scaleMax: 1.2,
+  randomYaw: true,
+  passThrough: false,
+  surfacePrimPath: "",
+  alignToNormal: false,
+  maxSlopeDeg: 90,
+  minSpacing: 0,
+  prototypes: [],
+};
+
 export type Data = {
   blenderSelections?: string[];
   blenderObjects?: BlenderObjectInfo[];
   blenderMaterialMode?: "off" | "auto" | "octane" | "cycles";
   blenderConvertProcedurals?: boolean;
+  blenderExportSkeletons?: boolean;
   materialX?:MaterialXSettings;
   materialXRules?:MaterialXRule[];
   materialBindings?: MaterialBindingRule[];
@@ -312,6 +539,8 @@ export type Data = {
   lightOverrides?: LightOverride[];
   hdri?: HdriSettings;
   hair?: HairSettings;
+  cacheEdit?: CacheEditSettings;
+  character?: CharacterSettings | null;
   camera?: ViewportCamera | null;
   cameraViews?: CameraView[];
   publicationPolicy?:PolicySnapshot | null;
@@ -323,6 +552,10 @@ export type Data = {
   manualBaseline?: NativeImport | null;
   nativePreparation?:Omit<NativeImport,"baselineDependencyId">|null;
   deletePaths?:string[];
+  scatter?: ScatterSettings | null;
+  groupName?: string;
+  loadPayloads?: boolean;
+  useAsPayload?: boolean;
   handoff?: Handoff | null;
   handoffSelection?:string[]|null;
   applicationMetersPerUnit?: number | null;
@@ -333,6 +566,7 @@ export type Data = {
   operation: string;
   app: string;
   axis: string;
+  frontAxis?: string;
   scale: number;
   appExecutable?: string;
   nativeProject: string;
@@ -807,16 +1041,24 @@ export function graphPreview(
       blenderSelections: n.data.blenderSelections,
       blenderMaterialMode: n.data.blenderMaterialMode,
       blenderConvertProcedurals: Boolean(n.data.blenderConvertProcedurals),
+      blenderExportSkeletons: Boolean(n.data.blenderExportSkeletons),
       instanced: Boolean(n.data.instanced),
+      loadPayloads: n.data.loadPayloads !== false,
+      useAsPayload: Boolean(n.data.useAsPayload),
       axis: n.data.axis || "preserve",
+      frontAxis: n.data.frontAxis || "preserve",
       scale: typeof n.data.scale === "number" && n.data.scale > 0 ? n.data.scale : 1,
       transform: n.data.transform || identityTransform,
       ...(n.data.operation==="transform" && n.data.transformTargets?.length ? {transformTargets: n.data.transformTargets} : {}),
       ...(n.data.operation==="delete" ? {deletePaths:n.data.deletePaths || []}:{}),
+      ...(n.data.operation==="scatter" ? {scatter: n.data.scatter || defaultScatter}:{}),
+      ...(n.data.operation==="group" && n.data.groupName ? {groupName: n.data.groupName}:{}),
       ...(n.data.operation==="material_bind" ? {materialBindings:n.data.materialBindings || []}:{}),
       ...(n.data.operation==="light" ? {lightOverrides:n.data.lightOverrides || []}:{}),
       ...(n.data.operation==="hdri" && n.data.hdri ? {hdri: n.data.hdri}:{}),
       ...(n.data.operation==="hair" && n.data.hair ? {hair: n.data.hair}:{}),
+      ...(n.data.operation==="cache_edit" ? {cacheEdit: n.data.cacheEdit || defaultCacheEditSettings}:{}),
+      ...(n.data.operation==="character" ? {character: n.data.character || defaultCharacterSettings}:{}),
       ...(n.data.operation==="camera" && n.data.camera ? {camera: n.data.camera}:{}),
       ...(n.data.operation==="camera" && n.data.cameraViews ? {cameraViews: n.data.cameraViews}:{}),
       assetOverrides: n.data.assetOverrides || [],
@@ -848,6 +1090,7 @@ export function graphPreview(
         n.liveAdjustment?.baselineDependencyId,
         n.liveAdjustment?.handoffDependencyId,
         n.hdri?.textureDependencyId,
+        ...(n.character?.clothCaches || []).map(c => c.dependencyId),
         ...(n.materialXRules || []).flatMap(r => materialTextures(r.material)),
       ])
       .filter(Boolean),
@@ -880,13 +1123,40 @@ export function overrideDependency(project: StoredProject, nodeId: string, id: s
     {originalPath: original.path, replacementDependencyId: registered.ids[0]}
   ]}}))};
 }
+export function mergeDiscoveredInputs(
+  project: StoredProject,
+  files: { path: string; kind: DependencyKind }[],
+  makeId = () => crypto.randomUUID(),
+): StoredProject {
+  let dependencies = project.dependencies;
+  let changed = false;
+  for (const file of files) {
+    if (!file.path.trim()) continue;
+    if (!dependencies.some((d) => fileKey(d.path) === fileKey(file.path))) {
+      dependencies = registerFiles(dependencies, [file.path], file.kind, makeId).dependencies;
+      changed = true;
+    }
+  }
+  return changed ? { ...project, dependencies } : project;
+}
+
 export function overrideInputs(project: StoredProject, nodeId: string) {
   const spec = JSON.parse(graphPreview(project, nodeId));
   const roots = new Set<string>(
-    spec.nodes.flatMap((n: { inputDependencyId: string; publishedDependencyId: string; materialX?: MaterialXSettings }) => [
+    spec.nodes.flatMap((n: {
+      inputDependencyId: string;
+      publishedDependencyId: string;
+      materialX?: MaterialXSettings;
+      materialXRules?: MaterialXRule[];
+      hdri?: { textureDependencyId?: string | null };
+      liveAdjustment?: { editedDependencyId?: string | null };
+    }) => [
       n.inputDependencyId,
       n.publishedDependencyId,
       ...materialTextures(n.materialX),
+      ...(n.materialXRules || []).flatMap(r => materialTextures(r.material)),
+      n.hdri?.textureDependencyId || "",
+      n.liveAdjustment?.editedDependencyId || "",
     ]).filter(Boolean)
   );
   return project.dependencies.filter(d => (d.kind==="asset" && roots.has(d.id)) || (d.usdReferences || []).some(r => roots.has(r.sourceDependencyId)));
@@ -896,6 +1166,24 @@ export function recordHandoff(project:StoredProject,nodeId:string,result:Handoff
   const root=registerFiles(project.dependencies,[result.path],"usd");
   const layers=registerFiles(root.dependencies,result.layerPaths,"usd");
   return {...project,dependencies:layers.dependencies.map(d=>layers.ids.includes(d.id) ? {...d,usdReferences:uniqueReferences([...(d.usdReferences || []),{sourceDependencyId:root.ids[0],path:d.path}])} : d),nodes:project.nodes.map(n=>n.id !== nodeId ? n : {...n,data:{...n.data,handoffSelection:result.selection ?? null,handoff:{selection:result.selection ?? null,inputEdges:result.inputEdges,dependencyId:root.ids[0],layerDependencyIds:layers.ids,conversion:result.draft,policy:result.policy}}})};
+}
+
+export function prepareQuickstart(project: StoredProject, nodeId: string, handoff: HandoffResult): StoredProject {
+  const staged = recordHandoff(project, nodeId, handoff);
+  return {
+    ...staged,
+    nodes: staged.nodes.map(node => node.id !== nodeId ? node : {
+      ...node,
+      data: {
+        ...node.data,
+        nativeProjectDependencyId: null,
+        nativePreparation: null,
+        nativeImport: null,
+        manualBaseline: null,
+        publicationPolicy: null,
+      },
+    }),
+  };
 }
 
 export function recordNativeCreation(project:StoredProject,nodeId:string,result:NativeCreationResult):StoredProject {

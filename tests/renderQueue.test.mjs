@@ -7,6 +7,7 @@ function fixture() {
   const callbacks = new Map();
   const renders = [],
     frames = [],
+    discarded = [],
     errors = [],
     busy = [];
   const queue = new LatestRenderQueue({
@@ -15,6 +16,7 @@ function fixture() {
         renders.push({ request, resolve, reject }),
       ),
     present: (frame) => frames.push(frame),
+    discard: (frame) => discarded.push(frame),
     error: (error) => errors.push(error),
     busy: (value) => busy.push(value),
     schedule: (callback) => {
@@ -29,7 +31,7 @@ function fixture() {
     callbacks.clear();
     batch.forEach((callback) => callback());
   };
-  return { queue, tick, renders, frames, errors, busy, callbacks };
+  return { queue, tick, renders, frames, discarded, errors, busy, callbacks };
 }
 
 test("continuous motion presents completed frames while keeping only the newest pending camera", async () => {
@@ -68,6 +70,20 @@ test("release keeps the last full-quality request even with a preview in flight"
   assert.equal(f.busy.at(-1), false);
 });
 
+test("a settled frame can rebase a queued orbit before it is sent", async () => {
+  const f = fixture();
+  f.queue.enqueue("stage", { panX: 0, interactive: false });
+  f.tick();
+  f.queue.enqueue("stage", { panX: 0, yaw: 50, interactive: true });
+  f.renders[0].resolve("settled");
+  await settled();
+  f.queue.updatePending((request) => ({ ...request, panX: request.panX - 1 }));
+  f.tick();
+  assert.deepEqual(f.renders[1].request, { panX: -1, yaw: 50, interactive: true });
+  f.renders[1].resolve("orbited");
+  await settled();
+});
+
 test("scene changes reject old frames, including switching away and back", async () => {
   const f = fixture();
   f.queue.enqueue("A", 1);
@@ -82,6 +98,37 @@ test("scene changes reject old frames, including switching away and back", async
   f.renders[1].resolve("new A");
   await settled();
   assert.deepEqual(f.frames, ["new A"]);
+});
+
+test("a queued groom commit runs before the new node preview and its stale image is discarded", async () => {
+  const f = fixture();
+  f.queue.enqueue("hair", "stroke in flight");
+  f.tick();
+  f.queue.enqueueRequired("hair", "last brush sample");
+  f.queue.enqueueRequired("hair", "commit groom");
+  f.queue.enqueue("other", "old preview");
+  f.queue.enqueue("other", "latest preview");
+  for (const [index, request] of ["stroke in flight", "last brush sample", "commit groom", "latest preview"].entries()) {
+    assert.equal(f.renders[index].request, request);
+    f.renders[index].resolve(request);
+    await settled();
+    f.tick();
+  }
+  assert.deepEqual(f.frames, ["latest preview"]);
+  assert.deepEqual(f.discarded, ["stroke in flight", "last brush sample", "commit groom"]);
+});
+
+test("selecting a node with no preview keeps the old node's queued groom commit", async () => {
+  const f = fixture();
+  f.queue.enqueue("hair", "old preview");
+  f.queue.enqueueRequired("hair", "commit groom");
+  f.queue.clear();
+  f.tick();
+  assert.deepEqual(f.renders.map(({ request }) => request), ["commit groom"]);
+  f.renders[0].resolve("old hair image");
+  await settled();
+  assert.deepEqual(f.frames, []);
+  assert.equal(f.busy.at(-1), false);
 });
 
 test("errors do not block subsequent camera updates", async () => {

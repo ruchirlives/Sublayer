@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -185,9 +185,76 @@ pub struct Position {
     pub x: f64,
     pub y: f64,
 }
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ScatterPrototypeRule {
+    pub id: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub prim_path: String,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ScatterSettings {
+    #[serde(default = "default_scatter_count")]
+    pub count: u32,
+    #[serde(default = "default_scatter_seed")]
+    pub seed: u64,
+    #[serde(default = "default_scatter_distribution")]
+    pub distribution: String,
+    #[serde(default = "default_scatter_area")]
+    pub area_size: [f64; 3],
+    #[serde(default = "default_scatter_scale_min")]
+    pub scale_min: f64,
+    #[serde(default = "default_scatter_scale_max")]
+    pub scale_max: f64,
+    #[serde(default = "default_scatter_random_yaw")]
+    pub random_yaw: bool,
+    #[serde(default)]
+    pub pass_through: bool,
+    #[serde(default)]
+    pub surface_prim_path: String,
+    #[serde(default)]
+    pub align_to_normal: bool,
+    #[serde(default = "default_scatter_max_slope_deg")]
+    pub max_slope_deg: f64,
+    #[serde(default)]
+    pub min_spacing: f64,
+    #[serde(default)]
+    pub prototypes: Vec<ScatterPrototypeRule>,
+}
+fn default_scatter_count() -> u32 {
+    100
+}
+fn default_scatter_seed() -> u64 {
+    42
+}
+fn default_scatter_distribution() -> String {
+    "random".to_string()
+}
+fn default_scatter_area() -> [f64; 3] {
+    [20.0, 0.0, 20.0]
+}
+fn default_scatter_scale_min() -> f64 {
+    0.8
+}
+fn default_scatter_scale_max() -> f64 {
+    1.2
+}
+fn default_scatter_random_yaw() -> bool {
+    true
+}
+fn default_scatter_max_slope_deg() -> f64 {
+    90.0
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NodeData {
+    #[serde(default = "default_true")]
+    pub load_payloads: bool,
+    #[serde(default)]
+    pub use_as_payload: bool,
     #[serde(default)]
     pub material_x: MaterialXSettings,
     #[serde(default)]
@@ -198,6 +265,10 @@ pub struct NodeData {
     pub light_overrides: Option<Vec<LightOverride>>,
     #[serde(default)]
     pub delete_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scatter: Option<ScatterSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_name: Option<String>,
     #[serde(default)]
     pub publication_policy: Option<crate::application_profiles::PolicySnapshot>,
     #[serde(default)]
@@ -230,6 +301,8 @@ pub struct NodeData {
     pub operation: String,
     pub app: String,
     pub axis: String,
+    #[serde(default = "default_preserve_axis")]
+    pub front_axis: String,
     pub scale: f64,
     #[serde(default)]
     pub input_dependency_id: Option<String>,
@@ -254,11 +327,17 @@ pub struct NodeData {
     #[serde(default)]
     pub blender_convert_procedurals: Option<bool>,
     #[serde(default)]
+    pub blender_export_skeletons: Option<bool>,
+    #[serde(default)]
     pub last_extraction_seconds: Option<f64>,
     #[serde(default)]
     pub hdri: Option<HdriSettings>,
     #[serde(default)]
     pub hair: Option<HairSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_edit: Option<CacheEditSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub character: Option<CharacterSettings>,
     #[serde(default)]
     pub camera: Option<ViewportCamera>,
     #[serde(default)]
@@ -293,6 +372,10 @@ pub struct MaterialBindingRule {
     #[serde(default = "default_binding_strength")]
     pub strength: String,
 }
+fn default_preserve_axis() -> String {
+    "preserve".into()
+}
+
 fn default_binding_strength() -> String {
     "strongerThanDescendants".into()
 }
@@ -321,6 +404,113 @@ pub struct LightOverride {
 }
 fn default_true() -> bool {
     true
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HairGroomDelta {
+    pub point_count: usize,
+    pub curve_count: usize,
+    pub deltas_z_b64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counts_z_b64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub points_z_b64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub widths_z_b64: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CharacterJointAttachment {
+    pub id: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub target_query: String,
+    #[serde(default)]
+    pub skeleton_path: String,
+    #[serde(default)]
+    pub joint_name: String,
+    #[serde(default)]
+    pub offset_translation: [f64; 3],
+    #[serde(default)]
+    pub offset_rotation: [f64; 3],
+    #[serde(default = "default_unit_scale")]
+    pub offset_scale: [f64; 3],
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CharacterSkeletonBinding {
+    pub id: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub target_query: String,
+    #[serde(default)]
+    pub skeleton_path: String,
+    #[serde(default = "default_true")]
+    pub deactivate_source_skeletons: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CharacterAnimationOverride {
+    pub id: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub skeleton_path: String,
+    #[serde(default)]
+    pub animation_path: String,
+    #[serde(default = "default_char_anim_mode")]
+    pub mode: String,
+    #[serde(default)]
+    pub pose_time: f64,
+}
+
+fn default_char_anim_mode() -> String {
+    "pose".into()
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CharacterClothCache {
+    pub id: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub dependency_id: Option<String>,
+    #[serde(default = "default_true")]
+    pub attach_to_root: bool,
+    #[serde(default = "default_preserve_axis")]
+    pub axis: String,
+    #[serde(default = "default_preserve_axis")]
+    pub front_axis: String,
+    #[serde(default = "default_one")]
+    pub scale: f64,
+    #[serde(default)]
+    pub time_offset: f64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CharacterSettings {
+    #[serde(default)]
+    pub base_skeleton_path: String,
+    #[serde(default)]
+    pub animation_overrides: Vec<CharacterAnimationOverride>,
+    #[serde(default)]
+    pub joint_attachments: Vec<CharacterJointAttachment>,
+    #[serde(default)]
+    pub skeleton_bindings: Vec<CharacterSkeletonBinding>,
+    #[serde(default)]
+    pub cloth_caches: Vec<CharacterClothCache>,
+}
+
+fn default_unit_scale() -> [f64; 3] {
+    [1.0, 1.0, 1.0]
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -366,6 +556,8 @@ pub struct HairSettings {
     pub collision_margin: f64,
     #[serde(default = "default_hair_friction")]
     pub friction: f64,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub groom_deltas: BTreeMap<String, HairGroomDelta>,
 }
 fn default_hair_width_mode() -> String {
     "multiply".into()
@@ -408,6 +600,181 @@ fn default_hair_gravity() -> f64 {
 }
 fn default_hair_collision_margin() -> f64 {
     0.005
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CacheEditDelta {
+    pub count: usize,
+    #[serde(
+        default,
+        rename = "indicesZB64",
+        alias = "indicesZb64",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub indices_zb64: Option<String>,
+    #[serde(rename = "deltasZB64", alias = "deltasZb64")]
+    pub deltas_zb64: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CacheEditMask {
+    pub count: usize,
+    #[serde(rename = "weightsZB64", alias = "weightsZb64")]
+    pub weights_zb64: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CacheEditLayer {
+    pub id: String,
+    pub name: String,
+    #[serde(default = "default_true_flag")]
+    pub enabled: bool,
+    #[serde(default = "default_cache_weight")]
+    pub weight: f64,
+    #[serde(default = "default_cache_mode")]
+    pub mode: String,
+    #[serde(default)]
+    pub center_frame: f64,
+    #[serde(default = "default_cache_fade")]
+    pub fade_in: f64,
+    #[serde(default = "default_cache_fade")]
+    pub fade_out: f64,
+    #[serde(default = "default_cache_falloff")]
+    pub falloff: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub deltas: BTreeMap<String, CacheEditDelta>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CacheEditSettings {
+    #[serde(default)]
+    pub target_query: String,
+    #[serde(default = "default_hair_collider_query")]
+    pub collider_query: String,
+    #[serde(default)]
+    pub active_layer_id: String,
+    #[serde(default)]
+    pub temporal_smooth_frames: u32,
+    #[serde(default)]
+    pub temporal_smooth_strength: f64,
+    #[serde(default = "default_cache_cloth_substeps")]
+    pub cloth_substeps: u32,
+    #[serde(default = "default_cache_cloth_iterations")]
+    pub cloth_iterations: u32,
+    #[serde(default = "default_cache_cloth_stretch")]
+    pub cloth_stretch_stiffness: f64,
+    #[serde(default = "default_cache_cloth_bend")]
+    pub cloth_bend_stiffness: f64,
+    #[serde(default = "default_cache_cloth_damping")]
+    pub cloth_damping: f64,
+    #[serde(default = "default_hair_gravity")]
+    pub cloth_gravity: f64,
+    #[serde(default = "default_cache_cloth_margin")]
+    pub cloth_collision_margin: f64,
+    #[serde(default = "default_cache_cloth_friction")]
+    pub cloth_friction: f64,
+    #[serde(default = "default_cache_cloth_patch_falloff")]
+    pub cloth_drag_pin_falloff: f64,
+    #[serde(default = "default_cache_sim_scale")]
+    pub cloth_sim_scale: f64,
+    #[serde(default)]
+    pub sim_enabled: bool,
+    #[serde(default = "default_cache_sim_mode")]
+    pub sim_mode: String,
+    #[serde(default)]
+    pub sim_start_frame: f64,
+    #[serde(default = "default_cache_sim_end_frame")]
+    pub sim_end_frame: f64,
+    #[serde(default = "default_cache_sim_fps")]
+    pub sim_fps: f64,
+    #[serde(default = "default_cache_sim_settle_steps")]
+    pub sim_settle_steps: u32,
+    #[serde(default = "default_cache_sim_fabric_preset")]
+    pub sim_fabric_preset: String,
+    #[serde(default = "default_cache_sim_air_drag")]
+    pub sim_air_drag: f64,
+    #[serde(default)]
+    pub sim_wind: [f64; 3],
+    #[serde(default = "default_true_flag")]
+    pub sim_self_collision: bool,
+    #[serde(default = "default_cache_sim_self_thickness")]
+    pub sim_self_thickness: f64,
+    #[serde(default = "default_true_flag")]
+    pub sim_pin_to_collider: bool,
+    #[serde(default)]
+    pub sim_cache_version: u32,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mask_weights: BTreeMap<String, CacheEditMask>,
+    #[serde(default)]
+    pub layers: Vec<CacheEditLayer>,
+}
+
+fn default_true_flag() -> bool {
+    true
+}
+fn default_cache_weight() -> f64 {
+    1.0
+}
+fn default_cache_mode() -> String {
+    "frameRange".into()
+}
+fn default_cache_fade() -> f64 {
+    8.0
+}
+fn default_cache_falloff() -> String {
+    "smoothstep".into()
+}
+fn default_cache_cloth_substeps() -> u32 {
+    4
+}
+fn default_cache_cloth_iterations() -> u32 {
+    8
+}
+fn default_cache_cloth_stretch() -> f64 {
+    0.95
+}
+fn default_cache_cloth_bend() -> f64 {
+    0.35
+}
+fn default_cache_cloth_damping() -> f64 {
+    0.08
+}
+fn default_cache_cloth_margin() -> f64 {
+    0.004
+}
+fn default_cache_cloth_friction() -> f64 {
+    0.35
+}
+fn default_cache_cloth_patch_falloff() -> f64 {
+    1.4
+}
+fn default_cache_sim_scale() -> f64 {
+    1.0
+}
+fn default_cache_sim_mode() -> String {
+    "animated".into()
+}
+fn default_cache_sim_end_frame() -> f64 {
+    48.0
+}
+fn default_cache_sim_fps() -> f64 {
+    24.0
+}
+fn default_cache_sim_settle_steps() -> u32 {
+    12
+}
+fn default_cache_sim_fabric_preset() -> String {
+    "custom".into()
+}
+fn default_cache_sim_air_drag() -> f64 {
+    0.05
+}
+fn default_cache_sim_self_thickness() -> f64 {
+    0.004
 }
 fn default_hair_friction() -> f64 {
     0.25
@@ -571,6 +938,8 @@ pub struct MaterialXSettings {
     pub procedural_base_color: Option<ProceduralConfig>,
     #[serde(default)]
     pub procedural_roughness: Option<ProceduralConfig>,
+    #[serde(default)]
+    pub uv_mode: Option<String>,
 }
 fn default_ior() -> f64 {
     1.5
@@ -639,6 +1008,7 @@ impl Default for MaterialXSettings {
             transmission_texture_dependency_id: None,
             procedural_base_color: None,
             procedural_roughness: None,
+            uv_mode: None,
         }
     }
 }
@@ -988,8 +1358,12 @@ impl Project {
                     "light",
                     "hdri",
                     "hair",
+                    "cache_edit",
                     "camera",
                     "delete",
+                    "group",
+                    "scatter",
+                    "character",
                 ]
                 .contains(&n.data.operation.as_str())
             {
@@ -1000,6 +1374,8 @@ impl Project {
                 || !n.position.x.is_finite()
                 || !n.position.y.is_finite()
                 || !["preserve", "Y", "-Y", "Z", "-Z", "X", "-X"].contains(&n.data.axis.as_str())
+                || !["preserve", "Y", "-Y", "Z", "-Z", "X", "-X"]
+                    .contains(&n.data.front_axis.as_str())
             {
                 return Err("Invalid axis, scale, or position".into());
             }
@@ -1026,6 +1402,39 @@ impl Project {
                 !crate::application_profiles::SCOPES.contains(&s.as_str()) || !scope.insert(s)
             }) {
                 return Err("Unknown or duplicate node edit scope".into());
+            }
+            if let Some(scatter) = &n.data.scatter {
+                if scatter.count == 0 || scatter.count > 1_000_000 {
+                    return Err("Scatter count must be between 1 and 1,000,000".into());
+                }
+                if !["random", "grid", "circle", "surface"].contains(&scatter.distribution.as_str())
+                {
+                    return Err(
+                        "Scatter distribution must be random, grid, circle, or surface".into(),
+                    );
+                }
+                if scatter.area_size.iter().any(|v| !v.is_finite() || *v < 0.0)
+                    || !scatter.scale_min.is_finite()
+                    || !scatter.scale_max.is_finite()
+                    || scatter.scale_min <= 0.0
+                    || scatter.scale_max < scatter.scale_min
+                    || !scatter.max_slope_deg.is_finite()
+                    || !(0.0..=180.0).contains(&scatter.max_slope_deg)
+                    || !scatter.min_spacing.is_finite()
+                    || scatter.min_spacing < 0.0
+                {
+                    return Err("Invalid scatter area, slope, spacing, or scale bounds".into());
+                }
+                if scatter.prototypes.len() > 1000
+                    || scatter.prototypes.iter().any(|p| p.id.trim().is_empty())
+                {
+                    return Err("Invalid scatter prototype list".into());
+                }
+            }
+            if let Some(group_name) = &n.data.group_name {
+                if group_name.len() > 128 {
+                    return Err("Group name must be 128 characters or fewer".into());
+                }
             }
             if n.data.operation == "application"
                 && n.data.published_dependency_id.is_some()
@@ -1180,6 +1589,65 @@ impl Project {
             {
                 return Err("Delete targets must be absolute USD prim paths".into());
             }
+            if n.data.operation == "character" {
+                if let Some(ch) = &n.data.character {
+                    let mut anim_ids = HashSet::new();
+                    if ch.animation_overrides.len() > 64
+                        || ch.animation_overrides.iter().any(|r| {
+                            r.id.is_empty()
+                                || !anim_ids.insert(&r.id)
+                                || !["pose", "clip"].contains(&r.mode.as_str())
+                                || !r.pose_time.is_finite()
+                        })
+                    {
+                        return Err("Invalid character animation overrides".into());
+                    }
+                    let mut ja_ids = HashSet::new();
+                    if ch.joint_attachments.len() > 256
+                        || ch.joint_attachments.iter().any(|r| {
+                            r.id.is_empty()
+                                || !ja_ids.insert(&r.id)
+                                || r.target_query.len() > 512
+                                || r.offset_translation.iter().any(|v| !v.is_finite())
+                                || r.offset_rotation.iter().any(|v| !v.is_finite())
+                                || r.offset_scale.iter().any(|v| !v.is_finite() || *v == 0.0)
+                        })
+                    {
+                        return Err("Invalid character joint attachment rules".into());
+                    }
+                    let mut sb_ids = HashSet::new();
+                    if ch.skeleton_bindings.len() > 256
+                        || ch.skeleton_bindings.iter().any(|r| {
+                            r.id.is_empty() || !sb_ids.insert(&r.id) || r.target_query.len() > 512
+                        })
+                    {
+                        return Err("Invalid character skeleton binding rules".into());
+                    }
+                    let mut cc_ids = HashSet::new();
+                    if ch.cloth_caches.len() > 256 {
+                        return Err("Too many character cloth cache entries".into());
+                    }
+                    for cc in &ch.cloth_caches {
+                        if cc.id.is_empty()
+                            || !cc_ids.insert(&cc.id)
+                            || !cc.scale.is_finite()
+                            || cc.scale <= 0.0
+                            || !cc.time_offset.is_finite()
+                            || !["preserve", "Y", "-Y", "Z", "-Z", "X", "-X"]
+                                .contains(&cc.axis.as_str())
+                            || !["preserve", "Y", "-Y", "Z", "-Z", "X", "-X"]
+                                .contains(&cc.front_axis.as_str())
+                        {
+                            return Err("Invalid character cloth cache settings".into());
+                        }
+                        if let Some(did) = &cc.dependency_id {
+                            if !did.is_empty() {
+                                check(did, &DependencyKind::Usd)?;
+                            }
+                        }
+                    }
+                }
+            }
             if n.data.operation == "material_bind" {
                 let mut rule_ids = HashSet::new();
                 if let Some(rules) = &n.data.material_bindings {
@@ -1215,6 +1683,78 @@ impl Project {
                             .contains(&h.texture_format.as_str())
                     {
                         return Err("Invalid HDRI settings".into());
+                    }
+                }
+            }
+            if n.data.operation == "cache_edit" {
+                if let Some(ce) = &n.data.cache_edit {
+                    if ce.temporal_smooth_frames > 30
+                        || !ce.temporal_smooth_strength.is_finite()
+                        || ce.temporal_smooth_strength < 0.0
+                        || ce.temporal_smooth_strength > 1.0
+                        || ce.cloth_substeps == 0
+                        || ce.cloth_substeps > 32
+                        || ce.cloth_iterations == 0
+                        || ce.cloth_iterations > 64
+                        || !ce.cloth_stretch_stiffness.is_finite()
+                        || ce.cloth_stretch_stiffness < 0.0
+                        || ce.cloth_stretch_stiffness > 1.0
+                        || !ce.cloth_bend_stiffness.is_finite()
+                        || ce.cloth_bend_stiffness < 0.0
+                        || ce.cloth_bend_stiffness > 1.0
+                        || !ce.cloth_damping.is_finite()
+                        || ce.cloth_damping < 0.0
+                        || ce.cloth_damping > 1.0
+                        || !ce.cloth_gravity.is_finite()
+                        || !ce.cloth_collision_margin.is_finite()
+                        || ce.cloth_collision_margin < 0.0
+                        || !ce.cloth_friction.is_finite()
+                        || ce.cloth_friction < 0.0
+                        || ce.cloth_friction > 1.0
+                        || !ce.cloth_drag_pin_falloff.is_finite()
+                        || ce.cloth_drag_pin_falloff < 1.0
+                        || ce.cloth_drag_pin_falloff > 10.0
+                        || !ce.cloth_sim_scale.is_finite()
+                        || ce.cloth_sim_scale <= 0.0
+                        || ce.cloth_sim_scale > 10000.0
+                        || !["animated", "static"].contains(&ce.sim_mode.as_str())
+                        || !ce.sim_start_frame.is_finite()
+                        || !ce.sim_end_frame.is_finite()
+                        || ce.sim_end_frame < ce.sim_start_frame
+                        || (ce.sim_end_frame - ce.sim_start_frame) > 10000.0
+                        || !ce.sim_fps.is_finite()
+                        || ce.sim_fps <= 0.0
+                        || ce.sim_fps > 240.0
+                        || ce.sim_settle_steps > 500
+                        || !["custom", "silk", "cotton", "denim", "wool", "leather"]
+                            .contains(&ce.sim_fabric_preset.as_str())
+                        || !ce.sim_air_drag.is_finite()
+                        || ce.sim_air_drag < 0.0
+                        || ce.sim_air_drag > 5.0
+                        || !ce.sim_wind.iter().all(|v| v.is_finite())
+                        || !ce.sim_self_thickness.is_finite()
+                        || ce.sim_self_thickness < 0.0
+                        || ce.sim_self_thickness > 1.0
+                    {
+                        return Err("Invalid cache edit physics or temporal settings".into());
+                    }
+                    for layer in &ce.layers {
+                        if layer.id.trim().is_empty()
+                            || !layer.weight.is_finite()
+                            || layer.weight < -10.0
+                            || layer.weight > 10.0
+                            || !["allFrames", "frameRange", "singleFrame"]
+                                .contains(&layer.mode.as_str())
+                            || !layer.center_frame.is_finite()
+                            || !layer.fade_in.is_finite()
+                            || layer.fade_in < 0.0
+                            || !layer.fade_out.is_finite()
+                            || layer.fade_out < 0.0
+                            || !["smoothstep", "gaussian", "linear", "constant"]
+                                .contains(&layer.falloff.as_str())
+                        {
+                            return Err("Invalid cache edit layer settings".into());
+                        }
                     }
                 }
             }
@@ -1264,6 +1804,15 @@ impl Project {
                         || hair.friction > 1.0
                     {
                         return Err("Invalid hair simulation settings".into());
+                    }
+                    for (prim_path, delta) in &hair.groom_deltas {
+                        if prim_path.trim().is_empty()
+                            || delta.point_count == 0
+                            || delta.curve_count == 0
+                            || delta.deltas_z_b64.trim().is_empty()
+                        {
+                            return Err("Invalid hair groom delta entry".into());
+                        }
                     }
                 }
             }
@@ -1322,6 +1871,9 @@ impl Project {
                         || m.binding_targets.iter().any(|p| {
                             p != "*" && (!p.starts_with('/') || p.contains('.') || p.contains('{'))
                         })
+                        || m.uv_mode
+                            .as_deref()
+                            .is_some_and(|mode| !matches!(mode, "auto" | "root" | "strand"))
                     {
                         return Err("Invalid MaterialX material parameters or binding paths".into());
                     }

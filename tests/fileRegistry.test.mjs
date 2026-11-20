@@ -265,6 +265,37 @@ test("asset overrides are scoped and survive JSON round trips", () => {
   assert.deepEqual(restored.nodes[1].data.assetOverrides,next.nodes[1].data.assetOverrides);
 });
 
+test("overrideInputs includes MaterialX rules, HDRI textures and mergeDiscoveredInputs reuses links", async () => {
+  const { mergeDiscoveredInputs } = await import("../src/fileRegistry.ts");
+  const mtlx = node("mtlx");
+  mtlx.data.operation = "materialx";
+  mtlx.data.materialXRules = [{
+    id: "r1",
+    pattern: "*",
+    mode: "simple",
+    material: { baseColorTextureDependencyId: "tex-1", roughnessTextureDependencyId: null, baseColor: [0.8, 0.8, 0.8], roughness: 0.4, metallic: 0, ior: 1.5, opacity: 1, uvScale: 1, useTexture: true, useRoughnessTexture: false, scope: "whole", primPath: "" },
+  }];
+  const hdri = node("hdri");
+  hdri.data.operation = "hdri";
+  hdri.data.hdri = { textureDependencyId: "hdri-1", intensity: 1, exposure: 0, rotation: 0, visible: true };
+  const over = node("over");
+  over.data.operation = "assetOverride";
+  const p = storeProject(
+    [mtlx, hdri, over],
+    [{ id: "e1", source: "mtlx", target: "hdri" }, { id: "e2", source: "hdri", target: "over" }],
+    [{ id: "tex-1", kind: "asset", path: "I:/textures/color.png" }, { id: "hdri-1", kind: "asset", path: "I:/textures/sky.exr" }],
+    id,
+  );
+  const inputs = overrideInputs(p, "over").map((d) => d.id).sort();
+  assert.deepEqual(inputs, ["hdri-1", "tex-1"]);
+  const merged = mergeDiscoveredInputs(p, [
+    { path: "i:/TEXTURES/color.png", kind: "asset" },
+    { path: "I:/textures/packed.png", kind: "asset" },
+  ], id);
+  assert.equal(merged.dependencies.length, 3);
+  assert.equal(merged.dependencies[2].path, "I:/textures/packed.png");
+});
+
 test("application executable is a shared registry link and does not affect USD preview identity", async () => {
   const { graphPreview } = await import("../src/fileRegistry.ts");
   const app = node("app", "", "I:/model.blend", "I:/model.usda");
@@ -331,6 +362,43 @@ test("first import links native project and freezes actual handoff provenance wi
  assert.deepEqual(next.nodes[0].data.nativeImport.policy,result.policy);
  assert.throws(()=>recordNativeCreation(next,"app",result),/preserved/);
  assert.equal(p.nodes[0].data.nativeProjectDependencyId,null);
+});
+
+test("rerunning Quickstart stages a fresh round trip without touching the active links or output", async () => {
+  const {prepareQuickstart, recordHandoff, recordNativeCreation, recordManualBaseline} = await import("../src/fileRegistry.ts");
+  const app = node("app", "I:/source.usd", "", "I:/published.usd");
+  app.data.operation = "application";
+  const policy = {profile:{id:"blender",revision:1},editScope:[]};
+  const conversion = {upAxis:"Z",metersPerUnit:1};
+  const original = recordHandoff(storeProject([app], [], [], id), "app", {
+    path:"I:/old_handoff.usd", layerPaths:[], draft:conversion, policy,
+  });
+  const oldHandoff = original.nodes[0].data.handoff.dependencyId;
+  const imported = recordNativeCreation(original, "app", {
+    path:"I:/old.blend", baselinePath:"I:/old.baseline.usdc",
+    handoffDependencyId:oldHandoff, conversion, policy, report:{},
+  });
+  const active = recordManualBaseline(imported, "app", {
+    baselinePath:"I:/manual.usdc", nativeDependencyId:imported.nodes[0].data.nativeProjectDependencyId,
+    handoffDependencyId:oldHandoff, conversion, policy, report:{},
+  });
+  const before = JSON.stringify(active);
+  const staged = prepareQuickstart(active, "app", {
+    path:"I:/new_handoff.usd", layerPaths:[], draft:conversion, policy,
+  });
+  assert.equal(JSON.stringify(active), before);
+  assert.equal(staged.nodes[0].data.nativeProjectDependencyId, null);
+  assert.equal(staged.nodes[0].data.manualBaseline, null);
+  const next = recordNativeCreation(staged, "app", {
+    path:"I:/new.blend", baselinePath:"I:/new.baseline.usdc",
+    handoffDependencyId:staged.nodes[0].data.handoff.dependencyId, conversion, policy, report:{},
+  });
+  const view = expandProject(next).nodes[0].data;
+  assert.equal(view.nativeProject, "I:/new.blend");
+  assert.equal(view.publishedPath, "I:/published.usd");
+  assert.equal(view.nativeImport.handoffDependencyId, view.handoff.dependencyId);
+  assert.notEqual(view.nativeImport.baselineDependencyId, active.nodes[0].data.nativeImport.baselineDependencyId);
+  for (const dependency of active.dependencies) assert.ok(next.dependencies.some(d => d.id === dependency.id));
 });
 
 test("publication promotion keeps previous output on stale policy and persists all artifact roles",async()=>{

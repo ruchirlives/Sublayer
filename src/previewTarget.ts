@@ -1,4 +1,28 @@
 import { graphPreview, type StoredProject } from "./fileRegistry.ts";
+
+export function sceneHierarchyKey(graph?: string): string {
+  if (!graph) return "";
+  try {
+    const parsed = JSON.parse(graph);
+    if (Array.isArray(parsed?.nodes)) {
+      parsed.nodes = parsed.nodes.map((node: Record<string, unknown>) => {
+        if (node?.operation === "transform") return { ...node, transform: null };
+        if (node?.operation === "hair" && node.hair && typeof node.hair === "object") {
+          const { groomDeltas: _points, ...hair } = node.hair as Record<string, unknown>;
+          return { ...node, hair };
+        }
+        if (node?.operation === "cache_edit") {
+          return { ...node, cacheEdit: null };
+        }
+        return node;
+      });
+    }
+    return JSON.stringify(parsed);
+  } catch {
+    return graph;
+  }
+}
+
 export function previewTarget(project: StoredProject, id: string, mode: "handoff"|"published"|"input" = "published") {
   const node = project.nodes.find(n=>n.id===id);
   if(!node) return {path:"",graph:undefined,title:"Select a node",message:"Choose a node to preview its USD scene.",label:""};

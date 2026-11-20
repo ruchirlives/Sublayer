@@ -5,6 +5,7 @@ pub mod blender_node;
 mod dependency_search;
 mod desktop_bridge;
 mod project;
+mod runtime_setup;
 mod usd;
 use project::Project;
 
@@ -327,6 +328,8 @@ async fn create_blender_project(
     node_id: String,
     path: String,
     overwrite: Option<bool>,
+    capture_baseline: Option<bool>,
+    overwrite_baseline: Option<bool>,
     app: tauri::AppHandle,
 ) -> Result<serde_json::Value, String> {
     let config = catalog_path(&app)?;
@@ -336,6 +339,8 @@ async fn create_blender_project(
             &node_id,
             &path,
             overwrite.unwrap_or(false),
+            capture_baseline.unwrap_or(false),
+            overwrite_baseline.unwrap_or(false),
             &application_profiles::load(&config)?,
         )
     })
@@ -370,11 +375,15 @@ async fn create_handoff(
     node_id: String,
     path: String,
     overwrite: Option<bool>,
+    quickstart_native_path: Option<String>,
     service: tauri::State<'_, std::sync::Arc<usd::UsdService>>,
 ) -> Result<serde_json::Value, String> {
     let config = catalog_path(&app)?;
     let service = service.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
+        if let Some(native_path) = quickstart_native_path {
+            application::validate_quickstart_paths(&project, &native_path, &path)?;
+        }
         let mut request = application::handoff_request(
             &project,
             &node_id,
@@ -485,6 +494,25 @@ async fn usd_request(
         .await
         .map_err(|e| e.to_string())?
 }
+#[tauri::command]
+async fn render_viewport_frame(
+    service: tauri::State<'_, std::sync::Arc<usd::UsdService>>,
+    request: serde_json::Value,
+) -> Result<tauri::ipc::Response, String> {
+    let service = service.inner().clone();
+    let (meta, image_bytes) =
+        tauri::async_runtime::spawn_blocking(move || service.request_binary(request))
+            .await
+            .map_err(|e| e.to_string())??;
+    let meta_bytes = serde_json::to_vec(&meta).map_err(|e| e.to_string())?;
+    let meta_len = u32::try_from(meta_bytes.len())
+        .map_err(|_| "Viewport frame metadata too large".to_string())?;
+    let mut out = Vec::with_capacity(4 + meta_bytes.len() + image_bytes.len());
+    out.extend_from_slice(&meta_len.to_le_bytes());
+    out.extend_from_slice(&meta_bytes);
+    out.extend_from_slice(&image_bytes);
+    Ok(tauri::ipc::Response::new(out))
+}
 type BridgeHolder =
     std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<desktop_bridge::DesktopBridge>>>>;
 
@@ -505,6 +533,87 @@ fn mcp_bridge_reply(
     Ok(())
 }
 
+#[tauri::command]
+fn open_hair_groom_window(app: tauri::AppHandle) -> Result<(), String> {
+    let handle = app.clone();
+    app.run_on_main_thread(move || {
+        if let Some(win) = handle.get_webview_window("hair-groom") {
+            let _ = win.show();
+            let _ = win.set_focus();
+            return;
+        }
+        let _ = tauri::WebviewWindowBuilder::new(
+            &handle,
+            "hair-groom",
+            tauri::WebviewUrl::App("index.html".into()),
+        )
+        .title("OrchFlow Hair Grooming & Live Physics")
+        .inner_size(1280.0, 860.0)
+        .min_inner_size(720.0, 480.0)
+        .background_color(tauri::window::Color(17, 19, 23, 255))
+        .additional_browser_args("--disable-gpu --disable-gpu-compositing")
+        .initialization_script("window.__ORCHFLOW_HAIR_GROOM__ = true;")
+        .build();
+    })
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn close_hair_groom_window(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(win) = app.get_webview_window("hair-groom") {
+        let _ = win.close();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn get_window_hwnd(window: tauri::WebviewWindow) -> Result<isize, String> {
+    #[cfg(target_os = "windows")]
+    {
+        window.hwnd().map(|h| h.0 as isize).map_err(|e| e.to_string())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = window;
+        Ok(0)
+    }
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StartupLaunchOptions {
+    open_last_project: bool,
+    project_path: Option<String>,
+}
+
+#[tauri::command]
+fn startup_launch_options() -> StartupLaunchOptions {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut open_last_project = false;
+    let mut project_path = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--last-project" | "-l" => open_last_project = true,
+            "--project" | "-p" => {
+                if let Some(next) = args.get(i + 1) {
+                    project_path = Some(next.clone());
+                    i += 1;
+                }
+            }
+            other if !other.starts_with('-') && project_path.is_none() => {
+                project_path = Some(other.to_string());
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    StartupLaunchOptions {
+        open_last_project,
+        project_path,
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let service = std::sync::Arc::new(usd::UsdService::default());
@@ -519,7 +628,15 @@ pub fn run() {
         .setup(move |app| {
             let handle = app.handle().clone();
             service_setup.set_status_listener(move |payload| {
-                let _ = handle.emit("renderer-status", payload);
+                if let Some(popup_evt) = payload.get("popupInput") {
+                    let _ = handle.emit("hair-popup-input", popup_evt.clone());
+                } else {
+                    let _ = handle.emit("renderer-status", payload);
+                }
+            });
+            let warm_service = service_setup.clone();
+            std::thread::spawn(move || {
+                let _ = warm_service.warm();
             });
             let bridge_handle = app.handle().clone();
             if let Ok(bridge) = desktop_bridge::DesktopBridge::start(move |payload| {
@@ -558,7 +675,12 @@ pub fn run() {
             dependency_statuses,
             find_missing_dependencies,
             usd_request,
-            mcp_bridge_reply
+            render_viewport_frame,
+            mcp_bridge_reply,
+            open_hair_groom_window,
+            close_hair_groom_window,
+            get_window_hwnd,
+            startup_launch_options
         ])
         .build(tauri::generate_context!())
         .expect("error while building OrchFlow")

@@ -129,6 +129,50 @@ class GraphTests(unittest.TestCase):
             self.assertEqual(prims[0].GetAttribute('animated').Get(10).path, replacement)
             self.assertEqual(prims[0].GetAttribute('optionalTexture').Get().path, '')
 
+    def test_asset_override_inputs_discovers_arriving_usd_and_materialx_rules(self):
+        import os
+        with tempfile.TemporaryDirectory() as folder:
+            path, source = self.fixture(folder)
+            tex = pathlib.Path(folder) / 'diffuse.png'
+            tex.write_bytes(b'png')
+            rule_tex = pathlib.Path(folder) / 'rule_color.png'
+            rule_tex.write_bytes(b'png')
+            source.GetPrimAtPath('/Asset').CreateAttribute('inputs:file', Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(str(tex)))
+            source.GetRootLayer().Save()
+            spec = {
+                'targetNodeId': 'override',
+                'nodes': [
+                    {'id': 'source', 'operation': 'source', 'inputDependencyId': 'src', 'instanced': False},
+                    {
+                        'id': 'mtlx',
+                        'operation': 'materialx',
+                        'materialXRules': [{
+                            'id': 'r1',
+                            'query': '*',
+                            'searchType': 'simple',
+                            'material': {'baseColorTextureDependencyId': 'rtex', 'useTexture': True, 'roughness': 0.5},
+                        }],
+                    },
+                    {'id': 'override', 'operation': 'assetOverride', 'assetOverrides': []},
+                ],
+                'edges': [
+                    {'id': 'e1', 'source': 'source', 'target': 'mtlx'},
+                    {'id': 'e2', 'source': 'mtlx', 'target': 'override'},
+                ],
+                'dependencies': [
+                    {'id': 'src', 'path': str(path)},
+                    {'id': 'rtex', 'path': str(rule_tex)},
+                ],
+            }
+            discovered = dispatch({'operation': 'asset_override_inputs', 'graph': spec})['files']
+            found_paths = {os.path.normcase(os.path.realpath(entry['path'])) for entry in discovered}
+            self.assertIn(os.path.normcase(os.path.realpath(str(path))), found_paths)
+            self.assertIn(os.path.normcase(os.path.realpath(str(tex))), found_paths)
+            self.assertIn(os.path.normcase(os.path.realpath(str(rule_tex))), found_paths)
+            self.assertFalse(any(entry['path'].startswith('anon:') for entry in discovered))
+            unconnected = {**spec, 'edges': []}
+            self.assertEqual(dispatch({'operation': 'asset_override_inputs', 'graph': unconnected})['files'], [])
+
     def test_application_conversion_units_axis_scale_inverse_and_input_revision(self):
         from pxr import Gf
         with tempfile.TemporaryDirectory() as folder:
@@ -170,9 +214,8 @@ class GraphTests(unittest.TestCase):
             self.assertEqual(UsdGeom.GetStageUpAxis(stage), 'Z')
             self.assertEqual(UsdGeom.GetStageMetersPerUnit(stage),0.01)
             self.assertEqual(stage.GetDefaultPrim().GetName(),'Handoff')
-            self.assertTrue(result['layerPaths'])
-            for layer in stage.GetUsedLayers():
-                if layer != stage.GetSessionLayer(): self.assertFalse(layer.anonymous)
+            self.assertEqual(result['layerPaths'], [])
+            self.assertCountEqual(stage.GetUsedLayers(), [stage.GetRootLayer(), stage.GetSessionLayer()])
             self.assertNotIn('anon:',destination.read_text())
             geometry=sum(1 for prototype in stage.GetPrototypes() for p in Usd.PrimRange(prototype) if p.IsA(UsdGeom.Cube))
             self.assertEqual(geometry,1)
@@ -186,7 +229,7 @@ class GraphTests(unittest.TestCase):
             request['overwrite']=True
             replacement=export_handoff(request)
             self.assertNotEqual(destination.read_bytes(),output_before)
-            self.assertTrue(all(pathlib.Path(p).exists() for p in result['layerPaths']))
+            self.assertEqual(replacement['layerPaths'], [])
             self.assertTrue(Usd.Stage.Open(str(destination)))
             request['overwrite']=False
             request['destination']=str(path)

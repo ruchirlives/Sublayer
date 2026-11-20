@@ -74,11 +74,13 @@ function hexToRgb(hex: string): [number, number, number] {
 export function MaterialXPanel({
   project,
   nodeId,
+  pendingPrimDrop,
   onProjectChange,
   onClose,
 }: {
   project: StoredProject;
   nodeId: string;
+  pendingPrimDrop?: { primPath: string; seq: number } | null;
   onProjectChange: (project: StoredProject) => void;
   onClose: () => void;
 }) {
@@ -150,6 +152,7 @@ export function MaterialXPanel({
     primPath: string;
     currentQuery: string;
   } | null>(null);
+  const lastHandledDropSeq = useRef(pendingPrimDrop?.seq ?? 0);
 
   function handlePrimDrop(rowId: string, droppedPath: string) {
     const row = draft.current.find((r) => r.id === rowId);
@@ -165,6 +168,13 @@ export function MaterialXPanel({
       });
     }
   }
+
+  useEffect(() => {
+    if (!pendingPrimDrop || pendingPrimDrop.seq <= lastHandledDropSeq.current) return;
+    lastHandledDropSeq.current = pendingPrimDrop.seq;
+    const targetRowId = selectedId || draft.current[0]?.id;
+    if (targetRowId) handlePrimDrop(targetRowId, pendingPrimDrop.primPath);
+  }, [pendingPrimDrop, selectedId]);
 
   function change(next: MaterialXRule[]) {
     setRows(next);
@@ -460,7 +470,7 @@ export function MaterialXPanel({
                         ? ["Trans", "Trans Color", "Emis", "Emis Color"]
                         : tableView === "sss"
                           ? ["SSS", "SSS Scale", "SSS Radius (RGB)"]
-                          : ["Base Color Tex", "Metal Tex", "Rough Tex", "Normal Tex"]),
+                          : ["UV Source", "Base Color Tex", "Metal Tex", "Rough Tex", "Normal Tex"]),
                 "Matches",
                 "Actions",
               ].map((v) => (
@@ -747,6 +757,22 @@ export function MaterialXPanel({
                   )}
                   {tableView === "textures" && (
                     <>
+                      <td>
+                        <select
+                          aria-label={`UV Source row ${index + 1}`}
+                          disabled={busy}
+                          value={rowMat.uvMode ?? "auto"}
+                          onChange={(e) => {
+                            const v = e.target.value as "auto" | "root" | "strand";
+                            material(row.id, { uvMode: v === "auto" ? null : v });
+                          }}
+                          style={{ fontSize: "10px", padding: "2px 4px" }}
+                        >
+                          <option value="auto">Auto (st → root)</option>
+                          <option value="root">Root UV</option>
+                          <option value="strand">Along Strand (0→1)</option>
+                        </select>
+                      </td>
                       {(["baseColorTextureDependencyId", "metallicTextureDependencyId", "roughnessTextureDependencyId", "normalTextureDependencyId"] as const).map((slotKey) => {
                         const depId = rowMat[slotKey];
                         const texPath = depId ? (project.dependencies.find((d) => d.id === depId)?.path || "") : "";

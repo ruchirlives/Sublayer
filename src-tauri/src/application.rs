@@ -378,17 +378,29 @@ pub fn evaluation_graph(
         }
         used.extend(n.data.asset_overrides.iter().map(|o| &o.replacement_dependency_id));
         if let Some(h) = &n.data.hdri { if let Some(tid) = &h.texture_dependency_id { used.insert(tid); } }
+        if let Some(ch) = &n.data.character {
+            for cc in &ch.cloth_caches {
+                if let Some(did) = &cc.dependency_id {
+                    if !did.is_empty() {
+                        used.insert(did);
+                    }
+                }
+            }
+        }
         if !(n.id==node_id && application_input) {if let Some(live)=&n.data.live_adjustment {used.insert(&live.edited_dependency_id);used.insert(&live.baseline_dependency_id);used.insert(&live.handoff_dependency_id);}}
-        let mut value=serde_json::json!({"id":n.id,"operation":operation,"inputDependencyId":n.data.input_dependency_id,"publishedDependencyId":published,"nativeProjectDependencyId":if n.id == node_id && application_input { None } else { n.data.native_project_dependency_id.as_ref() },"instanced":n.data.instanced.unwrap_or(false),"axis":n.data.axis,"scale":n.data.scale,"transform":n.data.transform,"assetOverrides":n.data.asset_overrides,"publication":if n.id == node_id && application_input {None} else {n.data.publication.as_ref().map(|p|serde_json::json!({"sourceRevisions":p.source_revisions}))}});
-        if n.data.operation=="blender"{if let Some(sel)=&n.data.blender_selections{value["blenderSelections"]=serde_json::to_value(sel).unwrap();}if let Some(mode)=&n.data.blender_material_mode{value["blenderMaterialMode"]=serde_json::to_value(mode).unwrap();}if let Some(cp)=n.data.blender_convert_procedurals{value["blenderConvertProcedurals"]=serde_json::to_value(cp).unwrap();}if let Some(secs)=n.data.last_extraction_seconds{value["lastExtractionSeconds"]=serde_json::to_value(secs).unwrap();}}
+        let mut value=serde_json::json!({"id":n.id,"operation":operation,"inputDependencyId":n.data.input_dependency_id,"publishedDependencyId":published,"nativeProjectDependencyId":if n.id == node_id && application_input { None } else { n.data.native_project_dependency_id.as_ref() },"instanced":n.data.instanced.unwrap_or(false),"axis":n.data.axis,"frontAxis":n.data.front_axis,"scale":n.data.scale,"transform":n.data.transform,"assetOverrides":n.data.asset_overrides,"publication":if n.id == node_id && application_input {None} else {n.data.publication.as_ref().map(|p|serde_json::json!({"sourceRevisions":p.source_revisions}))}});
+        if n.data.operation=="blender"{if let Some(sel)=&n.data.blender_selections{value["blenderSelections"]=serde_json::to_value(sel).unwrap();}if let Some(mode)=&n.data.blender_material_mode{value["blenderMaterialMode"]=serde_json::to_value(mode).unwrap();}if let Some(cp)=n.data.blender_convert_procedurals{value["blenderConvertProcedurals"]=serde_json::to_value(cp).unwrap();}if let Some(es)=n.data.blender_export_skeletons{value["blenderExportSkeletons"]=serde_json::to_value(es).unwrap();}if let Some(secs)=n.data.last_extraction_seconds{value["lastExtractionSeconds"]=serde_json::to_value(secs).unwrap();}}
 if n.data.operation=="camera"{if let Some(cam)=&n.data.camera{value["camera"]=serde_json::to_value(cam).unwrap();}if let Some(views)=&n.data.camera_views{value["cameraViews"]=serde_json::to_value(views).unwrap();}}
         if !(n.id==node_id && application_input) {if let Some(live)=&n.data.live_adjustment {value["liveAdjustment"]=serde_json::to_value(live).unwrap();value["publishedDependencyId"]=serde_json::Value::Null;value["publication"]=serde_json::Value::Null;}}
         if n.data.operation=="delete" {value["deletePaths"]=serde_json::to_value(&n.data.delete_paths).unwrap();}
+        if n.data.operation=="group"{if let Some(gn)=&n.data.group_name {value["groupName"]=serde_json::to_value(gn).unwrap();}}
         if n.data.operation=="materialx"{value["materialX"]=serde_json::to_value(&n.data.material_x).unwrap();if let Some(rules)=&n.data.material_x_rules {value["materialXRules"]=serde_json::to_value(rules).unwrap();}}
         if n.data.operation=="material_bind"{if let Some(bindings)=&n.data.material_bindings {value["materialBindings"]=serde_json::to_value(bindings).unwrap();}}
         if n.data.operation=="light"{if let Some(overrides)=&n.data.light_overrides {value["lightOverrides"]=serde_json::to_value(overrides).unwrap();}}
         if n.data.operation=="hdri"{if let Some(hdri)=&n.data.hdri {value["hdri"]=serde_json::to_value(hdri).unwrap();}}
         if n.data.operation=="hair"{if let Some(hair)=&n.data.hair {value["hair"]=serde_json::to_value(hair).unwrap();}}
+        if n.data.operation=="cache_edit"{if let Some(ce)=&n.data.cache_edit {value["cacheEdit"]=serde_json::to_value(ce).unwrap();}}
+        if n.data.operation=="character"{if let Some(ch)=&n.data.character {value["character"]=serde_json::to_value(ch).unwrap();}}
         if !(n.id == node_id && application_input) {
             if let Some(publication)=&n.data.publication {if !publication.revision.is_empty(){value["publication"]["revision"]=publication.revision.clone().into();}}
         }
@@ -421,6 +433,40 @@ if n.data.operation=="camera"{if let Some(cam)=&n.data.camera{value["camera"]=se
 }
 
 /// Build the input graph from validated project data, never from a client-supplied output graph.
+pub fn validate_quickstart_paths(
+    project: &Project,
+    native: &str,
+    handoff: &str,
+) -> Result<(), String> {
+    let native = Path::new(native);
+    if !native.is_absolute()
+        || !native
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("blend"))
+    {
+        return Err("Choose an absolute .blend destination".into());
+    }
+    let baseline = native.with_extension("baseline.usdc");
+    let [native, baseline, handoff] = [
+        native.to_string_lossy(),
+        baseline.to_string_lossy(),
+        handoff.into(),
+    ]
+    .map(|path| crate::project::file_key(&path));
+    if native == baseline || native == handoff || baseline == handoff {
+        return Err("Quick start requires distinct output files".into());
+    }
+    if project.dependencies.iter().any(|dependency| {
+        [&native, &baseline, &handoff].contains(&&crate::project::file_key(&dependency.path))
+    }) {
+        return Err(
+            "A Quick start destination is already registered. Choose a new .blend name or folder"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 pub fn handoff_request(
     project: &Project,
     node_id: &str,
@@ -549,6 +595,8 @@ pub fn create_blender_project(
     node_id: &str,
     destination: &str,
     overwrite: bool,
+    capture_baseline: bool,
+    overwrite_baseline: bool,
     catalog: &crate::application_profiles::Catalog,
 ) -> Result<serde_json::Value, String> {
     use std::io::Write;
@@ -620,11 +668,23 @@ pub fn create_blender_project(
         std::process::id()
     ));
     let baseline = destination.with_extension("baseline.usdc");
-    if project.dependencies.iter().any(|d| {
-        [destination.to_path_buf()].iter().any(|p| {
-            crate::project::file_key(&d.path) == crate::project::file_key(&p.to_string_lossy())
+    if capture_baseline && !overwrite_baseline && baseline.symlink_metadata().is_ok() {
+        return Err(
+            "Baseline destination already exists. Confirm replacement or choose a new filename"
+                .into(),
+        );
+    }
+    let targets =
+        std::iter::once(destination).chain(capture_baseline.then_some(baseline.as_path()));
+    if targets
+        .map(|path| crate::project::file_key(&path.to_string_lossy()))
+        .any(|target| {
+            project
+                .dependencies
+                .iter()
+                .any(|d| crate::project::file_key(&d.path) == target)
         })
-    }) {
+    {
         return Err(
             "Native/baseline destination is already a registered dependency; choose a new filename"
                 .into(),
@@ -666,7 +726,7 @@ pub fn create_blender_project(
             .map_err(|e| format!("Cannot start Blender: {e}"))?;
         let stdout = capture_tail(child.stdout.take().unwrap());
         let stderr = capture_tail(child.stderr.take().unwrap());
-        let config = serde_json::json!({"handoff":source,"destination":destination,"temporary":temporary,"baseline":baseline,"baselineTemporary":baseline_temporary,"captureBaseline":false,"overwrite":overwrite,"conversion":handoff.conversion,"policy":policy});
+        let config = serde_json::json!({"handoff":source,"destination":destination,"temporary":temporary,"baseline":baseline,"baselineTemporary":baseline_temporary,"captureBaseline":capture_baseline,"overwrite":overwrite,"overwriteBaseline":overwrite_baseline,"conversion":handoff.conversion,"policy":policy});
         let sent = child
             .stdin
             .take()
@@ -709,10 +769,18 @@ pub fn create_blender_project(
         if metadata.len() < 12 {
             return Err("Created native project is empty".into());
         }
+        if report["baselineCaptured"].as_bool() != Some(capture_baseline)
+            || capture_baseline
+                && (report["baselineDigest"].as_str().is_none_or(|digest| {
+                    digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit())
+                }) || !baseline.is_file())
+        {
+            return Err("Blender did not return the requested validated outputs".into());
+        }
         report["nativeFileSize"] = metadata.len().into();
         report["executablePath"] = executable.to_string_lossy().as_ref().into();
         Ok(
-            serde_json::json!({"path":destination,"baselinePath":serde_json::Value::Null,"handoffDependencyId":handoff.dependency_id,"conversion":handoff.conversion,"policy":policy,"report":report}),
+            serde_json::json!({"path":destination,"baselinePath":capture_baseline.then_some(&baseline),"handoffDependencyId":handoff.dependency_id,"conversion":handoff.conversion,"policy":policy,"report":report}),
         )
     })();
     if baseline_temporary.exists() {
@@ -849,6 +917,61 @@ mod tests {
     }
 
     #[test]
+    fn quickstart_rejects_registered_destinations_but_accepts_fresh_paths() {
+        let dir = std::env::temp_dir();
+        let native = dir.join("quickstart-old.blend");
+        let baseline = dir.join("quickstart-old.baseline.usdc");
+        let handoff = dir.join("quickstart-old_handoff.usd");
+        let project = Project::from_value(serde_json::json!({
+            "version": 2, "nodes": [], "edges": [],
+            "dependencies": [
+                {"id": "native", "kind": "nativeProject", "path": native},
+                {"id": "baseline", "kind": "usd", "path": baseline},
+                {"id": "handoff", "kind": "usd", "path": handoff},
+            ]
+        }))
+        .unwrap();
+        let new_native = dir.join("quickstart-fresh.blend");
+        let new_handoff = dir.join("quickstart-fresh_handoff.usd");
+        assert!(
+            validate_quickstart_paths(
+                &project,
+                new_native.to_str().unwrap(),
+                new_handoff.to_str().unwrap()
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_quickstart_paths(
+                &project,
+                native.to_str().unwrap(),
+                new_handoff.to_str().unwrap()
+            )
+            .is_err()
+        );
+        assert!(
+            validate_quickstart_paths(
+                &project,
+                new_native.to_str().unwrap(),
+                handoff.to_str().unwrap()
+            )
+            .is_err()
+        );
+        let mut baseline_only = project;
+        baseline_only
+            .dependencies
+            .retain(|dependency| dependency.id == "baseline");
+        assert!(
+            validate_quickstart_paths(
+                &baseline_only,
+                native.to_str().unwrap(),
+                new_handoff.to_str().unwrap()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn validate_reopen_without_writing_or_launching() {
         let dir = std::env::temp_dir().join(format!(
             "orchflow-launch-{}",
@@ -873,6 +996,8 @@ mod tests {
                 &project,
                 "app",
                 "I:/never-created.blend",
+                false,
+                true,
                 false,
                 &crate::application_profiles::Catalog::defaults()
             )

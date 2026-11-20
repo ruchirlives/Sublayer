@@ -1,23 +1,50 @@
 # Sublayer
 
-Sublayer is a Tauri + React node-graph USD composition and viewport desktop application with an OpenUSD / Hydra Storm worker and optional NVIDIA Omniverse RTX (`ovrtx`) path-traced rendering.
+Sublayer is a Windows desktop application built with **Tauri 2**, **React / TypeScript (React Flow)**, **Rust**, and **OpenUSD** for non-destructive USD scene composition, lookdev, simulation, DCC round-tripping, and real-time Hydra viewport rendering.
 
-## Prerequisites
+## Features
 
-- **Node.js & npm** (for the React + TypeScript + Vite frontend)
-- **Rust & Cargo** (`edition = "2024"`, Tauri v2 desktop backend, Windows WebView2 & MSVC build tools)
-- **Python + OpenUSD** (for the USD graph, MaterialX, hair simulation, and Hydra Storm viewport worker)
-- **Optional: NVIDIA Omniverse RTX (`ovrtx` / `ovstage`)** (for real-time and path-traced RTX viewport rendering)
+- **Non-Destructive USD Node Graph**: Compose scenes with `Source`, `Transform`, `Group`, `Delete`, `Scatter`, `Asset Override`, and `Output` nodes. Projects save to a single `.sublayer` / `.orchflow` JSON file that links external USD, texture, and DCC files in place without copying or mutating originals.
+- **Multi-Renderer Hydra Viewport**:
+  - **OpenUSD Storm**: Upstream Hydra Storm rasterized viewport.
+  - **Autodesk Aurora (`hdAurora`)**: Open-source DirectX 12 DXR / Slang path-traced Hydra delegate (bundled in the Windows installer).
+  - **NVIDIA Omniverse RTX (`ovrtx` / `ovstage`)**: Optional isolated RTX path-traced renderer.
+  - Interactive orbit/pan/dolly, transform & camera gizmos, prim selection/isolation, scene overview, and GPU cache controls (`Reload stage`, `Flush GPU`).
+- **Materials & Shading**: `MaterialX` authoring (Standard Surface with `UsdPreviewSurface` fallback, procedural shading rules, `.mtlx` export) and `Material Bind` nodes, with selective Auto/Scene/Solid material preview diagnostics for missing shader assets.
+- **Hair, Cloth & Character Tools**: `Hair` node (NVIDIA Warp GPU physics simulation and guide-based interactive grooming), `Cache Sculptor` (`cache_edit` for cloth physics brushing and full-garment GPU cloth simulation), and `Character` nodes.
+- **Lighting & Cameras**: `Light`, `HDRI`, and `Camera` nodes.
+- **DCC & Application Round Trips**: `Blender` and `Application` nodes with explicit handoff export, reversible coordinate/axis conversion snapshots, baseline comparison, selective sparse adjustment publishing, and upstream reconciliation (plus profile templates for ZBrush, Marvelous Designer, and Substance Painter).
+- **Local MCP Server**: `orchflow-mcp` exposes headless USD inspection, stage composition, and rendering over stdio.
+
+---
 
 ## Installation
 
-### 1. Install Frontend Dependencies
+### Option 1: Prebuilt Windows Installer (Recommended)
+
+1. Download the latest `Sublayer_*_x64-setup.exe` installer from the [GitHub Releases](https://github.com/ruchirlives/Sublayer/releases) page.
+2. Run the installer. It installs **Sublayer** and the bundled **Autodesk Aurora** Hydra delegate (`renderers/aurora`).
+3. At the end of installation (or anytime from the Start Menu via **Sublayer Runtime Setup**), the optional runtime wizard (`scripts/installer-runtimes.ps1`) lets you install:
+   - **`uv`** (Python & package manager)
+   - **OpenUSD 25.08 + Hydra Storm** (required for 3D USD evaluation and Storm rendering — downloaded directly from NVIDIA's official OpenUSD release with SHA-256 verification)
+   - **NVIDIA Omniverse RTX** (optional, for RTX GPUs — installs `ovrtx` and `ovstage` into an isolated Python 3.12 environment)
+
+### Option 2: Building from Source (Windows)
+
+#### Prerequisites
+
+- **Node.js & npm** (for the React + TypeScript + Vite frontend)
+- **Rust & Cargo** (`edition = "2024"`, Tauri v2 desktop backend, Windows WebView2 & MSVC build tools)
+- **Python + OpenUSD** (for the USD graph, MaterialX, simulation, and Hydra viewport workers)
+- **Optional: NVIDIA Omniverse RTX (`ovrtx` / `ovstage`)** (for RTX path-traced viewport rendering)
+
+#### 1. Install Frontend Dependencies
 
 ```powershell
 npm install
 ```
 
-### 2. Configure OpenUSD / Hydra Python Environment
+#### 2. Configure OpenUSD / Hydra Python Environment
 
 The Rust backend launches the primary USD worker using:
 
@@ -33,9 +60,9 @@ $env:ORCHFLOW_USD_ROOT = "I:\AI\OpenUSD-runtime\25.08"
 
 > **Note:** For `.abc` (Alembic) source stages when `usdAbc` is not in the primary OpenUSD build, `worker/usd_graph.py` can invoke an imaging runtime via `ORCHFLOW_IMAGING_PYTHON` or `.venv-imaging\Scripts\python.exe`.
 
-### 3. Optional: Configure NVIDIA Omniverse RTX (`ovrtx`)
+#### 3. Optional: Configure NVIDIA Omniverse RTX (`ovrtx`)
 
-Omniverse RTX runs in a separate isolated Python environment (`.venv-ovrtx`) to avoid ABI or symbol collisions with upstream OpenUSD / Hydra.
+Omniverse RTX runs in a separate isolated Python environment (`.venv-ovrtx`) to avoid ABI or symbol collisions with upstream OpenUSD / Hydra:
 
 1. Create `.venv-ovrtx` at the repository root (or point `ORCHFLOW_OVRTX_PYTHON` to an existing Python executable):
 
@@ -48,27 +75,44 @@ Omniverse RTX runs in a separate isolated Python environment (`.venv-ovrtx`) to 
 2. Install the `ovrtx`, `ovstage`, and OpenUSD (`pxr`) packages into `.venv-ovrtx` according to your Omniverse RTX SDK distribution.
 3. Point `ORCHFLOW_OVRTX_ROOT` to the external Omniverse RTX runtime directory containing `runtime.json` (defaults to `I:/AI/OrchFlow-renderers/ovrtx`).
 
-> See `LICENSE-EXCEPTION.md` and the header in `worker/ovrtx_worker.py` regarding GPL-3.0-or-later linking exception terms for the proprietary `ovrtx` and `ovstage` libraries.
+#### 4. Build, Launch & Bundle
 
-## Building & Launching
+- **Build and launch debug app** (builds frontend, `sublayer-updated.exe`, and `orchflow-mcp.exe` to `I:/AI/OrchFlow-build/debug/`):
 
-### Build and Launch (Recommended)
+  ```powershell
+  .\scripts\build-and-launch.ps1
+  ```
 
-Runs the frontend build, compiles the desktop binary (`sublayer-updated.exe`) and MCP binary (`orchflow-mcp.exe`) to `I:/AI/OrchFlow-build/debug/`, and launches the app:
+- **Build only**:
 
-```powershell
-.\scripts\build-and-launch.ps1
-```
+  ```powershell
+  .\scripts\build.ps1
+  ```
 
-### Build Only
+- **Build Windows NSIS installer** (stages open-source Autodesk Aurora if present and outputs the setup `.exe` under `$env:CARGO_TARGET_DIR\release\bundle\nsis\`):
 
-```powershell
-.\scripts\build.ps1
-```
+  ```powershell
+  .\scripts\bundle-windows.ps1
+  ```
 
-### Development / Tests
+- **Development & tests**:
+  - Frontend dev server: `npm run dev`
+  - Frontend build: `npm run build`
+  - Frontend tests: `npm test`
+  - Rust tests: `cargo test --manifest-path src-tauri/Cargo.toml`
 
-- **Frontend dev server:** `npm run dev`
-- **Frontend build:** `npm run build`
-- **Frontend tests:** `npm test`
-- **Rust tests:** `cargo test --manifest-path src-tauri/Cargo.toml`
+---
+
+## License & Caveats
+
+Sublayer is licensed under the **GNU General Public License v3.0 or later (`GPL-3.0-or-later`)**. See [`LICENSE`](LICENSE) for the full license text.
+
+### Licensing Caveats & Third-Party Runtimes
+
+1. **NVIDIA Omniverse RTX Linking Exception ([`LICENSE-EXCEPTION.md`](LICENSE-EXCEPTION.md))**:
+   - Under GNU GPLv3 Section 7, an additional permission is granted to combine or link Sublayer with the external proprietary NVIDIA Omniverse RTX runtime libraries (`ovrtx` and `ovstage`).
+   - Those proprietary libraries are **not** included in this repository or in the prebuilt Windows installer; end users must obtain them separately under NVIDIA's license terms.
+2. **Autodesk Aurora (`hdAurora`)**:
+   - The Windows installer stages the open-source Autodesk Aurora Hydra delegate (`scripts/bundle-windows.ps1`) and explicitly removes proprietary NVIDIA MDL SDK DLLs (`libmdl_*.dll`) before packaging.
+3. **External Optional Runtimes**:
+   - OpenUSD, `uv`, Python packages, and optional NVIDIA packages installed via `scripts/installer-runtimes.ps1` are downloaded directly by the user from their respective official upstream sources and remain governed by their own licenses.

@@ -121,11 +121,12 @@ inst_stats_cache = {}
 def get_inst_stats(col, visited=None):
     if visited is None:
         visited = set()
-    if col.name in inst_stats_cache:
-        return inst_stats_cache[col.name]
-    if col.name in visited:
+    ckey = (col.name, getattr(getattr(col, 'library', None), 'filepath', '') or '')
+    if ckey in inst_stats_cache:
+        return inst_stats_cache[ckey]
+    if ckey in visited:
         return (0, 0)
-    visited = visited | {col.name}
+    visited = visited | {ckey}
     v_total = 0
     p_total = 0
     for o in col.all_objects:
@@ -136,7 +137,7 @@ def get_inst_stats(col, visited=None):
             iv, ip = get_inst_stats(o.instance_collection, visited)
             v_total += iv
             p_total += ip
-    inst_stats_cache[col.name] = (v_total, p_total)
+    inst_stats_cache[ckey] = (v_total, p_total)
     return (v_total, p_total)
 
 items = []
@@ -295,12 +296,44 @@ _enable_collections(bpy.context.view_layer.layer_collection)
 for img in bpy.data.images:
     fp = getattr(img, 'filepath', '') or ''
     if fp:
-        abs_fp = os.path.abspath(bpy.path.abspath(fp))
-        if abs_fp != fp:
-            img.filepath = abs_fp
+        try:
+            lib = getattr(img, 'library', None)
+            abs_fp = os.path.abspath(bpy.path.abspath(fp, library=lib))
+            if abs_fp != fp:
+                img.filepath = abs_fp
+        except Exception:
+            pass
+
+def _unhide_collection_tree(col, visited=None):
+    if visited is None:
+        visited = set()
+    if col is None:
+        return
+    cid = (col.name, getattr(getattr(col, 'library', None), 'filepath', '') or '')
+    if cid in visited:
+        return
+    visited.add(cid)
+    for attr in ('hide_viewport', 'hide_render'):
+        try:
+            if getattr(col, attr, False):
+                setattr(col, attr, False)
+        except Exception:
+            pass
+    for o in getattr(col, 'all_objects', ()):
+        for attr in ('hide_viewport', 'hide_render'):
+            try:
+                if getattr(o, attr, False):
+                    setattr(o, attr, False)
+            except Exception:
+                pass
+        if o.type == 'EMPTY' and getattr(o, 'instance_type', None) == 'COLLECTION' and getattr(o, 'instance_collection', None) is not None:
+            _unhide_collection_tree(o.instance_collection, visited)
 
 for obj in bpy.data.objects:
-    obj["orchflow_blender_object"] = obj.name
+    try:
+        obj["orchflow_blender_object"] = obj.name
+    except Exception:
+        pass
 
 props = bpy.ops.wm.usd_export.get_rna_type().properties
 kwargs = {
@@ -332,10 +365,19 @@ if 'convert_orientation' in props:
     kwargs['convert_orientation'] = True
 
 for obj in bpy.context.view_layer.objects:
-    obj.hide_viewport = False
-    obj.hide_render = False
-    if obj.hide_get():
-        obj.hide_set(False)
+    for attr in ('hide_viewport', 'hide_render'):
+        try:
+            if getattr(obj, attr, False):
+                setattr(obj, attr, False)
+        except Exception:
+            pass
+    try:
+        if obj.hide_get():
+            obj.hide_set(False)
+    except Exception:
+        pass
+    if obj.type == 'EMPTY' and getattr(obj, 'instance_type', None) == 'COLLECTION' and getattr(obj, 'instance_collection', None) is not None:
+        _unhide_collection_tree(obj.instance_collection)
 
 if isinstance(selected, list):
     sel_set = set(selected)
@@ -358,6 +400,115 @@ if isinstance(selected, list):
                 while curr is not None:
                     expanded.add(curr.name)
                     curr = curr.parent
+            elif mod.type == 'PARTICLE_SYSTEM':
+                ps = getattr(mod, 'particle_system', None)
+                pset = getattr(ps, 'settings', None) if ps is not None else None
+                if pset is not None:
+                    io = getattr(pset, 'instance_object', None)
+                    ic = getattr(pset, 'instance_collection', None)
+                    if io is not None:
+                        for attr in ('hide_viewport', 'hide_render'):
+                            try: setattr(io, attr, False)
+                            except Exception: pass
+                    if ic is not None:
+                        _unhide_collection_tree(ic)
+            elif mod.type == 'NODES':
+                try:
+                    for k in mod.keys():
+                        val = mod[k]
+                        if isinstance(val, bpy.types.Collection):
+                            _unhide_collection_tree(val)
+                        elif isinstance(val, bpy.types.Object):
+                            for attr in ('hide_viewport', 'hide_render'):
+                                try: setattr(val, attr, False)
+                                except Exception: pass
+                except Exception:
+                    pass
+    bpy.context.view_layer.update()
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    exportable_inst_types = {'MESH', 'CURVE', 'CURVES', 'SURFACE', 'META', 'FONT', 'VOLUME', 'HAIR', 'POINTCLOUD'}
+    materialized_parents = set()
+    proto_data_cache = {}
+    inst_counter = 0
+    for inst in depsgraph.object_instances:
+        if not getattr(inst, 'is_instance', False):
+            continue
+        parent_ev = getattr(inst, 'parent', None)
+        if parent_ev is None:
+            continue
+        parent_orig = getattr(parent_ev, 'original', parent_ev)
+        if parent_orig.name not in expanded or parent_orig.type == 'EMPTY':
+            continue
+        inst_obj = getattr(inst, 'object', None)
+        if inst_obj is None or inst_obj.type not in exportable_inst_types:
+            continue
+        eval_data = getattr(inst_obj, 'data', None)
+        if eval_data is None:
+            continue
+        if inst_obj.type == 'MESH' and len(eval_data.polygons) == 0:
+            continue
+        data_key = (inst_obj.type, eval_data.as_pointer())
+        proto_data = proto_data_cache.get(data_key)
+        if proto_data is None:
+            if inst_obj.type == 'MESH':
+                try:
+                    cand = eval_data.copy()
+                    if len(cand.vertices) > 0 and len(cand.polygons) > 0:
+                        proto_data = cand
+                    else:
+                        bpy.data.meshes.remove(cand)
+                except Exception:
+                    proto_data = None
+                if proto_data is None:
+                    try:
+                        import bmesh
+                        bm = bmesh.new()
+                        bm.from_mesh(eval_data)
+                        proto_data = bpy.data.meshes.new(f"OrchFlowInstProto_{len(proto_data_cache)}")
+                        bm.to_mesh(proto_data)
+                        bm.free()
+                        for mat in getattr(eval_data, 'materials', ()):
+                            proto_data.materials.append(mat)
+                        if len(proto_data.vertices) == 0 or len(proto_data.polygons) == 0:
+                            bpy.data.meshes.remove(proto_data)
+                            proto_data = None
+                    except Exception:
+                        proto_data = None
+                if proto_data is None:
+                    continue
+            else:
+                try:
+                    proto_data = eval_data.copy()
+                except Exception:
+                    continue
+            proto_data_cache[data_key] = proto_data
+        inst_counter += 1
+        dup = bpy.data.objects.new(f"{parent_orig.name}__inst_{inst_counter}", proto_data)
+        dup.matrix_world = inst.matrix_world.copy()
+        try:
+            dup["orchflow_blender_object"] = parent_orig.name
+        except Exception:
+            pass
+        bpy.context.scene.collection.objects.link(dup)
+        expanded.add(dup.name)
+        materialized_parents.add(parent_orig)
+    for p_orig in materialized_parents:
+        try:
+            if getattr(p_orig, 'instance_type', 'NONE') in ('VERTS', 'FACES'):
+                p_orig.instance_type = 'NONE'
+        except Exception:
+            pass
+        has_gn = any(getattr(m, 'type', None) == 'NODES' for m in getattr(p_orig, 'modifiers', ()))
+        hide_emitter = (
+            has_gn
+            or not getattr(p_orig, 'show_instancer_for_viewport', True)
+            or not getattr(p_orig, 'show_instancer_for_render', True)
+            or (p_orig.type == 'MESH' and getattr(p_orig, 'data', None) is not None and len(p_orig.data.polygons) == 0)
+        )
+        if hide_emitter:
+            expanded.discard(p_orig.name)
+    if materialized_parents:
+        bpy.context.view_layer.update()
     for obj in bpy.context.view_layer.objects:
         obj.select_set(obj.name in expanded)
     kwargs['selected_objects_only'] = True

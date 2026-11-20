@@ -9,6 +9,18 @@ export default defineConfig(() => ({
   plugins: [react()],
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (id.includes("node_modules/@xyflow/")) return "xyflow";
+          if (id.includes("node_modules/react/") || id.includes("node_modules/react-dom/") || id.includes("node_modules/scheduler/")) {
+            return "react-vendor";
+          }
+        },
+      },
+    },
+  },
   //
   // 1. prevent Vite from obscuring rust errors
   clearScreen: false,

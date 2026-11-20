@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import type { ChangeEvent, InputHTMLAttributes, PointerEvent } from "react";
 
 type NumberInputProps = Omit<InputHTMLAttributes<HTMLInputElement>, "type">;
@@ -26,12 +26,14 @@ function clampAndRound(
 
 export function NumberInput({
   value,
+  defaultValue,
   step,
   min,
   max,
   disabled,
   readOnly,
   onChange,
+  onBlur,
   ...rest
 }: NumberInputProps) {
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -42,6 +44,15 @@ export function NumberInput({
     lastValue: number | null;
   } | null>(null);
   const [dragging, setDragging] = useState(false);
+
+  // Leave the focused input's text and caret in the browser's control.
+  // The model stores a number, so writing it back would strip typed zeros.
+  useLayoutEffect(() => {
+    const input = inputRef.current;
+    if (input && value !== undefined && input.ownerDocument.activeElement !== input) {
+      input.value = String(value);
+    }
+  }, [value]);
 
   const numericStep = (() => {
     const parsed = step !== undefined && step !== "any" ? Number(step) : NaN;
@@ -104,13 +115,20 @@ export function NumberInput({
       <input
         ref={inputRef}
         type="number"
-        value={value}
+        defaultValue={value ?? defaultValue}
         step={step}
         min={min}
         max={max}
         disabled={disabled}
         readOnly={readOnly}
-        onChange={onChange}
+        onChange={(event) => {
+          const input = event.currentTarget;
+          if (input.value !== "" && Number.isFinite(input.valueAsNumber)) onChange?.(event);
+        }}
+        onBlur={(event) => {
+          onBlur?.(event);
+          if (value !== undefined) event.currentTarget.value = String(value);
+        }}
         {...rest}
       />
       <span

@@ -4,6 +4,9 @@ import {NumberInput} from "./NumberInput";
 import {OperationProgress} from "./OperationProgress";
 import {
   createContext,
+  lazy,
+  memo,
+  Suspense,
   useContext,
   useEffect,
   useCallback,
@@ -13,17 +16,22 @@ import {
 } from "react";
 import {ProjectHistory,historyShortcut} from "./projectHistory";
 import {SceneOverview} from "./SceneOverview";
-import { DependencyTable } from "./DependencyTable";
+const DependencyTable = lazy(() => import("./DependencyTable").then((m) => ({ default: m.DependencyTable })));
 import {
   recordHandoff,
   recordNativeCreation,
   recordManualBaseline,
   recordPublication,
   recordLiveAdjustment,
+  mergeDiscoveredInputs,
   mergeUsdDiscovery,
   fileKey,
   graphPreview,
+  defaultCacheEditSettings,
+  defaultHairSettings,
+  defaultCharacterSettings,
   identityTransform,
+  defaultScatter,
   editNodeData,
   expandProject,
   storeProject,
@@ -37,15 +45,21 @@ import {
 import { insertToolbarNode, toolbarOperations, type DropTarget } from "./graphInsertion";
 import { previewTarget } from "./previewTarget";
 import { NativeViewport } from "./NativeViewport";
-import { ApplicationCatalogProvider, ApplicationSettings } from "./applicationProfiles";
+import { ApplicationCatalogProvider, ApplicationSettings, useApplicationCatalog } from "./applicationProfiles";
+import { defaultEditScope } from "./profilePolicy";
 import { NativeProjectPanel } from "./NativeProjectPanel";
-import {MaterialXPanel} from "./MaterialXPanel";
+const MaterialXPanel = lazy(() => import("./MaterialXPanel").then((m) => ({ default: m.MaterialXPanel })));
 import { MaterialBindingInspector } from "./MaterialBindingInspector";
 import { LightInspector } from "./LightInspector";
-import { HairInspector } from "./HairInspector";
-import { BlenderInspector } from "./BlenderInspector";
+const HairInspector = lazy(() => import("./HairInspector").then((m) => ({ default: m.HairInspector })));
+const CacheEditInspector = lazy(() => import("./CacheEditInspector").then((m) => ({ default: m.CacheEditInspector })));
+const CharacterInspector = lazy(() => import("./CharacterInspector").then((m) => ({ default: m.CharacterInspector })));
+const BlenderInspector = lazy(() => import("./BlenderInspector").then((m) => ({ default: m.BlenderInspector })));
 import { TransformInspector } from "./TransformInspector";
+import { GroupInspector } from "./GroupInspector";
+import { ScatterInspector } from "./ScatterInspector";
 import { invoke, isTauri } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import {
   ReactFlow,
   Background,
@@ -75,6 +89,7 @@ const seed: StageNode[] = [
       operation: "source",
       app: "",
       axis: "preserve",
+      frontAxis: "preserve",
       scale: 1,
       nativeProject: "",
       publishedPath: "",
@@ -277,7 +292,7 @@ const PinContext = createContext<{
   pinnedId: string | null;
   toggle: (id: string) => void;
 }>({ pinnedId: null, toggle: () => {} });
-function Card({ id, data, selected }: NodeProps<StageNode>) {
+const Card = memo(function Card({ id, data, selected }: NodeProps<StageNode>) {
   const pin = useContext(PinContext);
   const pinned = pin.pinnedId === id;
   return (
@@ -308,12 +323,12 @@ function Card({ id, data, selected }: NodeProps<StageNode>) {
       <div className="card-body">
         <strong>{data.label}</strong>
         <p>
-          {["delete", "transform", "output", "assetOverride", "materialx", "material_bind", "light", "hdri", "hair"].includes(data.operation)
+          {["delete", "scatter", "transform", "group", "output", "assetOverride", "materialx", "material_bind", "light", "hdri", "hair", "cache_edit", "character"].includes(data.operation)
             ? "Combined USD inputs"
             : data.operation === "blender"
               ? (data.nativeProject?.split(/[\\/]/).pop() || "No .blend linked")
               : data.operation === "application"
-              ? data.nativeProject.split(/[\\/]/).pop() || "No native project linked"
+              ? data.nativeProject?.split(/[\\/]/).pop() || data.app || "No profile selected"
               : data.path.split(/[\\/]/).pop() || "No stage assigned"}
         </p>
       </div>
@@ -337,9 +352,23 @@ function Card({ id, data, selected }: NodeProps<StageNode>) {
                 })()
               : "No .blend linked")
           : data.operation === "application"
-          ? data.liveAdjustment ? "Live output · reviewed edits" : "No saved live adjustment"
+          ? data.liveAdjustment
+            ? `Applied · ${Array.isArray(data.liveAdjustment.report?.applied) ? data.liveAdjustment.report.applied.length : 0} edit(s)`
+            : data.manualBaseline || data.nativeImport
+              ? "Baseline ready · awaiting export"
+              : data.handoff
+                ? "Handoff ready"
+                : data.applicationProfileId
+                  ? "Needs handoff"
+                  : "Choose profile"
           : data.operation === "transform"
           ? `XYZ scale ${(data.transform || identityTransform).scale.join(", ")}`
+          : data.operation === "group"
+          ? `/${(data.groupName || "Group").trim() || "Group"} · scale ${(data.transform || identityTransform).scale.join(", ")}`
+          : data.operation === "scatter"
+          ? `${(data.scatter || defaultScatter).count} instances · ${(data.scatter || defaultScatter).distribution}`
+          : data.operation === "character"
+          ? `${(data.character?.animationOverrides || []).filter((r) => r.enabled).length} anim · ${(data.character?.skeletonBindings || []).filter((r) => r.enabled).length} skel · ${(data.character?.jointAttachments || []).filter((r) => r.enabled).length} joint`
           : data.operation === "output"
             ? "In-memory USD output"
             : `${data.axis} up · scale ${data.scale}`}
@@ -347,10 +376,12 @@ function Card({ id, data, selected }: NodeProps<StageNode>) {
       <Handle type="source" position={Position.Right} />
     </div>
   );
-}
+});
 const nodeTypes = { stage: Card };
 function Workspace() {
+  const { catalog } = useApplicationCatalog();
   const [settingsTarget,setSettingsTarget]=useState({id:"",visit:0});
+  const [nodeContextMenu, setNodeContextMenu] = useState<{ nodeId: string; x: number; y: number } | null>(null);
   const [activeTab,setActiveTab]=useState<"canvas"|"applications">("canvas");
   const [nodes, setNodes] = useNodesState<StageNode>(seed);
   const [edges, setEdges] = useEdgesState<Edge>([]);
@@ -378,9 +409,14 @@ function Workspace() {
   const projectPathRef = useRef<string | null>(null);
   const [dependencies, setDependencies] = useState<Dependency[]>([]);
   const [materialXEditorId,setMaterialXEditorId]=useState<string|null>(null);
+  const [materialXPrimDrop,setMaterialXPrimDrop]=useState<{primPath:string;seq:number}|null>(null);
   const [overrideNodeId, setOverrideNodeId] = useState<string | null>(null);
   const [inspectorWidth, setInspectorWidth] = useState(310);
   const [resizingInspector, setResizingInspector] = useState(false);
+  const [viewportFrame, setViewportFrame] = useState(0);
+  const [seekFrameRequest, setSeekFrameRequest] = useState<{ frame: number; seq: number } | null>(null);
+  const viewportFrameRef = useRef(0);
+  viewportFrameRef.current = viewportFrame;
   function startInspectorResize(e: React.MouseEvent) {
     e.preventDefault();
     const startX = e.clientX;
@@ -426,6 +462,15 @@ function Workspace() {
   },[clearScenePrompt]);
   const history=useRef(new ProjectHistory());
   const [,historyChanged]=useState(0);
+  function commitQuickstart(nodeId: string, original: StoredProject, prepared: StoredProject) {
+    if (projectRef.current !== original) {
+      throw new Error("Quick start wrote the new files, but the project changed during preparation. Its current links were preserved.");
+    }
+    applyProject(prepared, "Prepare Blender round trip");
+    setApplicationPreviews(previous => ({ ...previous, [nodeId]: "handoff" }));
+    return prepared;
+  }
+
   function applyProject(project: StoredProject,label="Edit project",group:string|null=null,record=true) {
     if(currentProjectSession!==projectSession.current)return;
     const nextViewport: ViewportSettings = {
@@ -473,12 +518,31 @@ function Workspace() {
     if(!entry.project.nodes.some(n=>n.id===selected))select(entry.project.nodes[0]?.id || "");
     setOverrideNodeId(null);setStatus(`${direction==="undo"?"Undid":"Redid"}: ${entry.label}. External files were not changed.`);
   }
-  useEffect(()=>{
-    const key=(event:KeyboardEvent)=>{const editing=event.composedPath().some(target=>target instanceof HTMLElement && (target.matches("input,textarea,select") || target.isContentEditable));const direction=historyShortcut(event,editing);if(direction && !busy && activeTab==="canvas"){event.preventDefault();travel(direction);}};
-    const blur=()=>history.current.endGroup();
-    window.addEventListener("keydown",key);window.addEventListener("focusout",blur);
-    return ()=>{window.removeEventListener("keydown",key);window.removeEventListener("focusout",blur);};
-  });
+  const keyHandlerRef = useRef<(event: KeyboardEvent) => void>(() => {});
+  keyHandlerRef.current = (event: KeyboardEvent) => {
+    const editing = event
+      .composedPath()
+      .some(
+        (target) =>
+          target instanceof HTMLElement &&
+          (target.matches("input,textarea,select") || target.isContentEditable),
+      );
+    const direction = historyShortcut(event, editing);
+    if (direction && !busy && activeTab === "canvas") {
+      event.preventDefault();
+      travel(direction);
+    }
+  };
+  useEffect(() => {
+    const key = (event: KeyboardEvent) => keyHandlerRef.current(event);
+    const blur = () => history.current.endGroup();
+    window.addEventListener("keydown", key);
+    window.addEventListener("focusout", blur);
+    return () => {
+      window.removeEventListener("keydown", key);
+      window.removeEventListener("focusout", blur);
+    };
+  }, []);
   function pin(id:string|null){applyProject({...projectRef.current,viewport:{...projectRef.current.viewport,pinnedNodeId:id}},"Pin preview");}
   const node = nodes.find((n) => n.id === selected);
   const pinnedNode = nodes.find((n) => n.id === pinnedNodeId);
@@ -487,11 +551,28 @@ function Workspace() {
   const [applicationPreviews, setApplicationPreviews] = useState<Record<string,"handoff"|"published"|"input">>({});
   const previewMode = applicationPreviews[previewId] || (previewNode?.data.liveAdjustment ? "published" : "handoff");
   const activePreviewMode = pinnedNode && previewMode === "input" ? "handoff" : previewMode;
-  const target = previewTarget(projectModel,previewId,activePreviewMode);
+  const target = useMemo(
+    () => previewTarget(projectModel, previewId, activePreviewMode),
+    [projectModel, previewId, activePreviewMode],
+  );
   const comparisonHandoff=previewNode?.data.operation==="application" ? previewNode.data.handoff : null;
   const comparisonPath=projectModel.dependencies.find(d=>d.id===comparisonHandoff?.dependencyId)?.path;
-  const comparison=comparisonHandoff&&comparisonPath ? JSON.stringify({key:previewId,path:comparisonPath,inverse:comparisonHandoff.conversion.inverse,handoff:activePreviewMode==="handoff"}) : undefined;
-  const sceneKey=JSON.stringify([target.path,target.graph]);
+  const comparison = useMemo(
+    () =>
+      comparisonHandoff && comparisonPath
+        ? JSON.stringify({
+            key: previewId,
+            path: comparisonPath,
+            inverse: comparisonHandoff.conversion.inverse,
+            handoff: activePreviewMode === "handoff",
+          })
+        : undefined,
+    [comparisonHandoff, comparisonPath, previewId, activePreviewMode],
+  );
+  const sceneKey = useMemo(
+    () => JSON.stringify([target.path, target.graph]),
+    [target.path, target.graph],
+  );
   const [primSelection,setPrimSelection]=useState({key:"",path:""});
   const selectedPrim=primSelection.key===sceneKey?primSelection.path:"";
   const flowInstance=useRef<ReactFlowInstance<StageNode,Edge>|null>(null);
@@ -511,6 +592,20 @@ function Workspace() {
       /* ignore storage errors */
     }
   }
+  const startupLaunchHandledRef = useRef(false);
+  useEffect(() => {
+    if (!isTauri() || startupLaunchHandledRef.current) return;
+    startupLaunchHandledRef.current = true;
+    void invoke<{ openLastProject: boolean; projectPath: string | null }>("startup_launch_options")
+      .then((opts) => {
+        const targetPath = opts.projectPath || (opts.openLastProject ? lastProjectPath : null);
+        if (targetPath) {
+          void run(() => bridgeStateRef.current.openProjectAtPath(targetPath));
+        }
+      })
+      .catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const [themeId, setThemeId] = useState<string>(() => {
     try {
       const saved = localStorage.getItem(THEME_STORAGE_KEY);
@@ -534,6 +629,18 @@ function Workspace() {
     const edge=element.closest(".react-flow__edge");
     return edge?{kind:"edge",id:edge.getAttribute("data-id")!}:null;
   }
+  function defaultApplicationFields(): Partial<Data> {
+    const chosen =
+      catalog.applications.find((p) => p.app === "Blender" && p.adapterVersion === 2) ||
+      catalog.applications.find((p) => p.app === "Blender") ||
+      catalog.applications[0];
+    if (!chosen) return {};
+    return {
+      app: chosen.app,
+      applicationProfileId: chosen.id,
+      editScope: defaultEditScope(chosen),
+    };
+  }
   function dropNode(event:React.DragEvent) {
     const operation=event.dataTransfer.getData("application/orchflow-node");
     if(!toolbarOperations.includes(operation))return;
@@ -541,10 +648,10 @@ function Workspace() {
     const position=flowInstance.current?.screenToFlowPosition({x:event.clientX,y:event.clientY});
     if(!position)return;
     const id=crypto.randomUUID();
-    const label=operation === "materialx"?"MaterialX":operation === "material_bind"?"Material Bind":operation === "light"?"Light":operation === "hdri"?"HDRI":operation === "hair"?"Hair":operation === "camera"?"Camera":operation === "blender"?"Blender":operation === "assetOverride"?"Asset Override":operation === "source"?"Source stage":operation[0].toUpperCase()+operation.slice(1);
+    const label=operation === "materialx"?"MaterialX":operation === "material_bind"?"Material Bind":operation === "light"?"Light":operation === "hdri"?"HDRI":operation === "hair"?"Hair":operation === "cache_edit"?"Cache Sculptor":operation === "character"?"Character":operation === "camera"?"Camera":operation === "blender"?"Blender":operation === "assetOverride"?"Asset Override":operation === "source"?"Source stage":operation[0].toUpperCase()+operation.slice(1);
     const defaultCamera = { yaw: 35, pitch: 20, zoom: 1, panX: 0, panY: 0, fov: 45, dofEnabled: false, focusDistance: 5, fStop: 5.6 };
     const initialCamera = { ...defaultCamera, ...(projectRef.current.viewport?.camera ?? {}) };
-    const added=storeProject([{...seed[0],id,position,data:{...seed[0].data,label,operation,transform:structuredClone(identityTransform),...(operation === "camera" ? { cameraViews: [{ id: crypto.randomUUID(), name: "Camera 1", camera: initialCamera }] } : {})}}],[],[]).nodes[0];
+    const added=storeProject([{...seed[0],id,position,data:{...seed[0].data,label,operation,transform:structuredClone(identityTransform),...(operation === "application" ? defaultApplicationFields() : {}),...(operation === "cache_edit" ? { cacheEdit: structuredClone(defaultCacheEditSettings) } : {}),...(operation === "character" ? { character: structuredClone(defaultCharacterSettings) } : {}),...(operation === "camera" ? { cameraViews: [{ id: crypto.randomUUID(), name: "Camera 1", camera: initialCamera }] } : {})}}],[],[]).nodes[0];
     try {
       const target=targetAt(event.target);
       applyProject(insertToolbarNode(projectRef.current,added,target),"Insert node");select(id);
@@ -563,7 +670,7 @@ function Workspace() {
         data: {
           ...seed[0].data,
           label:
-            operation === "materialx" ? "MaterialX" : operation === "material_bind" ? "Material Bind" : operation === "light" ? "Light" : operation === "hdri" ? "HDRI" : operation === "hair" ? "Hair" : operation === "camera" ? "Camera" : operation === "blender" ? "Blender" : operation === "source"
+            operation === "materialx" ? "MaterialX" : operation === "material_bind" ? "Material Bind" : operation === "light" ? "Light" : operation === "hdri" ? "HDRI" : operation === "hair" ? "Hair" : operation === "cache_edit" ? "Cache Sculptor" : operation === "character" ? "Character" : operation === "camera" ? "Camera" : operation === "blender" ? "Blender" : operation === "source"
               ? "Source stage"
               : operation === "transform"
                 ? "Transform"
@@ -574,6 +681,8 @@ function Workspace() {
                   : "Application",
           operation,
           transform: structuredClone(identityTransform),
+          ...(operation === "application" ? defaultApplicationFields() : {}),
+          ...(operation === "cache_edit" ? { cacheEdit: structuredClone(defaultCacheEditSettings) } : {}),
           ...(operation === "camera"
             ? {
                 cameraViews: [
@@ -603,6 +712,67 @@ function Workspace() {
     select(id);
   }
 
+  function duplicateNodeById(targetId: string) {
+    const current = projectRef.current;
+    const expanded = expandProject(current);
+    const sourceNode = expanded.nodes.find((n) => n.id === targetId);
+    if (!sourceNode) return;
+    const newId = crypto.randomUUID();
+    const clonedData = structuredClone(sourceNode.data);
+    clonedData.label = `${clonedData.label} (copy)`;
+    const duplicated: StageNode = {
+      ...structuredClone(sourceNode),
+      id: newId,
+      selected: false,
+      position: {
+        x: sourceNode.position.x + 40,
+        y: sourceNode.position.y + 40,
+      },
+      data: clonedData,
+    };
+    const nextNodes = [...expanded.nodes, duplicated];
+    applyProject(
+      { ...current, ...storeProject(nextNodes, expanded.edges, current.dependencies) },
+      "Duplicate node",
+    );
+    select(newId);
+    setInspection(null);
+  }
+  function deleteNodeById(targetId: string) {
+    const current = projectRef.current;
+    const expanded = expandProject(current);
+    const nextNodes = expanded.nodes.filter((n) => n.id !== targetId);
+    const ids = new Set(nextNodes.map((n) => n.id));
+    const nextEdges = expanded.edges.filter((e) => ids.has(e.source) && ids.has(e.target));
+    const nextPinned =
+      current.viewport?.pinnedNodeId === targetId
+        ? null
+        : current.viewport?.pinnedNodeId ?? null;
+    applyProject(
+      {
+        ...current,
+        ...storeProject(nextNodes, nextEdges, current.dependencies),
+        viewport: current.viewport ? { ...current.viewport, pinnedNodeId: nextPinned } : current.viewport,
+      },
+      "Delete node",
+    );
+    if (selected === targetId) {
+      select(nextNodes[0]?.id || "");
+    }
+    setInspection(null);
+  }
+  function changeNodeFunction(targetId: string, operation: string) {
+    const current = projectRef.current;
+    const targetNode = current.nodes.find((n) => n.id === targetId);
+    if (!targetNode || targetNode.data.operation === operation) return;
+    const patch: Partial<Data> = {
+      operation,
+      ...(operation === "application" && !targetNode.data.applicationProfileId
+        ? defaultApplicationFields()
+        : {}),
+    };
+    applyProject(editNodeData(current, targetId, patch), "Change node function");
+  }
   function update(patch: Partial<Data>) {
     applyProject(editNodeData(projectRef.current, selected, patch),"Edit node",`field:${selected}:${Object.keys(patch).join()}`);
   }
@@ -617,18 +787,15 @@ function Workspace() {
       setBusy(false);
     }
   }
-  function rescanUsdDependencies(): Promise<void> {
+  function rescanUsdDependencies(forceAll = true): Promise<void> {
     if (scanPromise.current) return scanPromise.current;
     const task = (async () => {
       const initial = projectRef.current;
-      const rootIds = new Set(
-        initial.nodes
-          .flatMap((n) => [
-            n.data.inputDependencyId,
-            n.data.publishedDependencyId,
-          ])
-          .filter((id): id is string => !!id),
-      );
+      const rootIds = new Set<string>();
+      for (const n of initial.nodes) {
+        if (n.data.inputDependencyId) rootIds.add(n.data.inputDependencyId);
+        if (n.data.publishedDependencyId) rootIds.add(n.data.publishedDependencyId);
+      }
       for (const dependency of initial.dependencies) {
         if (
           !dependency.usdReferences?.length &&
@@ -636,29 +803,44 @@ function Workspace() {
         )
           rootIds.add(dependency.id);
       }
+      const sources = Array.from(rootIds)
+        .map((id) => initial.dependencies.find((d) => d.id === id))
+        .filter((d): d is Dependency => {
+          if (!d || !/\.(usd|usda|usdc|usdz)$/i.test(d.path)) return false;
+          if (!forceAll && d.usdReferences && d.usdReferences.length > 0) return false;
+          return true;
+        });
       let scanned = 0;
       const failures: string[] = [];
-      for (const sourceId of rootIds) {
-        const source = initial.dependencies.find((d) => d.id === sourceId);
-        if (!source || !/\.(usd|usda|usdc|usdz)$/i.test(source.path)) continue;
+      const discoveries: { sourceId: string; sourcePath: string; files: { path: string; kind: "usd" | "asset" }[] }[] = [];
+      for (const source of sources) {
         try {
           const result = await invoke<{
             files: { path: string; kind: "usd" | "asset" }[];
           }>("usd_request", {
             request: { operation: "dependencies", path: source.path },
           });
-          const current = projectRef.current;
-          if (
-            current.dependencies.some(
-              (d) =>
-                d.id === sourceId && fileKey(d.path) === fileKey(source.path),
-            )
-          ) {
-            applyProject(mergeUsdDiscovery(current, sourceId, result.files),"Discover dependencies",null,false);
-            scanned++;
-          }
+          discoveries.push({ sourceId: source.id, sourcePath: source.path, files: result.files });
+          scanned++;
         } catch (error) {
           failures.push(`${source.path}: ${error}`);
+        }
+      }
+      if (discoveries.length > 0) {
+        let updated = projectRef.current;
+        let changed = false;
+        for (const item of discoveries) {
+          if (
+            updated.dependencies.some(
+              (d) => d.id === item.sourceId && fileKey(d.path) === fileKey(item.sourcePath),
+            )
+          ) {
+            updated = mergeUsdDiscovery(updated, item.sourceId, item.files);
+            changed = true;
+          }
+        }
+        if (changed) {
+          applyProject(updated, "Discover dependencies", null, false);
         }
       }
       reportStatus(
@@ -680,9 +862,10 @@ function Workspace() {
       filters: [
         {
           name: "Scene / Volume source",
-          extensions: ["usd", "usda", "usdc", "usdz", "abc", "obj", "vdb", "goz"],
+          extensions: ["usd", "usda", "usdc", "usdz", "abc", "obj", "vdb", "goz", "sublayer", "orchflow"],
         },
         { name: "USD stage", extensions: ["usd", "usda", "usdc", "usdz"] },
+        { name: "Sublayer project", extensions: ["sublayer", "orchflow"] },
         { name: "Alembic", extensions: ["abc"] },
         { name: "Wavefront OBJ", extensions: ["obj"] },
         { name: "OpenVDB", extensions: ["vdb"] },
@@ -709,7 +892,7 @@ function Workspace() {
     if (!node || !node.data.path.trim()) return;
     const { save } = await import("@tauri-apps/plugin-dialog");
     const defaultName =
-      node.data.path.replace(/\.(abc|obj|vdb|goz)$/i, "") + ".usdc";
+      node.data.path.replace(/\.(abc|obj|vdb|goz|sublayer|orchflow)$/i, "") + ".usdc";
     const destination = await save({
       defaultPath: defaultName,
       filters: [
@@ -740,7 +923,7 @@ function Workspace() {
     select(p.nodes[0]?.id || "");
     setInspection(null);
     setOperationProgress("Discovering USD dependencies...");
-    await rescanUsdDependencies();
+    await rescanUsdDependencies(false);
     projectPathRef.current = path;
     recordLastProject(path);
     setProjectName(path.split(/[\\/]/).pop()?.replace(/\.(sublayer|orchflow|json)$/i,"") || "Untitled");
@@ -772,7 +955,7 @@ function Workspace() {
     if (!isTauri()) return;
     let disposed = false;
     let unlisten: (() => void) | undefined;
-    void import("@tauri-apps/api/event").then(async ({ listen }) => {
+    void (async () => {
       const stop = await listen<{
         requestId: string;
         action: string;
@@ -868,7 +1051,7 @@ function Workspace() {
       });
       if (disposed) stop();
       else unlisten = stop;
-    });
+    })();
     return () => {
       disposed = true;
       unlisten?.();
@@ -952,7 +1135,7 @@ function Workspace() {
             onDragStart={e=>{setGraphModeRequest(n=>n+1);e.dataTransfer.setData("application/orchflow-node",operation);e.dataTransfer.effectAllowed="copy";}}
             onDragEnd={()=>setDropTarget(null)} onClick={()=>addNode(operation)}>
             <span className="drag-grip" aria-hidden="true" />
-            ＋ {operation === "materialx"?"MaterialX":operation === "material_bind"?"Material Bind":operation === "light"?"Light":operation === "hdri"?"HDRI":operation === "hair"?"Hair":operation === "camera"?"Camera":operation === "blender"?"Blender":operation === "assetOverride"?"Asset Override":operation[0].toUpperCase()+operation.slice(1)}
+            ＋ {operation === "materialx"?"MaterialX":operation === "material_bind"?"Material Bind":operation === "light"?"Light":operation === "hdri"?"HDRI":operation === "hair"?"Hair":operation === "cache_edit"?"Cache Sculptor":operation === "character"?"Character":operation === "camera"?"Camera":operation === "blender"?"Blender":operation === "assetOverride"?"Asset Override":operation[0].toUpperCase()+operation.slice(1)}
           </button>)}
           <span className="nav-divider" aria-hidden="true" />
           <button className="nav-action nav-action-danger" disabled={busy || (!nodes.length && !dependencies.length)}
@@ -998,7 +1181,7 @@ function Workspace() {
           <button onClick={() => setStatus("Ready")}>Dismiss</button>
         </div>
       )}
-      {materialXEditorId && projectModel.nodes.some(n=>n.id===materialXEditorId && n.data.operation==="materialx") && <MaterialXPanel key={materialXEditorId} project={projectModel} nodeId={materialXEditorId} onProjectChange={applyProject} onClose={()=>setMaterialXEditorId(null)}/>}
+      {materialXEditorId && projectModel.nodes.some(n=>n.id===materialXEditorId && n.data.operation==="materialx") && <Suspense fallback={null}><MaterialXPanel key={materialXEditorId} project={projectModel} nodeId={materialXEditorId} pendingPrimDrop={materialXPrimDrop} onProjectChange={applyProject} onClose={()=>setMaterialXEditorId(null)}/></Suspense>}
       {overrideNodeId && projectModel.nodes.some(n => n.id === overrideNodeId) && (
         <div className="override-backdrop" onKeyDown={e => {
           if(e.key === "Escape") setOverrideNodeId(null);
@@ -1011,11 +1194,11 @@ function Workspace() {
         }}>
           <div className="override-modal" role="dialog" aria-modal="true" aria-label="Asset overrides">
             <button autoFocus onClick={() => setOverrideNodeId(null)}>Done</button>
-            <DependencyTable key={overrideNodeId} nodeId={overrideNodeId} project={projectModel} onChange={applyProject} onStatus={reportStatus} onRescan={rescanUsdDependencies}/>
+            <Suspense fallback={<p className="hint">Loading dependencies...</p>}><DependencyTable key={overrideNodeId} nodeId={overrideNodeId} project={projectModel} onChange={applyProject} onStatus={reportStatus} onRescan={rescanUsdDependencies} onDiscoverFiles={(files) => applyProject(mergeDiscoveredInputs(projectRef.current, files), "Discover dependencies", null, false)}/></Suspense>
           </div>
         </div>
       )}
-        <div className="application-tab-host" hidden={activeTab!=="applications"}><ApplicationSettings focusProfileId={settingsTarget.id} focusVisit={settingsTarget.visit}/></div>
+        <div className="application-tab-host" hidden={activeTab!=="applications"}><Suspense fallback={null}>{activeTab==="applications" && <ApplicationSettings focusProfileId={settingsTarget.id} focusVisit={settingsTarget.visit}/>}</Suspense></div>
         <section className="workspace" style={activeTab==="applications"?{display:"none"}:undefined}>
           <SceneOverview path={target.path} graph={target.graph} selected={selectedPrim} onSelect={path=>setPrimSelection({key:sceneKey,path})} onStatus={reportStatus}/>
           <div className={"canvas " + (sceneMode ? "scene-mode" : "")} onDrop={dropNode} onDragOver={e=>{
@@ -1026,16 +1209,31 @@ function Workspace() {
               cameraKey={comparison ? previewId : undefined}
               comparison={comparison}
               selectedPrim={selectedPrim}
+              selectedNodeId={node?.id ?? null}
               path={target.path}
               graph={target.graph}
               emptyTitle={target.title}
               emptyMessage={target.message}
-              previewControls={previewNode?.data.operation === "application" ? <div className="application-preview-controls">
-                <span>Handoff USD</span>
-                <input type="range" min="0" max="1" step="1" aria-label="Application preview: handoff or published USD" aria-valuetext={activePreviewMode === "published" ? "Published USD" : "Handoff USD"} value={activePreviewMode === "published" ? 1 : 0}
-                  onChange={e=>setApplicationPreviews(p=>({...p,[previewId]:e.target.value === "1" ? "published" : "handoff"}))}/>
-                <span>Published USD</span>
-              </div> : undefined}
+              previewControls={previewNode?.data.operation === "application" ? (
+                <div className="application-preview-controls" role="group" aria-label="Application preview mode">
+                  <button
+                    type="button"
+                    className={activePreviewMode !== "published" ? "active" : undefined}
+                    aria-pressed={activePreviewMode !== "published"}
+                    onClick={() => setApplicationPreviews(p => ({ ...p, [previewId]: "handoff" }))}
+                  >
+                    Handoff USD
+                  </button>
+                  <button
+                    type="button"
+                    className={activePreviewMode === "published" ? "active" : undefined}
+                    aria-pressed={activePreviewMode === "published"}
+                    onClick={() => setApplicationPreviews(p => ({ ...p, [previewId]: "published" }))}
+                  >
+                    Published USD
+                  </button>
+                </div>
+              ) : undefined}
               onRuntime={setRuntime}
               onMode={setSceneMode}
               graphModeRequest={graphModeRequest}
@@ -1055,9 +1253,96 @@ function Workspace() {
                   false,
                 )
               }
+              onTimeChange={setViewportFrame}
+              seekFrameRequest={seekFrameRequest}
+              onCommitHairGroom={(nodeId, groomDeltas) => {
+                const targetNode = projectRef.current.nodes.find((n) => n.id === nodeId);
+                if (!targetNode || targetNode.data.operation !== "hair") return;
+                const currentHair = targetNode.data.hair ?? defaultHairSettings;
+                const nextHair = { ...currentHair };
+                if (Object.keys(groomDeltas).length > 0) {
+                  nextHair.groomDeltas = groomDeltas;
+                } else {
+                  delete nextHair.groomDeltas;
+                }
+                applyProject(
+                  editNodeData(projectRef.current, nodeId, { hair: nextHair }),
+                  Object.keys(groomDeltas).length > 0 ? "Hair groom" : "Reset hair groom",
+                );
+              }}
+              onCommitCacheEdit={(nodeId, layerId, deltas, masks) => {
+                const targetNode = projectRef.current.nodes.find((n) => n.id === nodeId);
+                if (!targetNode || targetNode.data.operation !== "cache_edit") return;
+                const current = targetNode.data.cacheEdit ?? structuredClone(defaultCacheEditSettings);
+                const curLayers = current.layers?.length ? current.layers : structuredClone(defaultCacheEditSettings.layers);
+                const curFrame = Math.round(viewportFrameRef.current);
+                const active = curLayers.find((l) => l.id === layerId) || curLayers[0];
+                const hasExistingDeltas = Boolean(active?.deltas && Object.keys(active.deltas).length > 0);
+                const needsNewFrameLayer =
+                  Boolean(active) &&
+                  active.mode !== "allFrames" &&
+                  Math.round(active.centerFrame) !== curFrame &&
+                  hasExistingDeltas &&
+                  Object.keys(deltas).length > 0;
+
+                let nextActiveId = layerId || current.activeLayerId;
+                let layers = curLayers;
+
+                if (needsNewFrameLayer) {
+                  const existingAtFrame = curLayers.find(
+                    (l) => l.mode !== "allFrames" && Math.round(l.centerFrame) === curFrame,
+                  );
+                  if (existingAtFrame) {
+                    nextActiveId = existingAtFrame.id;
+                    layers = curLayers.map((l) =>
+                      l.id === existingAtFrame.id ? { ...l, deltas } : l,
+                    );
+                  } else {
+                    const newLayer = {
+                      ...active,
+                      id: `layer-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+                      name: `Frame ${curFrame}`,
+                      centerFrame: curFrame,
+                      deltas,
+                    };
+                    nextActiveId = newLayer.id;
+                    layers = [...curLayers, newLayer];
+                  }
+                } else {
+                  layers = curLayers.map((l) => {
+                    if (l.id !== (active?.id ?? layerId)) return l;
+                    const nextLayer = { ...l };
+                    if (nextLayer.mode !== "allFrames" && !hasExistingDeltas) {
+                      nextLayer.centerFrame = curFrame;
+                    }
+                    if (Object.keys(deltas).length > 0) {
+                      nextLayer.deltas = deltas;
+                    } else {
+                      delete nextLayer.deltas;
+                    }
+                    return nextLayer;
+                  });
+                }
+
+                const nextCacheEdit = {
+                  ...current,
+                  activeLayerId: nextActiveId,
+                  layers,
+                };
+                if (Object.keys(masks).length > 0) {
+                  nextCacheEdit.maskWeights = masks;
+                } else {
+                  delete nextCacheEdit.maskWeights;
+                }
+                applyProject(
+                  editNodeData(projectRef.current, nodeId, { cacheEdit: nextCacheEdit }),
+                  "Cache sculpt stroke",
+                );
+              }}
               transformGizmo={
                 node?.data.operation === "transform"
                   ? {
+                      nodeId: node.id,
                       transform: node.data.transform || identityTransform,
                       onChange: (nextTransform) =>
                         applyProject(
@@ -1072,6 +1357,7 @@ function Workspace() {
                   : null
               }
               onSelectPrim={path=>setPrimSelection({key:sceneKey,path})}
+              onAddToMaterialX={materialXEditorId && projectModel.nodes.some(n=>n.id===materialXEditorId && n.data.operation==="materialx") ? (primPath)=>setMaterialXPrimDrop(c=>({primPath,seq:(c?.seq ?? 0)+1})) : undefined}
             />
             {pinnedNode && (
               <div className="viewport-pin-badge">
@@ -1089,14 +1375,17 @@ function Workspace() {
               <ReactFlow
                 onInit={instance=>{flowInstance.current=instance;}}
                 zoomOnDoubleClick={false}
-                nodes={nodes.map(n=>dropTarget?.kind === "node" && dropTarget.id===n.id?{...n,className:[n.className,"toolbar-drop-target"].filter(Boolean).join(" ")}:n)}
-                edges={edges.map(e=>dropTarget?.kind === "edge" && dropTarget.id===e.id?{...e,style:{...e.style,stroke:"#a4e4bd",strokeWidth:4}}:e)}
+                nodes={dropTarget?.kind === "node" ? nodes.map(n => dropTarget.id === n.id ? { ...n, className: [n.className, "toolbar-drop-target"].filter(Boolean).join(" ") } : n) : nodes}
+                edges={dropTarget?.kind === "edge" ? edges.map(e => dropTarget.id === e.id ? { ...e, style: { ...e.style, stroke: "#a4e4bd", strokeWidth: 4 } } : e) : edges}
                 defaultEdgeOptions={{interactionWidth:32}}
                 nodeTypes={nodeTypes}
                 onNodesChange={changes=>{
+                  if (changes.every(c => c.type === "select" || c.type === "dimensions" || (c.type === "position" && c.dragging))) {
+                    setNodes(ns => applyNodeChanges(changes, ns));
+                    return;
+                  }
                   const current=projectRef.current,expanded=expandProject(current);
                   const next=applyNodeChanges(changes,expanded.nodes);
-                  if(changes.every(c=>c.type==="select" || c.type==="dimensions")){setNodes(next);return;}
                   const ids=new Set(next.map(n=>n.id));
                   applyProject({...current,...storeProject(next,expanded.edges.filter(e=>ids.has(e.source)&&ids.has(e.target)),current.dependencies)},changes.some(c=>c.type==="remove")?"Delete nodes":"Move nodes",changes.some(c=>c.type==="remove")?"delete":"drag");
                   if(changes.some(c=>c.type==="position" && !c.dragging))history.current.endGroup();
@@ -1108,9 +1397,17 @@ function Workspace() {
                   queueMicrotask(()=>history.current.endGroup());
                 }}
                 onNodeClick={(_, n) => {
+                  setNodeContextMenu(null);
                   select(n.id);
                   setInspection(null);
                 }}
+                onNodeContextMenu={(event, n) => {
+                  event.preventDefault();
+                  select(n.id);
+                  setInspection(null);
+                  setNodeContextMenu({ nodeId: n.id, x: event.clientX, y: event.clientY });
+                }}
+                onPaneClick={() => setNodeContextMenu(null)}
                 onConnect={(c) => {
                   const reaches = (
                     id: string,
@@ -1138,6 +1435,101 @@ function Workspace() {
                 <Controls />
               </ReactFlow>
             </PinContext.Provider>
+            {nodeContextMenu && (() => {
+              const targetNode = nodes.find((n) => n.id === nodeContextMenu.nodeId);
+              if (!targetNode) return null;
+              const functionOptions: [string, string][] = [
+                ["source", "Source stage"],
+                ["blender", "Blender"],
+                ["application", "Application"],
+                ["transform", "Transform"],
+                ["group", "Group"],
+                ["assetOverride", "Asset Override"],
+                ["materialx", "MaterialX"],
+                ["material_bind", "Material Bind"],
+                ["light", "Light"],
+                ["hdri", "HDRI"],
+                ["hair", "Hair"],
+                ["cache_edit", "Cache Sculptor"],
+                ["character", "Character"],
+                ["camera", "Camera"],
+                ["delete", "Delete prims"],
+                ["scatter", "Scatter"],
+                ["output", "Output"],
+              ];
+              return (
+                <div
+                  className="node-context-backdrop"
+                  onClick={() => setNodeContextMenu(null)}
+                  onContextMenu={(e) => {
+                    e.preventDefault();
+                    setNodeContextMenu(null);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Escape") setNodeContextMenu(null);
+                  }}
+                >
+                  <div
+                    className="node-context-menu"
+                    role="menu"
+                    aria-label={`Actions for ${targetNode.data.label}`}
+                    style={{
+                      left: Math.min(nodeContextMenu.x, window.innerWidth - 220),
+                      top: Math.min(nodeContextMenu.y, window.innerHeight - 280),
+                    }}
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <div className="node-context-header">{targetNode.data.label}</div>
+                    <div className="node-context-submenu-wrap">
+                      <button type="button" className="node-context-item" role="menuitem" aria-haspopup="menu">
+                        <span>Change function</span>
+                        <span className="node-context-arrow">▸</span>
+                      </button>
+                      <div className="node-context-submenu" role="menu" aria-label="Node function">
+                        {functionOptions.map(([op, label]) => (
+                          <button
+                            key={op}
+                            type="button"
+                            role="menuitemradio"
+                            aria-checked={targetNode.data.operation === op}
+                            className={"node-context-item" + (targetNode.data.operation === op ? " active" : "")}
+                            onClick={() => {
+                              changeNodeFunction(targetNode.id, op);
+                              setNodeContextMenu(null);
+                            }}
+                          >
+                            <span>{label}</span>
+                            {targetNode.data.operation === op && <span>✓</span>}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      className="node-context-item"
+                      role="menuitem"
+                      onClick={() => {
+                        duplicateNodeById(targetNode.id);
+                        setNodeContextMenu(null);
+                      }}
+                    >
+                      Duplicate node
+                    </button>
+                    <button
+                      type="button"
+                      className="node-context-item danger"
+                      role="menuitem"
+                      onClick={() => {
+                        deleteNodeById(targetNode.id);
+                        setNodeContextMenu(null);
+                      }}
+                    >
+                      Delete node
+                    </button>
+                  </div>
+                </div>
+              );
+            })()}
           </div>
           <div
             className={"inspector-resizer" + (resizingInspector ? " dragging" : "")}
@@ -1168,30 +1560,16 @@ function Workspace() {
                     onChange={(e) => update({ label: e.target.value })}
                   />
                 </label>
-                <label>
-                  Function
-                  <select
-                    value={node.data.operation}
-                    onChange={(e) => update({ operation: e.target.value })}
-                  >
-                    <option value="source">Source stage</option>
-                    <option value="blender">Blender</option>
-                    <option value="application">
-                      Application
-                    </option>
-                    <option value="transform">Transform</option>
-                    <option value="assetOverride">Asset Override</option>
-                    <option value="materialx">MaterialX</option>
-                    <option value="material_bind">Material Bind</option>
-                    <option value="light">Light</option>
-                    <option value="hdri">HDRI</option>
-                    <option value="hair">Hair</option>
-                    <option value="delete">Delete prims</option>
-                    <option value="output">Output</option>
-                  </select>
-                </label>
                 {node.data.operation === "assetOverride" && <button onClick={() => setOverrideNodeId(node.id)}>Edit Asset Overrides… ({node.data.assetOverrides?.length || 0})</button>}
                 {node.data.operation === "delete" && <label><span className="field-label">Prim paths<InspectorHint text="One absolute path per line. Deactivates these prims on this branch; original files are unchanged. Instance-proxy children cannot be deleted separately."/></span><textarea value={(node.data.deletePaths || []).join("\n")} onChange={e=>update({deletePaths:e.target.value.split("\n").map(v=>v.trim()).filter(Boolean)})}/></label>}
+                {node.data.operation === "scatter" && (
+                  <ScatterInspector
+                    project={projectModel}
+                    nodeId={node.id}
+                    value={node.data.scatter}
+                    onChange={(scatter) => update({ scatter })}
+                  />
+                )}
                 {node.data.operation === "transform" && (
                   <TransformInspector
                     value={node.data.transform}
@@ -1201,6 +1579,14 @@ function Workspace() {
                     onTargetsChange={(transformTargets) => update({ transformTargets })}
                   />
                 )}
+                {node.data.operation === "group" && (
+                  <GroupInspector
+                    groupName={node.data.groupName}
+                    transform={node.data.transform}
+                    onGroupNameChange={(groupName) => update({ groupName })}
+                    onTransformChange={(transform) => update({ transform })}
+                  />
+                )}
                 {node.data.operation === "materialx" && <button onClick={()=>setMaterialXEditorId(node.id)}>Edit MaterialX shading rules...</button>}
                 {node.data.operation === "output" && (
                   <p className="field-label">Combined output<InspectorHint text="Combines incoming stages in memory. Select this node to preview the result; it does not write a USD file."/></p>
@@ -1208,53 +1594,112 @@ function Workspace() {
                 {["source", "application"].includes(node.data.operation) && (
                   <>
                     {node.data.operation==="source"&&<>
-                      <label>Source file (USD / ABC / OBJ / VDB / GoZ)<input placeholder="C:\\assets\\scene.usda" value={node.data.path} onChange={e=>update({path:e.target.value})}/></label>
+                      <label>Source file (USD / ABC / OBJ / VDB / GoZ / Sublayer)<input placeholder="C:\\assets\\scene.usda" value={node.data.path} onChange={e=>update({path:e.target.value})}/></label>
                       <button disabled={busy || !isTauri()} onClick={()=>run(browse)}>Browse source...</button>
-                      {/\.(abc|obj|vdb|goz)$/i.test(node.data.path.trim()) && (
+                      {/\.(abc|obj|vdb|goz|sublayer|orchflow)$/i.test(node.data.path.trim()) && (
                         <button disabled={busy || !isTauri()} onClick={()=>run(convertSourceToUsd)}>Convert to USD...</button>
                       )}
-                      <label className="checkbox-field" style={{marginTop: "8px", display: "flex", alignItems: "center", gap: "8px", cursor: "pointer"}}>
-                        <input
-                          type="checkbox"
-                          checked={Boolean(node.data.instanced)}
-                          onChange={e=>update({instanced: e.target.checked})}
-                        />
-                        <span>Native instancing <InspectorHint text="When enabled, OpenUSD treats this asset as a sealed prototype to save memory on heavy duplication, but child meshes become read-only proxies. Leave unchecked to allow component styling on sub-meshes (Dress, Kimono, etc.)."/></span>
-                      </label>
+                      <table className="source-options-table">
+                        <tbody>
+                          <tr>
+                            <td>
+                              <span className="field-label">
+                                Native instancing
+                                <InspectorHint text="When enabled, OpenUSD treats this asset as a sealed prototype to save memory on heavy duplication, but child meshes become read-only proxies. Leave unchecked to allow component styling on sub-meshes (Dress, Kimono, etc.)."/>
+                              </span>
+                            </td>
+                            <td>
+                              <input
+                                type="checkbox"
+                                aria-label="Native instancing"
+                                checked={Boolean(node.data.instanced)}
+                                onChange={e=>update({instanced: e.target.checked})}
+                              />
+                            </td>
+                          </tr>
+                          <tr>
+                            <td>Load USD payloads</td>
+                            <td>
+                              <input
+                                type="checkbox"
+                                aria-label="Load USD payloads"
+                                checked={node.data.loadPayloads !== false}
+                                onChange={(e) => update({ loadPayloads: e.target.checked })}
+                              />
+                            </td>
+                          </tr>
+                          <tr>
+                            <td>
+                              <span className="field-label">
+                                Mount as payload
+                                <InspectorHint text="Attaches this source file using a USD Payload arc instead of a Reference, allowing Load USD payloads to defer loading even if the file has no internal payloads."/>
+                              </span>
+                            </td>
+                            <td>
+                              <input
+                                type="checkbox"
+                                aria-label="Mount as payload"
+                                checked={Boolean(node.data.useAsPayload)}
+                                onChange={(e) => update({ useAsPayload: e.target.checked })}
+                              />
+                            </td>
+                          </tr>
+                          <tr>
+                            <td>Up axis</td>
+                            <td>
+                              <select
+                                aria-label="Up axis"
+                                value={node.data.axis}
+                                onChange={(e) => update({ axis: e.target.value })}
+                              >
+                                <option value="preserve">Preserve source</option>
+                                <option value="Y">+Y</option>
+                                <option value="-Y">-Y</option>
+                                <option value="Z">+Z</option>
+                                <option value="-Z">-Z</option>
+                                <option value="X">+X</option>
+                                <option value="-X">-X</option>
+                              </select>
+                            </td>
+                          </tr>
+                          <tr>
+                            <td>Front axis</td>
+                            <td>
+                              <select
+                                aria-label="Front axis"
+                                value={node.data.frontAxis || "preserve"}
+                                onChange={(e) => update({ frontAxis: e.target.value })}
+                              >
+                                <option value="preserve">Preserve source</option>
+                                <option value="Z">+Z</option>
+                                <option value="-Z">-Z</option>
+                                <option value="Y">+Y</option>
+                                <option value="-Y">-Y</option>
+                                <option value="X">+X</option>
+                                <option value="-X">-X</option>
+                              </select>
+                            </td>
+                          </tr>
+                          <tr>
+                            <td>Scale</td>
+                            <td>
+                              <NumberInput
+                                min="0.000001"
+                                step="0.1"
+                                value={node.data.scale}
+                                onChange={(e) => {
+                                  const scale = Number(e.target.value);
+                                  if (Number.isFinite(scale) && scale > 0)
+                                    update({ scale });
+                                }}
+                              />
+                            </td>
+                          </tr>
+                        </tbody>
+                      </table>
                     </>}
                     {node.data.operation === "application" && <NativeProjectPanel projectName={projectName} onConfigure={()=>{setSettingsTarget(v=>({id:node.data.applicationProfileId || "",visit:v.visit+1}));setActiveTab("applications");}} key={node.id} project={projectModel} nodeId={node.id} data={node.data}
-                      onChange={patch => applyProject(editNodeData(projectRef.current, node.id, patch),"Edit node",`field:${node.id}:${Object.keys(patch).join()}`)} onLive={(edited,result)=>{applyProject(recordLiveAdjustment(projectRef.current,node.id,edited,result));setApplicationPreviews(p=>({...p,[node.id]:"published"}));}} onPublished={(edited,result)=>{applyProject(recordPublication(projectRef.current,node.id,edited,result));setApplicationPreviews(p=>({...p,[node.id]:"published"}));}} onBaseline={result=>applyProject(recordManualBaseline(projectRef.current,node.id,result))} onNativeCreated={created=>{const next=recordNativeCreation(projectRef.current,node.id,created);applyProject(next);return next;}} onHandoff={created=>{applyProject(recordHandoff(projectRef.current,node.id,created));setApplicationPreviews(p=>({...p,[node.id]:"handoff"}));}} onStatus={reportStatus}/>}
-
-                    {node.data.operation !== "application" && <div className="pair">
-                      <label>
-                        Up axis
-                        <select
-                          value={node.data.axis}
-                          onChange={(e) => update({ axis: e.target.value })}
-                        >
-                          <option value="preserve">Preserve source</option>
-                          <option value="Y">+Y</option>
-                          <option value="-Y">-Y</option>
-                          <option value="Z">+Z</option>
-                          <option value="-Z">-Z</option>
-                          <option value="X">+X</option>
-                          <option value="-X">-X</option>
-                        </select>
-                      </label>
-                      <label>
-                        Scale
-                        <NumberInput
-                          min="0.000001"
-                          step="0.1"
-                          value={node.data.scale}
-                          onChange={(e) => {
-                            const scale = Number(e.target.value);
-                            if (Number.isFinite(scale) && scale > 0)
-                              update({ scale });
-                          }}
-                        />
-                      </label>
-                    </div>}
+                      onChange={patch => applyProject(editNodeData(projectRef.current, node.id, patch),"Edit node",`field:${node.id}:${Object.keys(patch).join()}`)} onLive={(edited,result)=>{applyProject(recordLiveAdjustment(projectRef.current,node.id,edited,result));setApplicationPreviews(p=>({...p,[node.id]:"published"}));}} onPublished={(edited,result)=>{applyProject(recordPublication(projectRef.current,node.id,edited,result));setApplicationPreviews(p=>({...p,[node.id]:"published"}));}} onBaseline={result=>applyProject(recordManualBaseline(projectRef.current,node.id,result))} onQuickstartCreated={(original,prepared)=>commitQuickstart(node.id,original,prepared)} onNativeCreated={created=>{const next=recordNativeCreation(projectRef.current,node.id,created);applyProject(next);return next;}} onHandoff={created=>{const next=recordHandoff(projectRef.current,node.id,created);applyProject(next);setApplicationPreviews(p=>({...p,[node.id]:"handoff"}));return next;}} onStatus={reportStatus}/>}
 
                     {node.data.operation === "source" && <>
                     <hr />
@@ -1563,20 +2008,64 @@ function Workspace() {
                 })()}
 
                 {node.data.operation === "hair" && (
-                  <HairInspector
-                    value={node.data.hair}
-                    graph={edges.some((e) => e.target === node.id) ? graphPreview(projectModel, node.id) : undefined}
-                    onChange={(hair) => update({ hair })}
-                  />
+                  <Suspense fallback={<p className="hint">Loading hair inspector...</p>}>
+                    <HairInspector
+                      value={node.data.hair}
+                      graph={edges.some((e) => e.target === node.id) ? graphPreview(projectModel, node.id) : undefined}
+                      onChange={(hair) => update({ hair })}
+                    />
+                  </Suspense>
+                )}
+
+                {node.data.operation === "cache_edit" && (
+                  <Suspense fallback={<p className="hint">Loading cache sculptor...</p>}>
+                    <CacheEditInspector
+                      value={node.data.cacheEdit}
+                      project={projectModel}
+                      nodeId={node.id}
+                      currentFrame={viewportFrame}
+                      onJumpToFrame={(f) => setSeekFrameRequest((prev) => ({ frame: f, seq: (prev?.seq ?? 0) + 1 }))}
+                      onChange={(cacheEdit) => update({ cacheEdit })}
+                    />
+                  </Suspense>
+                )}
+
+                {node.data.operation === "character" && (
+                  <Suspense fallback={<p className="hint">Loading character inspector...</p>}>
+                    <CharacterInspector
+                      value={node.data.character}
+                      graph={edges.some((e) => e.target === node.id) ? graphPreview(projectModel, node.id) : null}
+                      dependencies={dependencies}
+                      onChange={(character, nextDeps) => {
+                        if (nextDeps) {
+                          applyProject(
+                            {
+                              ...projectModel,
+                              dependencies: nextDeps,
+                              nodes: projectModel.nodes.map((n) =>
+                                n.id !== node.id ? n : { ...n, data: { ...n.data, character } },
+                              ),
+                            },
+                            "Update Character",
+                          );
+                        } else {
+                          update({ character });
+                        }
+                      }}
+                      onStatus={reportStatus}
+                    />
+                  </Suspense>
                 )}
 
                 {node.data.operation === "blender" && (
-                  <BlenderInspector
-                    project={projectModel}
-                    nodeId={node.id}
-                    onProjectChange={(p) => applyProject(p, "Update Blender node")}
-                    onStatus={reportStatus}
-                  />
+                  <Suspense fallback={<p className="hint">Loading Blender inspector...</p>}>
+                    <BlenderInspector
+                      project={projectModel}
+                      nodeId={node.id}
+                      onProjectChange={(p) => applyProject(p, "Update Blender node")}
+                      onStatus={reportStatus}
+                    />
+                  </Suspense>
                 )}
                 <button
                   className="danger"

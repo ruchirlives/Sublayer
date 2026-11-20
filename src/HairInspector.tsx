@@ -613,12 +613,12 @@ export function HairInspector({ value, graph, onChange }: Props) {
                   <span className="field-label">Collision margin (m)</span>
                   <NumberInput
                     min={0}
-                    max={1}
+                    max={100}
                     step={0.001}
                     value={settings.collisionMargin}
                     onChange={(e) => {
                       const v = Number(e.target.value);
-                      if (Number.isFinite(v)) update({ collisionMargin: Math.max(0, Math.min(1, v)) });
+                      if (Number.isFinite(v)) update({ collisionMargin: Math.max(0, Math.min(100, v)) });
                     }}
                   />
                 </label>

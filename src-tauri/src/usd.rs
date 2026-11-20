@@ -1,8 +1,8 @@
 //! Serialized, persistent OpenUSD worker service shared by desktop and future MCP.
 use serde_json::Value;
 use std::{
-    io::{BufRead, BufReader, Write},
-    process::{Child, ChildStdin, Command, Stdio},
+    io::{BufRead, BufReader, Read, Write},
+    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     sync::{
         Arc, Mutex,
         mpsc::{self, Receiver},
@@ -58,30 +58,163 @@ impl Drop for WorkerJob {
 
 pub type StatusListener = Arc<dyn Fn(Value) + Send + Sync>;
 
+type WorkerResponse = Result<(Value, Option<Vec<u8>>), String>;
+
+fn spawn_stdout_reader(
+    output: ChildStdout,
+    status_listener: Option<StatusListener>,
+    log_prefix: &'static str,
+    invalid_msg: &'static str,
+) -> Receiver<WorkerResponse> {
+    let (sender, responses) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(output);
+        let mut line_buf = Vec::new();
+        loop {
+            line_buf.clear();
+            match reader.read_until(b'\n', &mut line_buf) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e) => {
+                    let _ = sender.send(Err(e.to_string()));
+                    break;
+                }
+            }
+            let line = String::from_utf8_lossy(&line_buf);
+            let trimmed = line.trim_end_matches(&['\r', '\n'][..]);
+            if let Some(payload) = trimmed.strip_prefix("ORCHFLOW_STATUS:") {
+                if let Some(ref cb) = status_listener {
+                    if let Ok(v) = serde_json::from_str::<Value>(payload) {
+                        cb(v);
+                    }
+                }
+            } else if let Some(payload) = trimmed.strip_prefix("ORCHFLOW:") {
+                let parsed: Result<Value, String> =
+                    serde_json::from_str(payload).map_err(|e| format!("{invalid_msg}: {e}"));
+                let msg = match parsed {
+                    Ok(value) => {
+                        let bin_len = value
+                            .get("binaryBytes")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0) as usize;
+                        if bin_len > 0 {
+                            let mut bin_buf = vec![0u8; bin_len];
+                            if let Err(e) = reader.read_exact(&mut bin_buf) {
+                                Err(format!("Failed to read worker binary frame: {e}"))
+                            } else {
+                                Ok((value, Some(bin_buf)))
+                            }
+                        } else {
+                            Ok((value, None))
+                        }
+                    }
+                    Err(e) => Err(e),
+                };
+                if sender.send(msg).is_err() {
+                    break;
+                }
+            } else {
+                eprintln!("{log_prefix}: {trimmed}");
+            }
+        }
+    });
+    responses
+}
+
+fn ensure_worker_script_dir() -> Result<std::path::PathBuf, String> {
+    if let Some(dir) = crate::runtime_setup::find_worker_dir() {
+        if dir.join("usd_worker.py").is_file() {
+            return Ok(dir);
+        }
+    }
+    let files: [(&str, &str); 11] = [
+        (
+            "geometry_exports.py",
+            include_str!("../../worker/geometry_exports.py"),
+        ),
+        (
+            "procedural_mtlx.py",
+            include_str!("../../worker/procedural_mtlx.py"),
+        ),
+        (
+            "hair_colliders.py",
+            include_str!("../../worker/hair_colliders.py"),
+        ),
+        (
+            "cloth_kernels.py",
+            include_str!("../../worker/cloth_kernels.py"),
+        ),
+        (
+            "cloth_proxy.py",
+            include_str!("../../worker/cloth_proxy.py"),
+        ),
+        ("cache_edit.py", include_str!("../../worker/cache_edit.py")),
+        ("usd_graph.py", include_str!("../../worker/usd_graph.py")),
+        (
+            "usd_publish.py",
+            include_str!("../../worker/usd_publish.py"),
+        ),
+        (
+            "material_preview.py",
+            include_str!("../../worker/material_preview.py"),
+        ),
+        (
+            "viewport_bounds.py",
+            include_str!("../../worker/viewport_bounds.py"),
+        ),
+        ("usd_worker.py", include_str!("../../worker/usd_worker.py")),
+    ];
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for (name, content) in &files {
+        for &b in name.as_bytes().iter().chain(content.as_bytes().iter()) {
+            hash ^= u64::from(b);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    let base = crate::runtime_setup::runtimes_root()
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(std::env::temp_dir);
+    let cache_dir = base.join("worker_cache").join(format!("{hash:016x}"));
+    if !cache_dir.join("usd_worker.py").is_file() {
+        std::fs::create_dir_all(&cache_dir).map_err(|e| e.to_string())?;
+        for (name, content) in &files {
+            std::fs::write(cache_dir.join(name), content).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(cache_dir)
+}
+
 struct Worker {
     child: Child,
     _scratch: Option<tempfile::TempDir>,
     #[cfg(windows)]
     job: WorkerJob,
     input: ChildStdin,
-    responses: Receiver<Result<Value, String>>,
+    responses: Receiver<WorkerResponse>,
 }
 impl Worker {
     fn start(status_listener: Option<StatusListener>) -> Result<Self, String> {
-        let python = std::env::var("ORCHFLOW_PYTHON").unwrap_or_else(|_| "python".into());
+        let python = crate::runtime_setup::find_imaging_python()
+            .unwrap_or_else(|| std::path::PathBuf::from("python"));
+        let script_dir = ensure_worker_script_dir()?;
+        let worker_script = script_dir.join("usd_worker.py");
         let mut command = Command::new(python);
-        if let Some(worker_dir) = find_ovrtx_worker_script().parent() {
-            if worker_dir.exists() {
-                command.env("ORCHFLOW_WORKER_DIR", worker_dir);
+        command.env("ORCHFLOW_WORKER_DIR", &script_dir);
+        if std::env::var_os("ORCHFLOW_USD_ROOT").is_none() {
+            if let Some(usd_root) = crate::runtime_setup::find_usd_root() {
+                command.env("ORCHFLOW_USD_ROOT", usd_root);
+            }
+        }
+        if std::env::var_os("ORCHFLOW_AURORA_ROOT").is_none() {
+            if let Some(aurora_root) = crate::runtime_setup::find_aurora_root() {
+                command.env("ORCHFLOW_AURORA_ROOT", aurora_root);
             }
         }
         command
-            .args([
-                "-u",
-                "-c",
-                "import sys,json; exec(compile(json.loads(sys.stdin.readline()), '<orchflow-worker>', 'exec'))",
-                "--serve",
-            ])
+            .arg("-u")
+            .arg(&worker_script)
+            .arg("--serve")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
@@ -98,55 +231,10 @@ impl Worker {
             let _ = child.kill();
             let _ = child.wait();
         })?;
-        let mut input = child.stdin.take().ok_or("Worker stdin unavailable")?;
-        let script = format!(
-            "{}\n{}\n{}\n{}\n{}\n{}\n{}",
-            include_str!("../../worker/geometry_exports.py"),
-            include_str!("../../worker/procedural_mtlx.py"),
-            include_str!("../../worker/usd_graph.py"),
-            include_str!("../../worker/usd_publish.py"),
-            include_str!("../../worker/material_preview.py"),
-            include_str!("../../worker/viewport_bounds.py"),
-            include_str!("../../worker/usd_worker.py")
-        );
-        serde_json::to_writer(&mut input, &script).map_err(|e| e.to_string())?;
-        input
-            .write_all(b"\n")
-            .and_then(|_| input.flush())
-            .map_err(|e| e.to_string())?;
+        let input = child.stdin.take().ok_or("Worker stdin unavailable")?;
         let output = child.stdout.take().ok_or("Worker stdout unavailable")?;
-        let (sender, responses) = mpsc::sync_channel(1);
-        let listener = status_listener.clone();
-        std::thread::spawn(move || {
-            for line in BufReader::new(output).lines() {
-                let line = match line {
-                    Ok(line) => line,
-                    Err(e) => {
-                        let _ = sender.send(Err(e.to_string()));
-                        break;
-                    }
-                };
-                if let Some(payload) = line.strip_prefix("ORCHFLOW_STATUS:") {
-                    if let Some(ref cb) = listener {
-                        if let Ok(v) = serde_json::from_str::<Value>(payload) {
-                            cb(v);
-                        }
-                    }
-                } else if let Some(payload) = line.strip_prefix("ORCHFLOW:") {
-                    if sender
-                        .send(
-                            serde_json::from_str(payload)
-                                .map_err(|e| format!("Invalid worker response: {e}")),
-                        )
-                        .is_err()
-                    {
-                        break;
-                    }
-                } else {
-                    eprintln!("USD: {line}");
-                }
-            }
-        });
+        let responses =
+            spawn_stdout_reader(output, status_listener, "USD", "Invalid worker response");
         Ok(Self {
             child,
             _scratch: None,
@@ -158,13 +246,11 @@ impl Worker {
     }
     fn start_ovrtx(status_listener: Option<StatusListener>) -> Result<Self, String> {
         let python = find_ovrtx_python().ok_or_else(|| {
-            "Cannot find Omniverse RTX Python executable. Ensure .venv-ovrtx is created."
+            "Cannot find Omniverse RTX Python executable. Run Sublayer Runtime Setup or scripts/setup-ovrtx.ps1."
                 .to_string()
         })?;
         let script = find_ovrtx_worker_script();
-        let runtime = std::env::var_os("ORCHFLOW_OVRTX_ROOT")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| "I:/AI/OrchFlow-renderers/ovrtx".into());
+        let runtime = crate::runtime_setup::find_ovrtx_root();
         let scratch_root = runtime.join("scratch");
         let scratch = std::fs::create_dir_all(&scratch_root)
             .and_then(|_| {
@@ -185,6 +271,7 @@ impl Worker {
             }
         }
         command
+            .env("ORCHFLOW_OVRTX_ROOT", &runtime)
             .env("ORCHFLOW_OVRTX_SCRATCH", scratch.path())
             .arg("-u")
             .arg(script)
@@ -207,38 +294,12 @@ impl Worker {
         })?;
         let input = child.stdin.take().ok_or("Worker stdin unavailable")?;
         let output = child.stdout.take().ok_or("Worker stdout unavailable")?;
-        let (sender, responses) = mpsc::sync_channel(1);
-        let listener = status_listener.clone();
-        std::thread::spawn(move || {
-            for line in BufReader::new(output).lines() {
-                let line = match line {
-                    Ok(line) => line,
-                    Err(e) => {
-                        let _ = sender.send(Err(e.to_string()));
-                        break;
-                    }
-                };
-                if let Some(payload) = line.strip_prefix("ORCHFLOW_STATUS:") {
-                    if let Some(ref cb) = listener {
-                        if let Ok(v) = serde_json::from_str::<Value>(payload) {
-                            cb(v);
-                        }
-                    }
-                } else if let Some(payload) = line.strip_prefix("ORCHFLOW:") {
-                    if sender
-                        .send(
-                            serde_json::from_str(payload)
-                                .map_err(|e| format!("Invalid ovrtx worker response: {e}")),
-                        )
-                        .is_err()
-                    {
-                        break;
-                    }
-                } else {
-                    eprintln!("OVRTX: {line}");
-                }
-            }
-        });
+        let responses = spawn_stdout_reader(
+            output,
+            status_listener,
+            "OVRTX",
+            "Invalid ovrtx worker response",
+        );
         Ok(Self {
             child,
             _scratch: Some(scratch),
@@ -248,7 +309,7 @@ impl Worker {
             responses,
         })
     }
-    fn request(&mut self, request: &Value) -> Result<Value, String> {
+    fn request(&mut self, request: &Value) -> WorkerResponse {
         serde_json::to_writer(&mut self.input, request).map_err(|e| e.to_string())?;
         self.input
             .write_all(b"\n")
@@ -293,52 +354,15 @@ impl Drop for Worker {
 }
 
 fn find_ovrtx_python() -> Option<std::path::PathBuf> {
-    if let Ok(var) = std::env::var("ORCHFLOW_OVRTX_PYTHON") {
-        let p = std::path::PathBuf::from(var);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    let candidates = [
-        "e:/CODINGPROJECTS/Rust/Sublayer/.venv-ovrtx/Scripts/python.exe",
-        "e:/CODINGPROJECTS/Rust/OrchFlow/.venv-ovrtx/Scripts/python.exe",
-        ".venv-ovrtx/Scripts/python.exe",
-    ];
-    for c in &candidates {
-        let p = std::path::PathBuf::from(c);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            let p1 = parent.join(".venv-ovrtx/Scripts/python.exe");
-            if p1.exists() {
-                return Some(p1);
-            }
-        }
-    }
-    None
+    crate::runtime_setup::find_ovrtx_python()
 }
 
 fn find_ovrtx_worker_script() -> std::path::PathBuf {
-    let candidates = [
-        "e:/CODINGPROJECTS/Rust/Sublayer/worker/ovrtx_worker.py",
-        "e:/CODINGPROJECTS/Rust/OrchFlow/worker/ovrtx_worker.py",
-        "worker/ovrtx_worker.py",
-    ];
-    for c in &candidates {
-        let p = std::path::PathBuf::from(c);
-        if p.exists() {
-            return p;
-        }
-    }
-    std::path::PathBuf::from("worker/ovrtx_worker.py")
+    crate::runtime_setup::find_ovrtx_worker_script()
 }
 
 fn is_ovrtx_available() -> bool {
-    std::path::Path::new("I:/AI/OrchFlow-renderers/ovrtx/runtime.json").exists()
-        && find_ovrtx_python().is_some()
+    crate::runtime_setup::is_ovrtx_available()
 }
 
 struct RtxWorker {
@@ -348,6 +372,7 @@ struct RtxWorker {
 
 #[derive(Default)]
 pub struct UsdService {
+    inspection_worker: Mutex<Option<Worker>>,
     worker: Mutex<Option<Worker>>,
     ovrtx_worker: Mutex<Option<RtxWorker>>,
     status_listener: Mutex<Option<StatusListener>>,
@@ -361,7 +386,79 @@ impl UsdService {
             *slot = Some(Arc::new(listener));
         }
     }
+    pub fn warm(&self) -> Result<(), String> {
+        let mut slot = self.inspection_worker.lock().map_err(|e| e.to_string())?;
+        if slot.is_none() {
+            let listener = self.status_listener.lock().ok().and_then(|s| s.clone());
+            *slot = Some(Worker::start(listener)?);
+        }
+        Ok(())
+    }
     pub fn request(&self, request: Value) -> Result<Value, String> {
+        let (value, _) = self.request_inner(request)?;
+        Ok(value)
+    }
+    pub fn request_binary(&self, mut request: Value) -> Result<(Value, Vec<u8>), String> {
+        if let Some(obj) = request.as_object_mut() {
+            obj.insert("binaryFrame".into(), Value::Bool(true));
+        }
+        let (value, bin) = self.request_inner(request)?;
+        Ok((value, bin.unwrap_or_default()))
+    }
+    fn send_to_slot(
+        slot: &Mutex<Option<Worker>>,
+        status_listener: &Mutex<Option<StatusListener>>,
+        request: &Value,
+        is_capabilities: bool,
+    ) -> WorkerResponse {
+        let mut guard = slot.lock().map_err(|e| e.to_string())?;
+        if guard.is_none() {
+            let listener = status_listener.lock().ok().and_then(|s| s.clone());
+            *guard = Some(Worker::start(listener)?);
+        }
+        let started = Instant::now();
+        let response = guard.as_mut().unwrap().request(request);
+        match response {
+            Ok((mut value, bin)) => {
+                if let Some(error) = value.get("error").and_then(Value::as_str) {
+                    return Err(error.to_string());
+                }
+                if is_capabilities && is_ovrtx_available() {
+                    if let Some(obj) = value.as_object_mut() {
+                        if let Some(renderers) =
+                            obj.get_mut("renderers").and_then(Value::as_array_mut)
+                        {
+                            renderers.push(serde_json::json!({
+                                "id": "OmniverseRTX",
+                                "name": "Omniverse RTX (NVIDIA ovrtx)"
+                            }));
+                        }
+                        obj.insert(
+                            "ovrtxRuntime".into(),
+                            serde_json::json!({
+                                "installed": true,
+                                "available": true,
+                                "message": "NVIDIA Omniverse RTX standalone viewport path tracing active"
+                            }),
+                        );
+                    }
+                }
+                if let Some(object) = value.as_object_mut() {
+                    object.insert(
+                        "roundTripMs".into(),
+                        Value::from(started.elapsed().as_secs_f64() * 1000.0),
+                    );
+                }
+                Ok((value, bin))
+            }
+            Err(e) => {
+                *guard = None;
+                Err(e)
+            }
+        }
+    }
+    fn request_inner(&self, request: Value) -> WorkerResponse {
+        let op = request.get("operation").and_then(Value::as_str);
         if ![
             Some("capabilities"),
             Some("inspect"),
@@ -380,21 +477,23 @@ impl UsdService {
             Some("reconcile_upstream"),
             Some("materialx_document"),
             Some("materialx_rule_matches"),
+            Some("asset_override_inputs"),
             Some("inspect_stage_materials"),
             Some("inspect_stage_lights"),
             Some("inspect_stage_curves"),
+            Some("inspect_stage_skeletons"),
+            Some("export_character_body"),
             Some("reset_hair"),
             Some("convert_source_to_usd"),
         ]
-        .contains(&request.get("operation").and_then(Value::as_str))
+        .contains(&op)
         {
             return Err("Unsupported USD operation".into());
         }
 
-        let is_render = request.get("operation").and_then(Value::as_str) == Some("render");
-        let is_scene_children =
-            request.get("operation").and_then(Value::as_str) == Some("scene_children");
-        let is_reset_hair = request.get("operation").and_then(Value::as_str) == Some("reset_hair");
+        let is_render = op == Some("render");
+        let is_scene_children = op == Some("scene_children");
+        let is_reset_hair = op == Some("reset_hair");
         if is_reset_hair {
             if let Ok(mut hydra) = self.worker.lock() {
                 if let Some(w) = hydra.as_mut() {
@@ -403,28 +502,38 @@ impl UsdService {
             }
             if let Ok(mut rtx) = self.ovrtx_worker.lock() {
                 if let Some(w) = rtx.as_mut() {
-                    if let Ok(resp) = w.worker.request(&request) {
-                        return Ok(resp);
+                    if let Ok((resp, _)) = w.worker.request(&request) {
+                        return Ok((resp, None));
                     }
                 }
             }
-            return Ok(serde_json::json!({"reset": true}));
+            return Ok((serde_json::json!({"reset": true}), None));
         }
 
-        let is_clear = request.get("operation").and_then(Value::as_str) == Some("clear_scene");
+        let is_clear = op == Some("clear_scene");
         if is_clear {
+            if let Ok(mut insp) = self.inspection_worker.lock() {
+                if let Some(w) = insp.as_mut() {
+                    if w.request(&request).is_err() {
+                        *insp = None;
+                    }
+                }
+            }
             {
                 let mut hydra = self.worker.lock().map_err(|e| e.to_string())?;
                 *hydra = None;
             }
             let mut rtx = self.ovrtx_worker.lock().map_err(|e| e.to_string())?;
             if let Some(w) = rtx.as_mut() {
-                if let Some(resp) = w.worker.request(&request).ok() {
-                    return Ok(resp);
+                if let Ok((resp, _)) = w.worker.request(&request) {
+                    return Ok((resp, None));
                 }
             }
             *rtx = None;
-            return Ok(serde_json::json!({"cleared": true, "cachedScenes": 0}));
+            return Ok((
+                serde_json::json!({"cleared": true, "cachedScenes": 0}),
+                None,
+            ));
         }
 
         if is_scene_children {
@@ -432,7 +541,7 @@ impl UsdService {
             if let Some(active) = rtx.as_mut() {
                 let started = Instant::now();
                 return match active.worker.request(&request) {
-                    Ok(mut value) => {
+                    Ok((mut value, bin)) => {
                         if let Some(error) = value.get("error").and_then(Value::as_str) {
                             return Err(error.to_string());
                         }
@@ -442,7 +551,7 @@ impl UsdService {
                                 Value::from(started.elapsed().as_secs_f64() * 1000.0),
                             );
                         }
-                        Ok(value)
+                        Ok((value, bin))
                     }
                     Err(e) => {
                         *rtx = None;
@@ -458,7 +567,7 @@ impl UsdService {
         if is_ovrtx {
             // Release the isolated Hydra/Storm renderer before starting Omniverse RTX.
             // Keeping its OpenGL FBO, textures and buffers alive in GPU VRAM competes
-            // with RTX path tracing on large scenes.
+            // with RTX path tracing on large scenes. Keep `inspection_worker` alive.
             {
                 let mut hydra = self.worker.lock().map_err(|e| e.to_string())?;
                 *hydra = None;
@@ -481,12 +590,6 @@ impl UsdService {
                 }
             ]);
             let started = Instant::now();
-            let mode_changed = slot
-                .as_ref()
-                .is_some_and(|active| active.scene_key.get(5) != scene_key.get(5));
-            if mode_changed {
-                *slot = None;
-            }
             if slot.is_none() {
                 let listener = self.status_listener.lock().ok().and_then(|s| s.clone());
                 *slot = Some(RtxWorker {
@@ -498,10 +601,13 @@ impl UsdService {
             }
             let response = slot.as_mut().unwrap().worker.request(&request);
             return match response {
-                Ok(mut value) => {
+                Ok((mut value, bin)) => {
                     if let Some(error) = value.get("error").and_then(Value::as_str) {
                         let message = error.to_string();
-                        *slot = None;
+                        eprintln!("OVRTX error: {message}");
+                        if message.contains("stalled") || message.contains("CUDA") {
+                            *slot = None;
+                        }
                         return Err(message);
                     }
                     if let Some(object) = value.as_object_mut() {
@@ -510,13 +616,27 @@ impl UsdService {
                             Value::from(started.elapsed().as_secs_f64() * 1000.0),
                         );
                     }
-                    Ok(value)
+                    Ok((value, bin))
                 }
                 Err(e) => {
+                    eprintln!("OVRTX worker IPC error (restarting): {e}");
                     *slot = None;
                     Err(e)
                 }
             };
+        }
+
+        // Non-GL USD inspection, dependency discovery, MaterialX & publication
+        // operations run on `inspection_worker` so they never block behind renders
+        // or get killed when switching to Omniverse RTX.
+        let is_inspection_op = !matches!(op, Some("render" | "capabilities"));
+        if is_inspection_op {
+            return Self::send_to_slot(
+                &self.inspection_worker,
+                &self.status_listener,
+                &request,
+                false,
+            );
         }
 
         // Release the isolated RTX renderer before returning to Hydra. Keeping
@@ -525,55 +645,17 @@ impl UsdService {
             let mut rtx = self.ovrtx_worker.lock().map_err(|e| e.to_string())?;
             *rtx = None;
         }
-        let mut slot = self.worker.lock().map_err(|e| e.to_string())?;
-        if slot.is_none() {
-            let listener = self.status_listener.lock().ok().and_then(|s| s.clone());
-            *slot = Some(Worker::start(listener)?);
-        }
-        let started = Instant::now();
-        let response = slot.as_mut().unwrap().request(&request);
-        match response {
-            Ok(mut value) => {
-                if let Some(error) = value.get("error").and_then(Value::as_str) {
-                    return Err(error.to_string());
-                }
-                if request.get("operation").and_then(Value::as_str) == Some("capabilities") {
-                    if is_ovrtx_available() {
-                        if let Some(obj) = value.as_object_mut() {
-                            if let Some(renderers) =
-                                obj.get_mut("renderers").and_then(Value::as_array_mut)
-                            {
-                                renderers.push(serde_json::json!({
-                                    "id": "OmniverseRTX",
-                                    "name": "Omniverse RTX (NVIDIA ovrtx)"
-                                }));
-                            }
-                            obj.insert(
-                                "ovrtxRuntime".into(),
-                                serde_json::json!({
-                                    "installed": true,
-                                    "available": true,
-                                    "message": "NVIDIA Omniverse RTX standalone viewport path tracing active"
-                                }),
-                            );
-                        }
-                    }
-                }
-                if let Some(object) = value.as_object_mut() {
-                    object.insert(
-                        "roundTripMs".into(),
-                        Value::from(started.elapsed().as_secs_f64() * 1000.0),
-                    );
-                }
-                Ok(value)
-            }
-            Err(e) => {
-                *slot = None;
-                Err(e)
-            }
-        }
+        Self::send_to_slot(
+            &self.worker,
+            &self.status_listener,
+            &request,
+            op == Some("capabilities"),
+        )
     }
     pub fn shutdown(&self) {
+        if let Ok(mut insp) = self.inspection_worker.lock() {
+            *insp = None;
+        }
         if let Ok(mut worker) = self.worker.lock() {
             *worker = None;
         }
@@ -682,6 +764,44 @@ mod tests {
         );
         service.shutdown();
         assert!(service.worker.lock().unwrap().is_none());
+        assert!(service.inspection_worker.lock().unwrap().is_none());
+    }
+
+    #[test]
+    #[ignore = "requires ORCHFLOW_PYTHON and ORCHFLOW_USD_ROOT with a real GPU"]
+    fn real_worker_binary_frame_transport() {
+        let service = UsdService::default();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../samples/layered.usda");
+        let (png_meta, png_bytes) = service
+            .request_binary(serde_json::json!({
+                "operation": "render",
+                "path": path,
+                "renderer": "HdStormRendererPlugin",
+                "width": 320,
+                "height": 240,
+                "interactive": false
+            }))
+            .unwrap();
+        assert!(png_meta.get("image").is_none());
+        assert_eq!(png_meta["encoding"], "png");
+        assert_eq!(png_meta["binaryBytes"], png_bytes.len());
+        assert!(png_bytes.starts_with(b"\x89PNG"));
+
+        let (jpg_meta, jpg_bytes) = service
+            .request_binary(serde_json::json!({
+                "operation": "render",
+                "path": path,
+                "renderer": "HdStormRendererPlugin",
+                "width": 320,
+                "height": 240,
+                "interactive": true
+            }))
+            .unwrap();
+        assert!(jpg_meta.get("image").is_none());
+        assert_eq!(jpg_meta["encoding"], "jpeg");
+        assert_eq!(jpg_meta["binaryBytes"], jpg_bytes.len());
+        assert!(jpg_bytes.starts_with(b"\xff\xd8\xff"));
+        service.shutdown();
     }
 
     #[test]

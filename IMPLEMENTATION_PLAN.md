@@ -1013,6 +1013,8 @@ A single-file handoff simplifies storage; it is not itself an evaluation-speed o
 
 ## Binary USD for geometry-bearing disk exports - 2026-11-10
 
+- [x] Treat the empty asset path reported by OpenUSD 25.08 for same-file prototype references as internal to the snapshot. Preserve the external-dependency guard and validate that the reopened snapshot uses only its root and session layers. Verified headlessly with instanced geometry, branch-local asset overrides, and skeletal handoffs. Blender Quickstart still requires manual verification.
+
 - [x] Handoff and final scene export share a writer that explicitly produces Crate binary for .usd and .usdc destinations, independent of USD_DEFAULT_FILE_FORMAT. Verify the staged binary encoding before installation; preserve the single-file snapshot, coordinate and composition checks. Keep .usda as an explicit text/debugging option.
 - [x] Offer binary USD first in handoff/final save dialogs, retain the project/node handoff naming convention with .usd, and default final export to final.usd. Existing ASCII and binary inputs remain readable; handoff reuse also accepts .usdc.
 - [x] Recommend binary .usdc or binary-encoded .usd for manually exported baseline/edited files, with identical exporter settings. Do not rewrite immutable baselines or user-owned exports. In-memory evaluation and the current project-JSON adjustment representation are unchanged.
@@ -1447,6 +1449,19 @@ NVIDIA viewport exposes Real-Time Path Tracing and Path Tracing. The mode is par
 - [x] Updated `src/App.tsx` file browser filters, Source inspector label, `Convert to USD...` action, and `rescanUsdDependencies` (skipping non-USD source files).
 - [x] Verified with `worker/test_goz_source.py` (2 passed), `npm run build` (passed), and `cargo fmt --check` (passed). Real `.goz` file loading and desktop viewport rendering remain with the user for manual verification.
 
+## Viewport transform anchor continuity — 2026-11-15
+
+- [x] Project the gizmo relative to the anchor translation carried by the displayed frame. Both renderers settle the anchor at the new world position after a drag, including when an orbit request supersedes the release frame. Rebase queued camera input when settling adjusts pan and zoom.
+- [x] Verified consecutive drags and orbit with real headless Storm and NVIDIA RTX renders, including restoration of the previous anchor in a replacement RTX worker. Frontend build and Python syntax checks passed.
+- [x] Route viewport picks through the render queue so a pick that settles a drag also applies its camera correction. Project the gizmo using the displayed frame's camera and the shared orbit anchor. A local MCP test picked the translated mesh, set the picked world point as the pivot, orbited, and verified the next translation moved that pivot once in both renderers.
+- [x] Update the shared anchor during interactive renders and track the active Transform by ID when a downstream preview is pinned. Verified through local MCP that both renderers moved the anchor during interactive frames with Output as the evaluation target, preserved the picked pivot through orbit, and applied the next drag's translation once.
+- [x] Hide viewport render progress and performance details during gizmo drags. The frontend build and render queue tests passed.
+- [x] Enable pointer events on the viewport Time and playback range drag handles. Frontend build passed. Desktop drag verification remains with the user.
+- [x] Preserve in-progress numeric text and the caret in inspector fields while applying valid values to the model. Frontend build passed. Desktop verification of small decimal edits remains with the user.
+- [x] Wrap viewport and timeline controls within the available canvas width. Frontend build passed. Narrow-window desktop verification remains with the user.
+- [x] Storm retains the stage and Hydra engine for transform-only edits through single-input Output or Camera previews. It updates the matrix in the Transform's anonymous USD layer. Verified updated rendered pixels and composed world coordinates, including a return to identity, with the same stage and engine. On the simple 800 × 450 pinned-Output benchmark, median worker drag time went from 31.3 ms to 6.3 ms and graph compiles went from 20 to zero across 20 warm frames. Desktop input-to-display timing remains unverified.
+- [ ] Desktop verification remains with the user: translate twice and orbit immediately after release in each renderer.
+
 ## Hair Node GPU Physics Simulation (NVIDIA Warp) — 2026-11-14
 
 - [x] Added encapsulated GPU hair strand simulation in `worker/hair_sim.py` using NVIDIA Warp (`warp-lang` + `numpy` installed on `I:\AI\OrchFlow-packages\py312` and loaded lazily only when `simEnabled` is true).
@@ -1456,3 +1471,194 @@ NVIDIA viewport exposes Real-Time Path Tracing and Path Tracing. The mode is par
 - [x] Added viewport timeline playback controls (`⏮`, `◀`, `▶`/`⏸`, `▶|`, scrubber, `Time`, start/end range, `Loop`) in `src/NativeViewport.tsx` that advance frames only after each render completes.
 - [x] Vectorized NumPy/OpenUSD array conversion (`Vt.Vec3fArray.FromNumpy`), merged AABB-culled collider `wp.Mesh` BVH, and defaulted `colliderQuery` to `__none__`; verified 48-frame simulation of `MikoCharacter` (12,600 strands / 259,080 vertices) in ~2.29s–2.79s and end-to-end `usd_worker.py` Storm render in 5.17s.
 - [x] Verified with `worker/test_hair_sim.py` (3 passed on `cuda:0` NVIDIA GeForce RTX 3090), `npm run build` (passed), and `cargo fmt --check` (passed). Desktop viewport playback in the restarted app remains with the user.
+
+
+## Blender Quickstart automatic baseline — 2026-11-15
+
+- [x] Prepare & Open in Blender discloses the handoff USD and `<name>.baseline.usdc` beside the chosen `.blend`. The background adapter exports from the freshly imported scene, validates the standalone USD and its coordinates and handoff identities, fingerprints it, and checks that the staged native project reopens before installing the pair. Existing destinations require individual replacement authorization. The adapter retains backups and rolls back a partial install.
+- [x] Register the validated pair using the existing native import record, with frozen conversion, dependency revisions and exporter settings. Apply Edits exposes a Blender command using the captured settings. The separate Create Blender project action still uses the manual baseline workflow.
+- [x] Verified the frontend production build, Rust formatting and unit tests, and headless OpenUSD fixtures for identity and coordinate validation, collision handling, rollback and backup retention. Existing frontend and publication test failures also occurred in the untouched checkout.
+- [ ] Verify with a real stage and the configured Blender 5.3 installation. Run Quickstart, confirm the linked baseline, export a small edit with the recorded settings, and review it in Sublayer.
+
+## Blender Quickstart rerun — 2026-11-15
+
+- [x] Show Rerun Quickstart when the Blender Application node has a handoff or native link. Use a fresh destination for linked artifacts. Confirm replacement of eligible unlinked outputs using the existing file-write guards.
+- [x] Stage the new handoff and native preparation privately. Commit all three new links together after baseline capture succeeds. Retain previous files and dependency entries, preserve downstream output, and keep the link change in session undo history.
+- [x] Frontend production build, Rust formatting and 32 Rust tests passed. Focused frontend and backend rerun tests verified staged link replacement and protected destinations. The frontend suite retains four previously reproduced failures.
+- [ ] In the desktop app, rerun an already prepared Blender node to a new destination and verify that it opens the fresh project with the captured baseline. Verify that cancellation or preparation failure leaves the original links active.
+
+## Performance Optimizations & Clarisse-Scale Scene Architecture — 2026-11-16
+
+- [x] **Loading, interaction, and binary transport optimizations**:
+  - Split heavy frontend panels (`DependencyTable`, `HairInspector`, `BlenderInspector`, `MaterialXPanel`, `react-vendor`, `xyflow`) into async/manual chunks in `vite.config.ts`.
+  - Fixed `RenderQueue` frame dropping during interactive motion and added in-memory stage/bounds caching across `worker/usd_worker.py` and `worker/ovrtx_worker.py`, plus binary PNG/JPEG frame transport (`src-tauri/src/usd.rs`, `src-tauri/src/lib.rs`, `src/NativeViewport.tsx`).
+- [x] **Step 1 — Prototype-aware USD traversal**:
+  - Added `iter_scene_and_prototype_prims` in `worker/material_preview.py` and `worker/usd_worker.py` so scene/material inspection walks prototypes and non-instanced prims without redundantly traversing every instance proxy.
+- [x] **Step 2 — Viewport Purpose & Complexity controls**:
+  - Added `Purpose` (`render` / `proxy` / `both`) and `Complexity` (`low` / `medium` / `high`) controls in `src/NativeViewport.tsx` and `worker/usd_worker.py` for lightweight proxy and tessellation previews.
+- [x] **Step 3 — `Scatter` (`UsdGeom.PointInstancer`) node**:
+  - Added `Scatter` node (`operation: "scatter"`) across `src-tauri/src/project.rs` (`ScatterSettings`), `src/fileRegistry.ts`, `src/graphInsertion.ts`, `src/App.tsx`, and `worker/usd_graph.py` (`apply_scatter`) with `random`, `grid`, and `circle` distributions, seed, area bounds, scale min/max, random yaw, and `passThrough` (retaining upstream USD prims alongside `/Scene/Scatter`).
+  - Fixed `Vt.QuathArray.FromNumpy` quaternion layout (`(imag_x, imag_y, imag_z, real_w)`) so scattered instances preserve stage up-axis orientation.
+- [x] **Step 4 — Surface-aware `Scatter` & spacing/slope masking**:
+  - Added `surface` distribution mode to `Scatter` with optional `surfacePrimPath` (or automatic last-input surface when 2+ inputs are connected), area-weighted triangle sampling (`_sample_surface_points` respecting `leftHanded` mesh orientation and world transforms), `alignToNormal`, `maxSlopeDeg` filtering, and 3D spatial-hash `minSpacing` rejection (`_filter_min_spacing`).
+- [x] **Scatter prototype prim table & input prim picker**:
+  - Added `prototypes` (`ScatterPrototypeRule[]`: `id`, `enabled`, `primPath`) to `ScatterSettings` across `src-tauri/src/project.rs`, `src/fileRegistry.ts`, `src/ScatterInspector.tsx`, and `worker/usd_graph.py` (`apply_scatter` / `_resolve_scatter_prototype_prim`).
+  - `ScatterInspector` provides a table-based CRUD list (`+ Add`, toggle `On`, edit `Prim Path`, remove `✕`) and a `Select from input…` modal prim browser querying `scene_children` on the node's upstream graph (`graphPreview(project, nodeId, true)`).
+  - `apply_scatter` references each enabled prototype prim (rejecting missing or instance-proxy prims) and picks a random prototype index per scatter instance (`rng.integers(0, len(proto_paths), ...)`), falling back to whole connected inputs when the prototype table is empty.
+- [x] **Group (`UsdGeom.Xform`) node**:
+  - Added `Group` node (`operation: "group"`) across `src-tauri/src/project.rs`, `src-tauri/src/application.rs`, `src/fileRegistry.ts`, `src/graphInsertion.ts`, `src/GroupInspector.tsx`, `src/App.tsx`, and `worker/usd_graph.py`.
+  - Wraps all connected upstream inputs under a named `UsdGeom.Xform` at `/Scene/<GroupName>` with `translation`, `rotation`, and `scale` authored directly on the group `Xform` prim so grouped assemblies can be positioned and selected as a single prototype in `Scatter`.
+- [x] **Step 5 — Lazy USD Payloads & Viewport Draw Mode (`Shaded` / `Wireframe` / `Points` / `Bounds`)**:
+  - Added `loadPayloads` (`bool`, default `true`) to `NodeData` (`src-tauri/src/project.rs`, `src/fileRegistry.ts`, `src/App.tsx`). When unchecked on a `Source` node, `_open_source_stage` and `wrap_source_stage` open with `Usd.Stage.LoadNone` (keyed separately in `_SOURCE_STAGE_CACHE` / `_MULTI_ROOT_CACHE`) so heavy payloaded sub-assemblies stay unloaded until enabled.
+  - Added `Draw` mode selector (`Shaded`, `Wireframe`, `Points`, `Bounds`) to `src/NativeViewport.tsx` and `worker/usd_worker.py`, wiring `UsdImagingGL.DrawMode` (`DRAW_SHADED_SMOOTH`, `DRAW_WIREFRAME`, `DRAW_POINTS`) and session-layer `UsdGeom.ModelAPI` `bounds` draw mode.
+- [x] **Verification**:
+  - `npm run build` (`tsc && vite build`), `cargo fmt --manifest-path src-tauri/Cargo.toml --check`, `cargo test --manifest-path src-tauri/Cargo.toml --target-dir I:/AI/OrchFlow-build project::tests` (17 passed in `tauri_app_lib` and `orchflow_mcp`), and Python unit tests (`worker/test_worker.py`, `worker/test_assets.py`, `worker/test_selective_materials.py`: 16 passed) passed.
+- [ ] **Remaining manual/desktop verification**: Rebuild/restart the desktop app (`.\scripts\build.ps1`) and verify `Scatter` `passThrough`, `surface` scattering, `loadPayloads` toggling, and viewport `Draw` modes (`Shaded` / `Wireframe` / `Points` / `Bounds`) in the live viewport.
+
+## Hair comb root masking
+
+- [x] Comb and Surface Comb exclude camera-backfacing roots before picking stroke depth and strands. The mask uses the nearest collider face normal when available and the first nondegenerate root segment otherwise. Root eligibility stays fixed through the stroke.
+- [x] Six hair worker tests passed on the RTX 3090, including overlapping roots with and without a collider. The frontend and desktop builds and Rust formatting check passed. Rust library tests recorded 31 passes, four ignored tests and one failure in Blender executable discovery.
+- [ ] Verify both comb brushes on a groom in the desktop viewport. Orbit to the other side and start a new stroke to check that root eligibility follows the view.
+
+## Hair groom persistence across node changes
+
+- [x] Queue the final brush sample and commit against the originating Hair node before rendering a new preview. Apply returned groom deltas to that node's project data even when the old preview image is discarded.
+- [x] Verified queued commits across preview changes and empty previews. Seven hair worker tests passed on the RTX 3090, including recomposition from saved deltas after switching to Source, Output and back to Hair. Frontend build and Rust formatting passed. An existing viewport resolution assertion still fails, and the Rust run excluded Blender executable discovery.
+- [ ] In the desktop app, finish a stroke, immediately select another node, then return to the Hair node and verify the stroke is still present.
+
+## Avoid scene recompilation after a live groom commit
+
+- [x] Storm and Omniverse RTX keep the live stage when the project sends back the exact groom just committed on the previewed static Hair node. Keep brush opinions in private session layers. Undo, redo, upstream changes and other revisions use normal evaluation when their graph differs.
+- [x] Commit an unsent final brush sample with the stroke, reuse its local points for delta encoding, and bypass compiled disk snapshots for editable hair previews. RTX reuses the registered graph digest for scene hierarchy lookup.
+- [x] Headless Storm and Omniverse RTX tests on the RTX 3090 confirmed stage reuse, no graph compile on commit, and correct points after undo and redo. The two-strand commit confirmation frames took about 7 ms in Storm and 6 ms in RTX. Seven hair worker tests, focused queue tests, frontend and desktop builds, and Rust formatting passed. The Rust test run excluded Blender executable discovery.
+- [ ] Verify repeated comb strokes and node changes on a production groom in the desktop viewport.
+
+### Groom hierarchy refresh and downstream cache follow-up
+
+- [x] Keep the Scene Overview hierarchy stable across groom point and strand-count changes. Read-only downstream previews use the regular caches, and selecting an editable Hair node prepares its simulation session.
+- [x] Accept the committed live groom through a single-input Output or Camera chain. Early RTX hierarchy queries for the exact pending commit reuse the live stage.
+- [x] Verified three consecutive commits through a pinned Output on both Storm and Omniverse RTX with graph compilation disabled after setup. Hierarchy-key and hair-worker tests passed. Rebuilt the frontend and desktop executable, and passed Rust formatting and 31 library tests with Blender discovery excluded.
+
+- [x] Replace the per-segment Comb and Surface Comb clamp after desktop feedback. Limit the pulled point's reach from its root and let the solver distribute the deformation.
+- [x] Limit live RTX brush frames and groom confirmation frames to one render step, with further refinement handled by subsequent frames.
+- [ ] Verify comb shape, length, and stroke-release responsiveness in the desktop app. Testing is assigned to the user.
+
+- [x] Reuse the already-rendered RTX brush frame for an exact groom confirmation with unchanged view options. Limit refinement to one step per request while grooming is active. Frontend and desktop builds passed.
+- [ ] Verify the release delay on the production groom in the updated desktop build. Testing is assigned to the user.
+
+## Guide-based interactive hair grooming
+
+- [x] Add deterministic spatial guide selection, weighted follower binding, normalized arc-length correspondence, and a Warp follower deformation kernel.
+- [x] Wire Comb and Surface Comb on dense grooms to compact guide buffers and reconstruct the full groom for rendering and persistence. Small grooms and selections without an active guide use the full solver.
+- [x] Add a local–global ADMM elastic solve for guides. Stretch and bend-chord projections share a banded global solve with fixed roots. Contact still uses the existing collider projections.
+- [x] Gather guide brush weights and targets once per stroke. Run each comb substep directly on the compact guide buffers, then reconstruct followers once per brush sample. Report RTX groom computation and encoding separately from rendering.
+- [x] Add a refittable GPU BVH for discrete guide-to-guide segment contacts, with corrections distributed to both segments and tangential slip limited by Coulomb friction. Run contact projection after the elastic solve and before scalp collision per substep.
+- [x] Transport root-aligned material frames along guide segments on the GPU. Use those frames to deform follower offsets and fade root correction into the strand.
+- [x] Project guide friction into angular motion about the strand tangents. Solve a root-fixed torsion chain per substep and apply the resulting roll to follower deformation. The angular solve is split from the positional solve and starts from zero twist at stroke start.
+- [x] Report guide strand count, full-solver fallback count, groom time and encoding time in the viewport. Cap Storm grooming previews at 960×720 and stop stationary Comb samples. Coalesced pointer events preserve the cursor position from the previous dispatched sample.
+- [x] Save updated groom curves without another full USD traversal and use a run-length zlib strategy in the existing delta format. Bound follower rotation offsets and guide contact corrections after desktop feedback about isolated strands.
+- [x] Apply guide comb motion through weighted spring attachments inside the elastic system. Attachments fall off along the guide around the picked point. The brush releases the attachments during settling.
+- [x] Interleave guide contact projection with the rod solve. Keep the inertial and brush targets and ADMM duals across both passes, and feed contact targets back into the global system. Transport rest bending into the live frame and let contact-driven twist rotate that bending direction.
+- [x] Precompute follower guide segment indices and interpolation fractions once per guide binding. The viewport deformation kernel reuses those lookups on each sample.
+- [x] Reuse the rendered brush frame in Storm when the graph confirms the exact groom and the view matches. Use the same view comparison in Storm and RTX.
+- [x] Use one quasistatic guide solve per interactive comb sample, with the full cursor delta and no inertial velocity carry-over. Preserve authored substeps for animated simulation and full-strand brush fallback. Factor the guide system in root-relative coordinates.
+- [x] Bound guide and follower motion after unstable brush feedback. Reject non-finite proposals, limit segment stretch by backing off the whole strand toward its last sample, and cap collision diameter when authored render widths are large for the guide discretization.
+- [x] Convert brush points to USD-local coordinates on the GPU before Storm readback. Synchronize RTX point buffers once per brush request and stage undo snapshots directly into reusable pinned host buffers.
+- [x] Sweep moving follower points against the scalp collider during the per-strand stability pass. Back off the whole strand at the earliest entering hit, and leave guide contact to the guide solver.
+- [x] Keep bounded ADMM duals across brush samples within a stroke. Reuse the banded factor where a guide has no contacts and end iterations when both guide motion and constraint residual fall below the segment-relative tolerance.
+- [x] Compact the active brush point and follower lists once per stroke. Reconstruction and follower scalp checks visit only selected, unpinned strands.
+- [x] Rank nearby follower guides by root distance and rest-curve shape at quarter and half arc length. Exclude opposing guide directions when the candidate set contains a compatible guide.
+- [x] Keep RTX pin colors and counts stable during ordinary comb strokes. Refresh them when the pin display, pin selection or topology changes. Detect topology changes from pending session flags without traversing the scene on each brush sample.
+- [x] Commit the displayed quasistatic Comb and Surface Comb shape on release when all pointer samples have been dispatched. If a sample is still pending, solve it as part of the commit.
+- [x] Reuse the USD-local GPU buffer for a stationary comb release. In RTX, skip the point upload only when the same buffer was written to the current scene at its current ordinal.
+- [x] Report separate CUDA stream timings for guide solving and follower reconstruction using the existing brush synchronization. Display the latest encoding time even for commits with no solve.
+- [x] Include axial roll mobility in the guide contact tangent-plane solve. Apply the same Coulomb-limited correction to guide translations and twist, with root frames fixed. The contact projection and rod solve remain staggered.
+- [x] Resolve new guide compression relative to the preceding sample when imported curves already overlap. Let moving segments contact unselected guides near pinned roots, with corrections distributed only to movable vertices.
+- [x] Build compact active-guide and active-segment lists at stroke start. Launch elastic, twist and contact queries only for the brush selection while retaining all guides as collision candidates.
+- [x] Index curve prim paths on the live USD stage and reuse them for brush samples and pin overlays. Invalidate on prim resyncs or stage changes.
+- [x] Initialize guide collision bounds and material frames once per stroke. Update moving guide bounds and transport moving guide frames per sample, while retaining stationary guides in the collision tree and follower bindings.
+- [x] Encode localized groom commits as sorted point indices and exact float deltas when fewer than a quarter of the points changed. Keep dense entries and topology overrides readable.
+- [x] Convert brush displacements relative to paired world-space and USD-local reference points so untouched points keep their exact authored values through transformed previews and commits.
+- [x] Snapshot follower points in the reconstruction kernel as it writes them. Initialize fixed root snapshots once per stroke and avoid copying the full groom on every pointer sample.
+- [x] Search guide candidates near both the follower root and its quarter-length landmark. Discard duplicate candidates before weighting to better resolve neighboring layers and partings.
+- [x] Prepare interactive Hair sessions without flattening or repopulating RTX when the same graph is already rendered and has no pending live geometry changes.
+- [x] Update queued viewport requests with a just-committed groom when they still reference the exact pre-stroke graph, including required commits for quick consecutive strokes.
+- [x] Reuse the last RTX brush image on a stationary release when points and view match. Report groom encoding separately from any renderer work still needed on release.
+- [x] Dispatch guide spring target updates only for selected guides. Bound Surface Comb travel before the scalp query and use signed scalp clearance so the target follows the outside of the surface.
+- [x] Preserve the previous contact side for nearby interior guide-segment crossings. Leave endpoint contacts free to slide and retain the discrete broad phase.
+- [x] Apply the strand-level stretch and scalp guard to Comb and Surface Comb strokes using the full-strand fallback.
+- [x] Run guide scalp midpoint and point collision kernels over the active guide edge list. Keep the original dispatch for animated and full-strand solves.
+- [x] Measure the current comb arc lengths on the GPU at stroke start. Use the stroke pose for target reach, spring falloff and per-sample motion limits after earlier edits.
+- [x] Preserve binary image bytes in cached RTX brush frames through transport. Clear the save status when the commit reply arrives and release the queue with an explicit error if a response lacks image data.
+- [x] Acknowledge RTX groom commits without resending the image when the viewport confirms it already displays that exact frame. Keep the cached bytes available when the viewport needs them.
+- [x] Blend follower displacements around their exact stroke-start points. Keep stationary guides' weight in the blend while skipping their frame transport and reconstruction work.
+- [x] Carry the rest bend through near half-turn guide reversals and skip twist trigonometry on untwisted bend projections.
+- [x] Read Smooth and Clump neighbors from a stable substep snapshot. Align Clump samples by normalized strand progress, limit per-substep pull, and apply the strand-level stretch and scalp guard to both brushes. Commit the displayed shape on release.
+- [x] Use stroke-start arc length for Clump correspondence and Smooth neighbor interpolation, preserving correspondence on unevenly sampled strands.
+- [x] Skip the second guide rod solve when the first pass met its convergence tolerance and contact changed neither the position targets nor the twist angles.
+- [x] Skip the twist-chain solve for guides with zero existing twist and zero friction impulse.
+- [x] Weight each guide contact target by its squared endpoint contribution. Preserve strong contact constraints near the collision and reduce the influence on distant segment endpoints.
+- [x] Skip guarded brush solves on curve prims the stroke misses and skip stationary release readback and encoding for clean sessions. Retain the last release round-trip timing alongside encoding time.
+- [x] Apply the existing 960×720 grooming preview cap to RTX as well as Storm. Keep the preview size stable across pointer-down and mouse-up and restore the normal viewport size when leaving grooming.
+- [x] Feed each projected guide contact into the rod solve at its interpolated point of contact. Include the cross term between neighboring vertices in the banded system and scale the contact block as a whole for dense clumps. The two contacting rods still exchange targets through the contact projection pass.
+- [x] Limit sliding friction in the local effective-mass metric, retaining a direct solve for sticking contacts. Keep the stroke-start separation as a lower bound on the target distance for persistent contacts so residual compression does not erase their normal load.
+- [x] Store rest bend chords in the guide's material frame at stroke start. Transport that frame from the root during each local bend projection and use the same transport for follower deformation. The bend-chord energy remains an approximation of the published rod energy.
+- [x] Allocate the guide budget across root neighborhoods and select representatives by root and rest-curve shape within each neighborhood. Keep the guide count unchanged while improving coverage across neighboring layers and partings.
+- [x] Synchronize the producing Warp stream before handing live points to RTX. Report the RTX point upload and write-floor wait separately from simulation and rendering.
+- [x] Reuse the live stage when acknowledging an exact groom commit through single-input MaterialX and Material Bind overlays. These overlays preserve curve paths, geometry and transforms.
+- [x] Cache the factorization of the root-fixed twist chain across brush samples.
+- [x] Cache guide rest segment lengths when building the stroke's material frames and reuse them in stretch projection. Keep the rest-vector fallback for collapsed edges.
+- [x] Keep a separate cached banded factor for the elastic and brush system over a stroke. Rebuild the contact factor for guides with transient contacts and keep the brush targets current on every sample.
+- [x] Derive guide vertex inertia from the adjacent stroke-rest segment lengths and use the same inverse masses for contact. Keep pinned roots fixed and bound mass ratios and per-contact displacement.
+- [x] Exclude followers with no moving guide from the per-sample reconstruction and scalp guard lists. Run the guide motion guard over selected guides only.
+- [x] Weight the guide's segment extension energy by inverse rest segment length. Reuse the per-edge weights in the cached elastic factor and its contact updates, with bounds for degenerate sampling.
+- [x] Replace two-point bend chords with a three-point, rest-length-weighted change of segment direction. Project the rest bend in the live material frame and include all three coefficients in the banded solve. This remains a surrogate for the published discrete-rod curvature energy.
+- [x] Feed a bounded elastic bend torque into the same guide twist solve as contact friction. Use that updated twist in the second positional pass, keeping the root material frame fixed.
+- [x] Register the expected post-stroke graph inside the RTX worker. Use its handle when the viewport requests that exact graph, avoiding a second transfer of the groom payload. Re-register normally if the worker has lost the handle.
+- [x] Factor each guide's twist chain at stroke start using segment-length-based axial inertia and joint stiffness. Use the same axial inertia for the rolling term in contact friction.
+- [ ] Verify Warp execution, root anchoring, partings, follower scalp contact, and persisted brush results through the desktop workflow.
+- [ ] Verify the interleaved approximation and implement the paper's coupled frictional constraints and rod energies. Measure simulation, reconstruction, rendering and release separately on a comparable groom on the RTX 3090 before claiming parity with the demo.
+
+## Cache Sculptor & GPU Cloth Physics Brush — 2026-11-19
+
+- [x] Added `Cache Sculptor` node (`operation: "cache_edit"`) across `src-tauri/src/project.rs` (`CacheEditSettings`, `CacheEditLayer`, `CacheEditDelta`, `CacheEditMask` with full boundary validation), `src-tauri/src/application.rs`, `src/fileRegistry.ts`, `src/graphInsertion.ts`, `src/App.tsx`, and `worker/usd_graph.py` (`apply_cache_edit`).
+- [x] Implemented Cache Sculptor non-destructive animation cache sculpting in `worker/cache_edit.py` and `worker/cloth_kernels.py`:
+  - Stackable sculpt layers with per-layer enable/mute, opacity weight (`-2..2`), temporal influence modes (`frameRange`, `singleFrame`, `allFrames`), center frame, fade-in/fade-out frames, and falloff curves (`smoothstep`, `gaussian`, `linear`, `constant`).
+  - Optional triangular-weighted temporal smoothing filter (`temporalSmoothFrames` / `temporalSmoothStrength`) across animated time samples.
+  - Compact sparse delta (`indicesZB64` + `deltasZB64`) and uint8 vertex mask (`weightsZB64`) zlib+base64 encoding stored inside the single `.orchflow` project JSON; USD evaluation authors into an anonymous `cache_edit.usda` overlay layer without modifying source files.
+- [x] Implemented NVIDIA Warp CUDA (with NumPy CPU fallback) sculpt & Cloth Physics brushes in `worker/cloth_kernels.py`:
+  - Sculpt brushes: `Grab`, `Smooth` (volume-preserving Taubin), `Inflate` (along live normals), `Pinch`, `Flatten`, `Mask` / `Unmask`.
+  - GPU XPBD Cloth Physics brushes: `Cloth Drag` (elastic patch pull preserving structural edge lengths, interior shared-edge bending hinges, mask pinning, and `wp.Mesh` BVH body collider push-out with Coulomb friction), `Cloth Relax` (gravity drape & wrinkle/poke-through settling over collider), and `Cloth Push` (normal push solved with cloth elasticity & collision).
+- [x] Wired live viewport sculpting into `src/NativeViewport.tsx` (toolbar toggle, 10 brushes, `[`/`]` radius hotkeys, Invert/Shift, Undo Stroke, circular brush cursor) and both `worker/usd_worker.py` (Storm session-layer point updates) and `worker/ovrtx_worker.py` (Omniverse RTX zero-copy DLPack point uploads via `_write_hair_points_to_ovstage`), plus `src/CacheEditInspector.tsx` (mesh scanner, layer stack, cloth physics parameters, temporal filter, mask controls).
+- [x] Verified:
+  - `worker/test_cache_edit.py`: 10/10 passed on `cuda:0` (NVIDIA GeForce RTX 3090), including automatic under-the-hood coarse cloth proxy solving (`worker/cloth_proxy.py` + `cloth_reconstruct_fine_kernel` in `worker/cloth_kernels.py`) for dense meshes (> 8,000 vertices): 96,100 fine vertices -> 4,096 proxy nodes in 262.1 ms one-time init, 24.3 ms per interactive brush step + fine reconstruction.
+  - `npm run build` (`tsc && vite build`): passed cleanly in 159ms.
+  - `cargo test --manifest-path src-tauri/Cargo.toml --target-dir I:/AI/OrchFlow-build project::tests`: 17/17 passed in `tauri_app_lib` and `orchflow_mcp`.
+  - Python syntax check (`py_compile`) passed on `cloth_kernels.py`, `cache_edit.py`, `usd_graph.py`, `usd_worker.py`, and `ovrtx_worker.py`.
+  - Note: `cargo fmt --check` reported zero diffs in modified files (`project.rs`, `application.rs`); one pre-existing formatting diff remains in `src-tauri/src/lib.rs:570`.
+- [ ] **Remaining manual/desktop verification**: Rebuild/restart the desktop app (`.\scripts\build.ps1`), connect an animated USD/Alembic cloth mesh into a `Cache Edit` node, test `Cloth Drag` / `Cloth Relax` / `Cloth Push` and sculpt layers across frames in both Storm and Omniverse RTX viewports, and verify Undo/Redo and project save/reload.
+
+## Cache Sculptor — Full-Garment GPU Cloth Simulation ("Simulate in Sublayer") — 2026-11-19
+
+- [x] Extended `CacheEditSettings` across `src-tauri/src/project.rs` (with serde defaults and boundary validation), `src/fileRegistry.ts`, and `src/CacheEditInspector.tsx` with `simEnabled`, `simMode` (`animated` / `static`), `simStartFrame`, `simEndFrame`, `simFps`, `simSettleSteps`, `simFabricPreset` (`custom` / `silk` / `cotton` / `denim` / `wool` / `leather`), `simAirDrag`, `simWind`, `simSelfCollision`, `simSelfThickness`, `simPinToCollider`, and `simCacheVersion`.
+- [x] Added 5 NVIDIA Warp GPU kernels in `worker/cloth_kernels.py`: `_cloth_sim_predict` (gravity, aerodynamic normal drag/wind, speed clamping, pin blending), `_cloth_self_collision` (`wp.HashGrid` spatial hash skipping 1-ring topological neighbors), `_cloth_bind_collider_pins` / `_cloth_eval_collider_pins` (bind masked vertices to nearest collider triangle so waistbands/collars/straps track animated character bodies), and `_cloth_lerp_collider_pts` (per-substep animated collider BVH refit).
+- [x] Implemented `_simulate_cloth_mesh` and `_CLOTH_SIM_CACHE` LRU caching in `worker/cache_edit.py` (with NumPy CPU fallback), integrated before Sculpt Layers in `apply_cache_edit` so simulated garment caches author into the anonymous `cache_edit.usda` overlay layer and Sculpt Layers stack non-destructively on top without modifying source USD files.
+- [x] Verified:
+  - `worker/test_cache_edit.py`: 8/8 passed on `cuda:0` (NVIDIA GeForce RTX 3090), including animated cloth + moving collider + collider-bound vertex pins + self-collision + Sculpt Layer stacking + LRU cache hit + unchanged source SHA-256, and static drape mode.
+  - `npm run build` (`tsc && vite build`): passed cleanly in 166ms.
+  - `cargo test --manifest-path src-tauri/Cargo.toml --target-dir I:/AI/OrchFlow-build project::tests`: 17/17 passed in `tauri_app_lib` and `orchflow_mcp`; zero `cargo fmt` diffs in `src-tauri/src/project.rs` (one pre-existing diff remains in `src-tauri/src/lib.rs:570`).
+- [ ] **Remaining manual/desktop verification**: Rebuild/restart the desktop app (`.\scripts\build.ps1`), connect a rest garment USD (e.g. from Marvelous Designer) and animated character body into a `Cache Sculptor` node, paint pin masks on the waistband/collar, enable **Cloth Simulation**, scrub the timeline in Storm/RTX, and layer a Sculpt Layer fix on top.
+
+## Cache Sculptor — Explicit `Sim` vs `Play` & Skeletal Playback Overlay — 2026-11-20
+
+- [x] Fixed `frame-reopen` in `worker/ovrtx_worker.py` so skeletal/transform-animated scenes (e.g., `DancerCharacter`) collect time-sampled `Mesh`/`BasisCurves` `point_updates` from `self.current_usd_stage` and overlay them onto `ovstage` via `_write_hair_points_to_ovstage` after `open_usd(self.temp_usd_path)`.
+- [x] Decoupled simulation from playback and parameter tweaks:
+  - Added `_INTERACTIVE_MANUAL_SIM = True` in `worker/ovrtx_worker.py` and `worker/usd_worker.py` so opening projects or tweaking cloth parameters never auto-runs cloth simulation or triggers full scene recompiles (`_try_fast_cache_edit_delta` returns in < 1 ms for sim-parameter-only edits).
+  - Added incremental GPU/CPU solver stepping (`step_cloth_simulation`, `_CLOTH_LIVE_CACHE`, `_CLOTH_LIVE_RUNNERS`, `clear_cloth_sim_cache`) in `worker/cache_edit.py` and wired `clothSimStep` in `worker/ovrtx_worker.py` and `worker/usd_worker.py`.
+  - Added explicit **Sim** / **⏹ Sim** button next to **Play (`▶`)** in `src/NativeViewport.tsx` (and **Clear Cache** in `src/CacheEditInspector.tsx`): clicking **Sim** advances the simulation frame-by-frame from the current frame and replaces the cache from that frame onwards (preserving earlier cached frames), while **Play (`▶`)** plays existing cached frames without running simulation.
+- [x] Verified:
+  - `worker/test_cache_edit.py`: 12/12 passed on `cuda:0` (RTX 3090), including `test_manual_sim_mode_and_step_cloth_simulation_from_current_frame` (manual mode skips auto-sim, `Sim` advances from frame 5, re-simulating from frame 6 replaces frames 6+ while preserving frame 5, and `apply_cache_edit` replays cached frames).
+  - `npm run build`: passed in 164 ms with 0 warnings.
+  - `cargo test --manifest-path src-tauri/Cargo.toml --target-dir I:/AI/OrchFlow-build project::tests`: 17/17 passed in both crates.
+- [ ] **Remaining manual/desktop verification**: Rebuild/launch desktop (`.\scripts\build-and-launch.ps1`), open `DancerCharacter.sublayer`, click **Sim** from frame 0 (or mid-timeline) to watch live cloth draping over the dancing body, tweak `Substeps` (verify instant response with no recompile), re-click **Sim** mid-timeline to replace cache from that frame onwards, and click **Play (`▶`)** to verify smooth cached playback.

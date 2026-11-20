@@ -1,10 +1,8 @@
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
-# Prefer the newest successful build; a replacement can be built while the old app is open.
-$executable = @('I:\AI\OrchFlow-build\debug\sublayer-updated.exe', 'I:\AI\OrchFlow-build\debug\orchflow-updated.exe', 'I:\AI\OrchFlow-build\debug\orchflow-dragfix.exe') |
-    Where-Object { Test-Path -LiteralPath $_ } |
-    Get-Item | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
-if (-not $executable) { throw 'No desktop build found. Run scripts/build.ps1 first.' }
+# Launch the built Sublayer desktop executable.
+$executable = 'I:\AI\OrchFlow-build\debug\Sublayer.exe'
+if (-not (Test-Path -LiteralPath $executable)) { throw 'No desktop build found. Run scripts/build.ps1 first.' }
 if (-not (Test-Path -LiteralPath $executable)) {
     throw 'The built app is missing. Build the frontend and the custom-protocol Rust executable first, or use scripts/dev.ps1.'
 }

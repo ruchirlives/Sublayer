@@ -1,4 +1,5 @@
 import os
+import tempfile
 import unittest
 import usd_worker
 import usd_graph
@@ -6,7 +7,8 @@ from pxr import Usd, UsdGeom
 
 class BlenderNodeTests(unittest.TestCase):
     def setUp(self):
-        self.test_usd = os.path.abspath('test_blender_node_stage.usda')
+        self._tmp = tempfile.TemporaryDirectory()
+        self.test_usd = os.path.join(self._tmp.name, 'test_blender_node_stage.usda')
         st = Usd.Stage.CreateNew(self.test_usd)
         UsdGeom.SetStageUpAxis(st, UsdGeom.Tokens.y)
         root = UsdGeom.Xform.Define(st, '/root')
@@ -15,8 +17,8 @@ class BlenderNodeTests(unittest.TestCase):
         st.GetRootLayer().Save()
 
     def tearDown(self):
-        if os.path.isfile(self.test_usd):
-            os.remove(self.test_usd)
+        usd_graph.clear_graph_caches()
+        self._tmp.cleanup()
 
     def test_blender_node_compilation_with_exported_usd(self):
         graph = {
@@ -87,6 +89,56 @@ class BlenderNodeTests(unittest.TestCase):
         stage, alive, stats = usd_graph.compile_graph(graph)
         self.assertTrue(stage)
         self.assertEqual(stats['evaluatedNodes'], 2)
+
+    def test_filter_preserves_usd_instances_and_referenced_prototypes(self):
+        from pxr import Sdf, UsdShade
+
+        st = Usd.Stage.CreateInMemory()
+        UsdGeom.SetStageUpAxis(st, UsdGeom.Tokens.y)
+        root = UsdGeom.Xform.Define(st, '/root')
+        st.SetDefaultPrim(root.GetPrim())
+
+        # Materials
+        mats = UsdGeom.Scope.Define(st, '/root/_materials')
+        mat_keep = UsdShade.Material.Define(st, '/root/_materials/Gold')
+        mat_drop = UsdShade.Material.Define(st, '/root/_materials/Unused')
+
+        # Prototypes (as exported by Blender with use_instancing=True)
+        UsdGeom.Scope.Define(st, '/root/prototypes')
+        proto_keep = UsdGeom.Xform.Define(st, '/root/prototypes/Bangles_SRC')
+        mesh_keep = UsdGeom.Mesh.Define(st, '/root/prototypes/Bangles_SRC/Torus')
+        UsdShade.MaterialBindingAPI.Apply(mesh_keep.GetPrim()).Bind(mat_keep)
+
+        proto_drop = UsdGeom.Xform.Define(st, '/root/prototypes/Unused_SRC')
+        mesh_drop = UsdGeom.Mesh.Define(st, '/root/prototypes/Unused_SRC/Box')
+        UsdShade.MaterialBindingAPI.Apply(mesh_drop.GetPrim()).Bind(mat_drop)
+
+        # Instance prim with sanitized name (Blender name "Torus_INST.001" -> USD "Torus_INST_001")
+        inst_keep = UsdGeom.Xform.Define(st, '/root/Torus_INST_001')
+        inst_keep.GetPrim().GetReferences().AddInternalReference('/root/prototypes/Bangles_SRC')
+        inst_keep.GetPrim().SetInstanceable(True)
+
+        # Unselected instance prim
+        inst_drop = UsdGeom.Xform.Define(st, '/root/Unused_INST')
+        inst_drop.GetPrim().GetReferences().AddInternalReference('/root/prototypes/Unused_SRC')
+        inst_drop.GetPrim().SetInstanceable(True)
+
+        usd_graph._filter_blender_stage_in_memory(st, {'Torus_INST.001'})
+
+        # Selected instance, its prototype mesh, and its bound material must survive and stay visible
+        kept_prim = st.GetPrimAtPath('/root/Torus_INST_001')
+        self.assertTrue(kept_prim.IsValid())
+        self.assertTrue(kept_prim.IsInstance())
+        self.assertEqual(UsdGeom.Imageable(kept_prim).ComputeVisibility(), UsdGeom.Tokens.inherited)
+        self.assertTrue(st.GetPrimAtPath('/root/prototypes/Bangles_SRC/Torus').IsValid())
+        self.assertTrue(st.GetPrimAtPath('/root/_materials/Gold').IsValid())
+
+        # Unselected instance remains in stage with visibility=invisible (not deleted)
+        hidden_prim = st.GetPrimAtPath('/root/Unused_INST')
+        self.assertTrue(hidden_prim.IsValid())
+        self.assertEqual(UsdGeom.Imageable(hidden_prim).ComputeVisibility(), UsdGeom.Tokens.invisible)
+        self.assertTrue(st.GetPrimAtPath('/root/prototypes/Unused_SRC').IsValid())
+        self.assertTrue(st.GetPrimAtPath('/root/_materials/Unused').IsValid())
 
 if __name__ == '__main__':
     unittest.main()

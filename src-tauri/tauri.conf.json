@@ -15,7 +15,8 @@
         "title": "Sublayer — USD Workspace",
         "width": 1440,
         "height": 900,
-        "dragDropEnabled": false
+        "dragDropEnabled": false,
+        "additionalBrowserArgs": "--disable-gpu --disable-gpu-compositing"
       }
     ],
     "security": {
@@ -24,7 +25,19 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": "nsis",
+    "resources": {
+      "../worker/*.py": "worker/",
+      "../scripts/installer-runtimes.ps1": "scripts/installer-runtimes.ps1",
+      "../LICENSE": "LICENSE",
+      "../LICENSE-EXCEPTION.md": "LICENSE-EXCEPTION.md"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "both",
+        "installerHooks": "nsis/installer.nsh"
+      }
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

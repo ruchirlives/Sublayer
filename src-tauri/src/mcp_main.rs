@@ -5,6 +5,7 @@ mod application_profiles;
 mod dependency_search;
 mod desktop_bridge;
 mod project;
+mod runtime_setup;
 mod usd;
 use serde_json::{Value, json};
 use std::io::{BufRead, Write};
@@ -107,7 +108,17 @@ fn definitions() -> Vec<Value> {
         (
             "usd_render",
             "Render a validated project node or external path; returns an MCP image plus metadata. Does not control the desktop UI.",
-            json!({"project":p,"nodeId":s,"path":s,"renderer":s,"width":{"type":"integer"},"height":{"type":"integer"},"yaw":{"type":"number"},"pitch":{"type":"number"}}),
+            json!({
+                "project":p,"nodeId":s,"path":s,"renderer":s,
+                "width":{"type":"integer"},"height":{"type":"integer"},
+                "yaw":{"type":"number"},"pitch":{"type":"number"},
+                "panX":{"type":"number"},"panY":{"type":"number"},"zoom":{"type":"number"},
+                "cameraSession":s,"frameFit":{"type":"integer"},
+                "interactive":{"type":"boolean"},"transformGizmoNodeId":s,
+                "pick":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2},
+                "orbitPivotSeq":{"type":"integer"},"orbitPivotTarget":s,
+                "orbitPivotPoint":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3}
+            }),
             vec![],
         ),
         (
@@ -176,8 +187,20 @@ fn definitions() -> Vec<Value> {
             json!({"project":p,"label":s,"selectNodeId":s}),
             vec!["project"],
         ),
+        (
+            "inspect_stage_skeletons",
+            "Discover UsdSkel Skeletons (with joints), Animations (with time ranges), and Xformable prims for a Character node.",
+            json!({"project":p,"nodeId":s}),
+            vec!["project", "nodeId"],
+        ),
+        (
+            "export_character_body",
+            "Explicitly bake and export the animated/deformed character body meshes (excluding clothCaches) to a user-selected .usd/.usda/.usdc path.",
+            json!({"project":p,"nodeId":s,"destination":s}),
+            vec!["project", "nodeId", "destination"],
+        ),
     ];
-    entries.into_iter().map(|(name,description,properties,required)|{let write=["project_save","export_materialx","create_handoff","publish_reviewed","reconcile_upstream","desktop_open_project","desktop_select_node","desktop_pin_node","desktop_set_viewport","desktop_apply_project"].contains(&name);json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false},"annotations":{"readOnlyHint":!write,"destructiveHint":name=="project_save","idempotentHint":!write,"openWorldHint":false}})}).collect()
+    entries.into_iter().map(|(name,description,properties,required)|{let write=["project_save","export_materialx","export_character_body","create_handoff","publish_reviewed","reconcile_upstream","desktop_open_project","desktop_select_node","desktop_pin_node","desktop_set_viewport","desktop_apply_project"].contains(&name);json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false},"annotations":{"readOnlyHint":!write,"destructiveHint":name=="project_save","idempotentHint":!write,"openWorldHint":false}})}).collect()
 }
 fn call(name: &str, a: &Value, service: &usd::UsdService) -> Result<Value, String> {
     match name {
@@ -187,6 +210,8 @@ fn call(name: &str, a: &Value, service: &usd::UsdService) -> Result<Value, Strin
  "project_save"=>{let path=string(a,"path")?;let p=model(a)?;if std::path::Path::new(path).exists() && a.get("expectedRevision").and_then(Value::as_str)!=Some(&revision(path)?){return Err("Project changed or no expectedRevision supplied; load it before replacing existing JSON".into());}project::save(path,&p)?;Ok(json!({"path":path,"revision":revision(path)?}))},
  "export_materialx"=>application::export_materialx(&model(a)?,string(a,"nodeId")?,string(a,"destination")?,service),
  "materialx_document"=>{let project=model(a)?;let id=string(a,"nodeId")?;let node=project.nodes.iter().find(|n|n.id==id && n.data.operation=="materialx").ok_or("Choose a MaterialX node")?;service.request(json!({"operation":"materialx_document","materialX":node.data.material_x,"dependencies":project.dependencies}))},
+ "inspect_stage_skeletons"=>{let project=model(a)?;let id=string(a,"nodeId")?;service.request(json!({"operation":"inspect_stage_skeletons","graph":application::evaluation_graph(&project,id,false)?}))},
+ "export_character_body"=>{let project=model(a)?;let id=string(a,"nodeId")?;if !project.nodes.iter().any(|n|n.id==id && n.data.operation=="character"){return Err("Choose a Character node".into());}service.request(json!({"operation":"export_character_body","graph":application::evaluation_graph(&project,id,false)?,"outputPath":string(a,"destination")?}))},
  "application_profiles"=>Ok(json!({"configured":catalog(a)?,"bundled":application_profiles::Catalog::defaults()})),
  "usd_capabilities"=>service.request(json!({"operation":"capabilities"})),
  "usd_inspect"|"usd_dependencies"=>service.request(json!({"operation":if name=="usd_inspect"{"inspect"}else{"dependencies"},"path":string(a,"path")?})),

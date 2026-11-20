@@ -694,6 +694,35 @@ export function BlenderInspector({
             <span>Convert procedurals (Cycles / Octane → MaterialX)</span>
           </label>
         )}
+        {blendPath && (
+          <label
+            style={{
+              margin: "6px 0 0",
+              display: "flex",
+              alignItems: "center",
+              gap: "6px",
+              fontSize: "11px",
+              cursor: "pointer",
+            }}
+          >
+            <input
+              type="checkbox"
+              aria-label="Export skeletons (UsdSkel)"
+              checked={Boolean(node?.data.blenderExportSkeletons)}
+              onChange={(e) => {
+                const checked = e.target.checked;
+                const base = flushPendingSelections();
+                onProjectChange({
+                  ...base,
+                  nodes: base.nodes.map((n) =>
+                    n.id !== nodeId ? n : { ...n, data: { ...n.data, blenderExportSkeletons: checked } }
+                  ),
+                });
+              }}
+            />
+            <span>Export skeletons (UsdSkel)</span>
+          </label>
+        )}
       </div>
 
       {/* 2. Scene & Collection Selection Tables */}

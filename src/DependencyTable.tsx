@@ -1,9 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import {
+  fileKey,
+  graphPreview,
   referencedBy,
   overrideDependency,
   overrideInputs,
+  type DependencyKind,
   type StoredProject,
 } from "./fileRegistry";
 
@@ -12,6 +15,7 @@ export function DependencyTable({
   onChange,
   onStatus,
   onRescan,
+  onDiscoverFiles,
   nodeId,
 }: {
   project: StoredProject;
@@ -19,6 +23,7 @@ export function DependencyTable({
   onChange: (project: StoredProject) => void;
   onStatus: (text: string) => void;
   onRescan: () => Promise<void>;
+  onDiscoverFiles?: (files: { path: string; kind: DependencyKind }[]) => void;
 }) {
   const latest = useRef(project);
   latest.current = project;
@@ -29,7 +34,24 @@ export function DependencyTable({
   const [busy, setBusy] = useState(false);
   const [statuses, setStatuses] = useState<Record<string, string>>({});
   const [refresh, setRefresh] = useState(0);
-  const effectiveDependencies = overrideInputs(project, nodeId).map(d => {
+  const [liveKeys, setLiveKeys] = useState<Set<string> | null>(null);
+  const scopedDependencies = useMemo(() => {
+    const fallback = overrideInputs(project, nodeId);
+    if (liveKeys === null) return fallback;
+    const seen = new Set<string>();
+    const combined = [];
+    for (const d of project.dependencies) {
+      if (liveKeys.has(fileKey(d.path))) {
+        seen.add(d.id);
+        combined.push(d);
+      }
+    }
+    for (const d of fallback) {
+      if (!seen.has(d.id)) combined.push(d);
+    }
+    return combined;
+  }, [project, nodeId, liveKeys]);
+  const effectiveDependencies = scopedDependencies.map(d => {
     const rule = project.nodes.find(n => n.id === nodeId)?.data.assetOverrides?.find(o => o.originalPath === d.path);
     const replacement = project.dependencies.find(r => r.id === rule?.replacementDependencyId);
     return {...d, path: replacement?.path || d.path};
@@ -55,6 +77,23 @@ export function DependencyTable({
       active = false;
     };
   }, [signature, refresh, onStatus]);
+  async function rescanInputs() {
+    await onRescan();
+    try {
+      const result = await invoke<{
+        files: { path: string; kind: DependencyKind }[];
+      }>("usd_request", {
+        request: {
+          operation: "asset_override_inputs",
+          graph: JSON.parse(graphPreview(latest.current, nodeId)),
+        },
+      });
+      onDiscoverFiles?.(result.files);
+      setLiveKeys(new Set(result.files.map((f) => fileKey(f.path))));
+    } catch {
+      setLiveKeys(null);
+    }
+  }
   async function run(task: () => Promise<void>) {
     setBusy(true);
     try {
@@ -83,7 +122,7 @@ export function DependencyTable({
       project.dependencies.find((d) => d.id === existingId)?.path || path;
     const next = overrideDependency(project, nodeId, id, replacement);
     onChange(next);
-    await onRescan();
+    await rescanInputs();
     onStatus(
       existingId
         ? `Warning: file is already registered. References merged into ${existingId}; this branch reuses that file link.`
@@ -91,7 +130,7 @@ export function DependencyTable({
     );
   }
   useEffect(() => {
-    if (isTauri()) void run(onRescan);
+    if (isTauri()) void run(rescanInputs);
   }, []);
   async function useMatch(id: string, path: string) {
     const current = latest.current;
@@ -108,7 +147,7 @@ export function DependencyTable({
       delete next[id];
       return next;
     });
-    await onRescan();
+    await rescanInputs();
     onStatus(
       existingId
         ? "Warning: matched an already registered file; the branch reuses its file link."
@@ -167,7 +206,7 @@ export function DependencyTable({
     if (replacements.length) onChange(next);
     setCandidates(pending);
     setChoices({});
-    if (replacements.length) await onRescan();
+    if (replacements.length) await rescanInputs();
     setRefresh((v) => v + 1);
     onStatus(
       `${partial ? "Warning: search was incomplete. " : ""}Relinked ${replacements.length} unique match(es); ${Object.keys(pending).length} need your choice; ${unmatched} not found. Searched ${result.scannedEntries} entries; skipped ${result.skippedFolders} folder(s).`,
@@ -175,7 +214,7 @@ export function DependencyTable({
   }
   const rows = useMemo(
     () =>
-      overrideInputs(project, nodeId)
+      scopedDependencies
         .map((dependency) => {
           const name = dependency.path.split(/[\\/]/).pop() || dependency.path;
           const extension = name.includes(".")
@@ -195,7 +234,7 @@ export function DependencyTable({
             .toLowerCase()
             .includes(query.toLowerCase()),
         ),
-    [project, query, nodeId],
+    [scopedDependencies, project, query],
   );
   return (
     <section className="dependencies-tab">
@@ -218,7 +257,7 @@ export function DependencyTable({
         >
           Check files
         </button>
-        <button disabled={busy || !isTauri()} onClick={() => run(onRescan)}>
+        <button disabled={busy || !isTauri()} onClick={() => run(rescanInputs)}>
           Rescan USD
         </button>
         <button

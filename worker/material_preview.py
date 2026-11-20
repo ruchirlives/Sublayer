@@ -1,13 +1,24 @@
 """Shared read-only diagnostics and private selective material fallbacks."""
 import os
 
+
+def iter_scene_and_prototype_prims(stage):
+    """Yield non-instance-proxy prims on the stage plus each prototype's prims once."""
+    from pxr import Usd
+    for prim in stage.Traverse():
+        yield prim
+    for proto in stage.GetPrototypes():
+        for prim in Usd.PrimRange(proto):
+            yield prim
+
+
 def missing_shader_assets(stage, frame, mdl_search_paths=()):
     """Audit composed shader input assets without changing layers or guessing paths."""
     from pathlib import PurePosixPath
     from pxr import Ar, Sdf, Usd, UsdShade
     missing = {}
     with Ar.ResolverContextBinder(stage.GetPathResolverContext()):
-        for prim in stage.Traverse(Usd.TraverseInstanceProxies()):
+        for prim in iter_scene_and_prototype_prims(stage):
             if not prim.IsA(UsdShade.Shader):
                 continue
             for attr in prim.GetAttributes():
@@ -40,7 +51,7 @@ def invalid_shader_inputs(stage,frame):
     """Known Storm-invalid primvar readers; never guess another UV set."""
     from pxr import Usd,UsdShade
     issues=[]
-    for prim in stage.Traverse(Usd.TraverseInstanceProxies()):
+    for prim in iter_scene_and_prototype_prims(stage):
         if not prim.IsA(UsdShade.Shader):continue
         shader=UsdShade.Shader(prim);identifier=shader.GetIdAttr().Get() or ''
         if not identifier.startswith('UsdPrimvarReader_'):continue
@@ -62,7 +73,7 @@ def invalid_shader_inputs(stage,frame):
         if attr.GetName().startswith('outputs:') and prim.IsA(UsdShade.Shader):
             for other in prim.GetAttributes():
                 if other.GetName().startswith('inputs:'):visit(other)
-    for prim in stage.Traverse(Usd.TraverseInstanceProxies()):
+    for prim in iter_scene_and_prototype_prims(stage):
         if prim.IsA(UsdShade.Material):
             for output in UsdShade.Material(prim).GetOutputs():visit(output.GetAttr())
     return [issue for issue in issues if issue['path'] in connected]
@@ -100,7 +111,7 @@ def preserve_mdl_preview(stage, missing, invalid):
     broken_assets = {path for item in missing for path in item['usedBy']}
     broken = broken_assets | {item['path'] for item in invalid}
     disconnected = {}
-    for prim in stage.Traverse(Usd.TraverseInstanceProxies()):
+    for prim in iter_scene_and_prototype_prims(stage):
         if not prim.IsA(UsdShade.Material):
             continue
         material = UsdShade.Material(prim)
@@ -136,7 +147,7 @@ def selective_material_preview(stage,missing,frame,invalid=None):
     from pxr import Usd,UsdShade,Sdf,UsdUtils,Gf,Sdr
     broken={prop for item in missing for prop in item['usedBy']}|{item['path'] for item in invalid or []}
     affected=[]
-    for prim in stage.Traverse(Usd.TraverseInstanceProxies()):
+    for prim in iter_scene_and_prototype_prims(stage):
         if prim.IsA(UsdShade.Material) and any(shader_depends_on(stage, output.GetAttr(),broken,set()) for output in UsdShade.Material(prim).GetOutputs()):affected.append(prim)
     if not affected:return stage,[],[]
     # One replacement template per render context set, not one geometry copy
@@ -196,5 +207,16 @@ def selective_material_preview(stage,missing,frame,invalid=None):
     result=Usd.Stage.Open(clones[root.identifier],session,stage.GetPathResolverContext())
     if result is None:raise ValueError('Unable to compose selective material preview')
     keepalive.extend([*clones.values(),result])
-    return result,keepalive,[str(p.GetPath()) for p in affected]
+    affected_paths = []
+    protos = list(stage.GetPrototypes())
+    for p in affected:
+        if p.IsInPrototype():
+            owner_proto = next((pr for pr in protos if p.GetPath().HasPrefix(pr.GetPath())), None)
+            if owner_proto is not None:
+                rel = p.GetPath().MakeRelativePath(owner_proto.GetPath())
+                for inst in owner_proto.GetInstances():
+                    affected_paths.append(str(inst.GetPath().AppendPath(rel)))
+                continue
+        affected_paths.append(str(p.GetPath()))
+    return result,keepalive,affected_paths
 

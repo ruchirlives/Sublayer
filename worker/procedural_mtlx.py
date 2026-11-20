@@ -664,6 +664,13 @@ def _convert_usd(stage, mat_path, suffix, src_api, src_port, src_type, target_ty
         ext.CreateInput('index', Sdf.ValueTypeNames.Int).Set(0)
         ext.CreateOutput('out', Sdf.ValueTypeNames.Float)
         return ext.ConnectableAPI(), 'out'
+    if src_type == 'vector2' and target_type == 'float':
+        ext = UsdShade.Shader.Define(stage, mat_path.AppendChild(f'ProcExt_{suffix}'))
+        ext.CreateIdAttr('ND_extract_vector2')
+        ext.CreateInput('in', Sdf.ValueTypeNames.Float2).ConnectToSource(src_api, src_port)
+        ext.CreateInput('index', Sdf.ValueTypeNames.Int).Set(1)
+        ext.CreateOutput('out', Sdf.ValueTypeNames.Float)
+        return ext.ConnectableAPI(), 'out'
     return src_api, src_port
 
 

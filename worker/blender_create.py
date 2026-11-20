@@ -1,7 +1,7 @@
 """Fixed Blender background adapter; request data arrives on stdin, never as code."""
-import bpy
 import json
 import hashlib
+import math
 import fnmatch
 import os
 import sys
@@ -19,7 +19,7 @@ def revision(paths):
     return result
 
 
-def publish_pair(pairs, overwrite, expected):
+def publish_pair(pairs, allowed_replacements, expected):
     """Publish validated native/baseline outputs; retain backups on replacement."""
     import uuid
     if revision([target for _, target in pairs]) != expected:
@@ -30,7 +30,7 @@ def publish_pair(pairs, overwrite, expected):
             if os.path.islink(target):
                 raise RuntimeError('Cannot replace a symlink destination')
             if os.path.lexists(target):
-                if not overwrite:
+                if target not in allowed_replacements:
                     raise RuntimeError('Destination already exists; replacement requires confirmation')
                 backup = target + '.orchflow-backup-' + uuid.uuid4().hex
                 os.link(target, backup)
@@ -51,14 +51,54 @@ def publish_pair(pairs, overwrite, expected):
     return list(backups.values())
 
 
+def stable_identity(prim, name):
+    attr = prim.GetAttribute('userProperties:' + name)
+    if not attr:
+        return None
+    values = [attr.Get(), *(attr.Get(t) for t in attr.GetTimeSamples())]
+    authored = [value for value in values if value is not None]
+    if authored and isinstance(authored[0], str) and all(v == authored[0] for v in authored):
+        return authored[0]
+    return None
+
+
+def validate_baseline(source, baseline, round_trip, unit):
+    if not baseline:
+        raise RuntimeError('Baseline could not be reopened')
+    root = baseline.GetRootLayer()
+    if any(root.GetCompositionAssetDependencies()) or any(
+            layer not in (root, baseline.GetSessionLayer()) for layer in baseline.GetUsedLayers()):
+        raise RuntimeError('Baseline must contain its scene in one USD layer')
+    if str(UsdGeom.GetStageUpAxis(baseline)) != 'Z' or not math.isclose(
+            UsdGeom.GetStageMetersPerUnit(baseline), unit, rel_tol=1e-6):
+        raise RuntimeError('Baseline axis or units differ from the prepared Blender scene')
+    prims = list(baseline.Traverse(Usd.TraverseInstanceProxies()))
+    identities = {value for prim in prims if (value := stable_identity(prim, 'orchflowRoundTripId'))}
+    if identities != {round_trip}:
+        raise RuntimeError('Blender did not preserve the handoff round-trip identity')
+    source_ids = {value for prim in source.Traverse(Usd.TraverseInstanceProxies())
+                  if (value := stable_identity(prim, 'orchflowId'))}
+    root_id = stable_identity(source.GetDefaultPrim(), 'orchflowId')
+    exported_ids = {value for prim in prims if (value := stable_identity(prim, 'orchflowId'))}
+    if not (source_ids & exported_ids) - {root_id} or exported_ids - source_ids:
+        raise RuntimeError('Blender did not preserve usable handoff object identities')
+
+
 def create(config):
+    import bpy
+
     source, destination, temporary = config['handoff'], config['destination'], config['temporary']
     overwrite = config.get("overwrite", False)
-    capture_baseline=config.get("captureBaseline", True)
+    capture_baseline=config.get("captureBaseline", False)
     targets = [destination, config["baseline"]] if capture_baseline else [destination]
     expected_outputs = revision(targets)
-    if os.path.lexists(destination) and not overwrite:
-        raise RuntimeError('Native destination exists. Choose a new filename; existing edits are never overwritten.')
+    allowed_replacements = {destination} if overwrite else set()
+    if capture_baseline and config.get("overwriteBaseline", False):
+        allowed_replacements.add(config["baseline"])
+    for target in targets:
+        if os.path.islink(target) or (os.path.lexists(target) and
+                (not os.path.isfile(target) or target not in allowed_replacements)):
+            raise RuntimeError('Cannot replace output without an eligible file and confirmation: ' + target)
     expected=config['policy']['profile']['applicationVersion']
     actual='.'.join(map(str,bpy.app.version))
     if not fnmatch.fnmatchcase(actual,expected.replace('x','*')):
@@ -70,8 +110,17 @@ def create(config):
     axis, unit = str(UsdGeom.GetStageUpAxis(stage)), UsdGeom.GetStageMetersPerUnit(stage)
     if axis != conversion['upAxis'] or abs(unit-conversion['metersPerUnit']) > 1e-10*unit:
         raise RuntimeError('Handoff metadata differs from its recorded conversion. Recreate the handoff first.')
+    root = stage.GetDefaultPrim()
+    if not root:
+        raise RuntimeError('Handoff has no default prim')
+    round_trip = stable_identity(root, 'orchflowRoundTripId')
+    if capture_baseline and (not round_trip or stage.GetRootLayer().customLayerData.get('orchflowNamespaceVersion') != 2):
+        raise RuntimeError('Create a fresh tagged handoff before capturing a baseline')
     layers, assets, unresolved = UsdUtils.ComputeAllDependencies(source)
-    paths = [layer.realPath for layer in layers if layer.realPath] + list(assets) + list(unresolved)
+    paths = [source] + [layer.realPath for layer in layers if layer.realPath] + list(assets) + list(unresolved)
+    input_paths = {os.path.normcase(os.path.realpath(path)) for path in paths}
+    if any(os.path.normcase(os.path.realpath(path)) in input_paths for path in targets):
+        raise RuntimeError('An output destination overlaps a handoff dependency')
     before = revision(paths)
     if len(json.dumps(before))>4000000: raise RuntimeError("Input dependency revision record is too large; split the preparation workflow")
     options = dict(filepath=source, relative_path=False, scale=1.0,
@@ -93,12 +142,11 @@ def create(config):
     if revision(paths) != before:
         raise RuntimeError('Handoff or referenced assets changed during import. Retry after saving them.')
     baseline, baseline_temp=config['baseline'], config['baselineTemporary']
-    round_trip=stage.GetDefaultPrim().GetAttribute('userProperties:orchflowRoundTripId').Get()
     baseline_digest=None
     export_options={}
     if capture_baseline:
-        if os.path.lexists(baseline) and not overwrite: raise RuntimeError('Baseline destination already exists')
-        export_options=dict(filepath=baseline_temp,check_existing=False,export_animation=True,
+        export_options=dict(filepath=baseline_temp,check_existing=False,selected_objects_only=False,
+            collection='',export_animation=True,
             export_hair=True,export_uvmaps=True,rename_uvmaps=False,export_normals=True,
             export_materials=True,export_armatures=True,export_shapekeys=True,use_instancing=True,
             convert_orientation=False,export_textures_mode='KEEP',relative_paths=False,
@@ -106,15 +154,12 @@ def create(config):
             custom_properties_namespace='userProperties',convert_scene_units='CUSTOM',meters_per_unit=unit,
             merge_parent_xform=False)
         props=bpy.ops.wm.usd_export.get_rna_type().properties
-        if any(key not in props for key in export_options): raise RuntimeError('Blender lacks required round-trip baseline export options')
-        if 'KEEP' not in [value.identifier for value in props['export_textures_mode'].enum_items]: raise RuntimeError('Blender cannot export without copying textures')
+        for key, value in export_options.items():
+            if key not in props or (props[key].type == 'ENUM' and value not in props[key].enum_items.keys()):
+                raise RuntimeError(f'Blender lacks the required USD export setting {key}={value}')
         if 'FINISHED' not in bpy.ops.wm.usd_export(**export_options): raise RuntimeError('Initial round-trip baseline export failed')
         baseline_stage=Usd.Stage.Open(baseline_temp)
-        if not baseline_stage: raise RuntimeError('Baseline could not be reopened')
-        if any(layer.anonymous and layer != baseline_stage.GetSessionLayer() for layer in baseline_stage.GetUsedLayers()): raise RuntimeError('Baseline contains transient dependencies')
-        round_trip=stage.GetDefaultPrim().GetAttribute('userProperties:orchflowRoundTripId').Get()
-        if not round_trip or not any(p.GetAttribute('userProperties:orchflowRoundTripId') and p.GetAttribute('userProperties:orchflowRoundTripId').Get()==round_trip for p in baseline_stage.Traverse(Usd.TraverseInstanceProxies())):
-            raise RuntimeError('Blender did not retain handoff identity. Cannot capture a safe baseline; enable user/custom properties.')
+        validate_baseline(stage, baseline_stage, round_trip, unit)
         digest=hashlib.sha256()
         with open(baseline_temp,'rb') as stream:
             for block in iter(lambda:stream.read(1024*1024),b''):digest.update(block)
@@ -146,15 +191,18 @@ def create(config):
     # Exclusive publication: no existing destination can be replaced, including
     # a file created by another process while Blender was importing.
     if revision(paths)!=before:raise RuntimeError('Preserved inputs changed during preparation; retry after saving them.')
-    report["replacementBackups"] = publish_pair(([(baseline_temp,baseline)] if capture_baseline else [])+[(temporary,destination)], overwrite, expected_outputs)
+    report["replacementBackups"] = publish_pair(([(baseline_temp,baseline)] if capture_baseline else [])+[(temporary,destination)], allowed_replacements, expected_outputs)
     report['baselineCaptured']=capture_baseline
+    if capture_baseline:
+        report['baselineOrigin']='quickstart'
     return report
 
 
-config = json.loads(sys.stdin.readline())
-try:
-    report = create(config)
-    print('ORCHFLOW_CREATE:' + json.dumps(report), flush=True)
-finally:
-    for key in ['temporary','baselineTemporary']:
-        if os.path.isfile(config[key]): os.unlink(config[key])
+if __name__ == '__main__':
+    config = json.loads(sys.stdin.readline())
+    try:
+        report = create(config)
+        print('ORCHFLOW_CREATE:' + json.dumps(report), flush=True)
+    finally:
+        for key in ['temporary','baselineTemporary']:
+            if os.path.isfile(config[key]): os.unlink(config[key])

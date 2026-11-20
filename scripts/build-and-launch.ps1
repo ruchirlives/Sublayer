@@ -1,7 +1,21 @@
+param(
+    [switch]$NoLastProject,
+    [string]$Project = ''
+)
+
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $buildRoot = 'I:/AI/OrchFlow-build'
-$exe = Join-Path $buildRoot 'debug/sublayer-updated.exe'
+$exe = Join-Path $buildRoot 'debug/Sublayer.exe'
+
+$appProcessNames = @('sublayer-updated', 'orchflow-updated', 'orchflow-dragfix', 'tauri-app', 'Sublayer')
+$running = Get-Process -Name $appProcessNames -ErrorAction SilentlyContinue
+if ($running) {
+    Write-Host "Stopping running Sublayer app process(es): $(($running | Select-Object -ExpandProperty ProcessName -Unique) -join ', ')"
+    $running | Stop-Process -Force -ErrorAction SilentlyContinue
+    $running | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 300
+}
 
 $runtimeRoot = if ($env:ORCHFLOW_USD_ROOT) { $env:ORCHFLOW_USD_ROOT } else { 'I:\AI\OpenUSD-runtime\25.08' }
 if (-not $env:ORCHFLOW_PYTHON) {
@@ -29,4 +43,15 @@ if (-not (Test-Path $exe)) {
     throw "Built executable not found at $exe"
 }
 
-Start-Process -FilePath $exe -WorkingDirectory $projectRoot
+$launchArgs = @()
+if ($Project) {
+    $launchArgs += @('--project', $Project)
+} elseif (-not $NoLastProject) {
+    $launchArgs += '--last-project'
+}
+
+if ($launchArgs.Count -gt 0) {
+    Start-Process -FilePath $exe -ArgumentList $launchArgs -WorkingDirectory $projectRoot
+} else {
+    Start-Process -FilePath $exe -WorkingDirectory $projectRoot
+}
