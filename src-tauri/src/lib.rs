@@ -294,6 +294,7 @@ async fn export_blender_to_usd(
     blend_path: String,
     usd_path: String,
     selected_objects: Option<Vec<String>>,
+    scene_name: Option<String>,
 ) -> Result<(), String> {
     let _ = app.emit(
         "renderer-status",
@@ -316,6 +317,7 @@ async fn export_blender_to_usd(
             std::path::Path::new(&blend_path),
             std::path::Path::new(&usd_path),
             selected_objects.as_deref(),
+            scene_name.as_deref(),
         )
     })
     .await
@@ -570,7 +572,10 @@ async fn close_hair_groom_window(app: tauri::AppHandle) -> Result<(), String> {
 fn get_window_hwnd(window: tauri::WebviewWindow) -> Result<isize, String> {
     #[cfg(target_os = "windows")]
     {
-        window.hwnd().map(|h| h.0 as isize).map_err(|e| e.to_string())
+        window
+            .hwnd()
+            .map(|h| h.0 as isize)
+            .map_err(|e| e.to_string())
     }
     #[cfg(not(target_os = "windows"))]
     {

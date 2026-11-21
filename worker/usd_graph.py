@@ -1003,23 +1003,23 @@ def _extract_blender_materials(target_scene, material_mode):
 """
 
 
-def _blender_disk_cache_paths(norm_path, mtime, size, export_skeletons=False):
+def _blender_disk_cache_paths(norm_path, mtime, size, export_skeletons=False, scene_name=None):
     import hashlib, tempfile
     cache_dir = os.path.join(tempfile.gettempdir(), 'sublayer_blender_cache')
     path_hash = hashlib.sha256(norm_path.encode('utf-8')).hexdigest()[:12]
     skel_tag = 'skel1' if export_skeletons else 'skel0'
-    key = hashlib.sha256(f"{norm_path}|{mtime}|{size}|v6|{skel_tag}".encode('utf-8')).hexdigest()[:24]
+    key = hashlib.sha256(f"{norm_path}|{mtime}|{size}|v8|{skel_tag}|{scene_name!r}".encode('utf-8')).hexdigest()[:24]
     return cache_dir, os.path.join(cache_dir, f"{path_hash}_{key}.usdc"), os.path.join(cache_dir, f"{path_hash}_{key}.json")
 
 
-def _get_or_extract_full_blender_layer(blend_path, mtime, selected_objects=None, reload=False, material_mode='off', est_seconds=None, convert_procedurals=False, export_skeletons=False):
+def _get_or_extract_full_blender_layer(blend_path, mtime, selected_objects=None, reload=False, material_mode='off', est_seconds=None, convert_procedurals=False, export_skeletons=False, scene_name=None):
     import os, tempfile, subprocess, json
     from pxr import Sdf, UsdUtils
     material_mode = material_mode if material_mode in ('off', 'auto', 'octane', 'cycles') else 'off'
     export_skeletons = bool(export_skeletons)
     norm_path = os.path.normcase(os.path.abspath(blend_path))
     file_size = os.path.getsize(blend_path) if os.path.isfile(blend_path) else 0
-    cache_dir, disk_usdc, disk_json = _blender_disk_cache_paths(norm_path, mtime, file_size, export_skeletons=export_skeletons)
+    cache_dir, disk_usdc, disk_json = _blender_disk_cache_paths(norm_path, mtime, file_size, export_skeletons=export_skeletons, scene_name=scene_name)
     if reload:
         _evict_blender_caches(norm_path)
         for p in (disk_usdc, disk_json):
@@ -1059,7 +1059,9 @@ def _get_or_extract_full_blender_layer(blend_path, mtime, selected_objects=None,
         inst_prefix = f"{name}__inst_"
         return any(o.startswith(inst_prefix) for o in obj_set)
 
-    matching_keys = [k for k in _BLENDER_FULL_LAYER_CACHE if k[0] == norm_path and k[1] == mtime and (len(k) < 4 or k[3] == export_skeletons)]
+    # Key includes both the resolved scene and the requested scene (None means
+    # automatic selection). Never reuse a different scene's shared objects.
+    matching_keys = [k for k in _BLENDER_FULL_LAYER_CACHE if k[0] == norm_path and k[1] == mtime and k[3] == export_skeletons and k[4] == scene_name]
     if matching_keys:
         if not selected_objects:
             k = matching_keys[-1]
@@ -1089,15 +1091,14 @@ def _get_or_extract_full_blender_layer(blend_path, mtime, selected_objects=None,
                 cached = json.load(f)
             cached_objs = set(cached.get("sceneObjects") or [])
             has_mats = bool(cached.get("hasMaterials"))
+            if scene_name and cached.get('scene') != scene_name:
+                raise ValueError('Cached Blender layer belongs to a different scene')
             sel_ok = (not selected_objects) or all(_obj_present(str(x), cached_objs) for x in selected_objects)
             if (sel_ok or prev_entry is None) and (material_mode == 'off' or has_mats):
                 disk_layer = Sdf.Layer.FindOrOpen(disk_usdc)
                 if disk_layer:
-                    raw_layer = Sdf.Layer.CreateAnonymous('blender_full.usdc')
-                    raw_layer.TransferContent(disk_layer)
-                    del disk_layer
                     raw_entry = {
-                        "raw_layer": raw_layer,
+                        "raw_layer": disk_layer,
                         "mat_bundles": cached.get("matBundles") or {},
                         "has_materials": has_mats,
                         "scene": str(cached.get("scene") or ""),
@@ -1106,7 +1107,7 @@ def _get_or_extract_full_blender_layer(blend_path, mtime, selected_objects=None,
                     }
                     if sel_ok:
                         report_status(f"Blender: Loading cached scene layer for {os.path.basename(blend_path)}...")
-                        full_key = (norm_path, mtime, raw_entry["scene"], export_skeletons)
+                        full_key = (norm_path, mtime, raw_entry["scene"], export_skeletons, scene_name)
                         while len(_BLENDER_FULL_LAYER_CACHE) >= _MAX_BLENDER_FULL_CACHE:
                             _BLENDER_FULL_LAYER_CACHE.pop(next(iter(_BLENDER_FULL_LAYER_CACHE)))
                         _BLENDER_FULL_LAYER_CACHE[full_key] = raw_entry
@@ -1121,6 +1122,7 @@ def _get_or_extract_full_blender_layer(blend_path, mtime, selected_objects=None,
         if missing_objs:
             extract_objects = missing_objs
 
+    requested_scene = scene_name
     blender_exe = find_blender_executable()
     if not blender_exe:
         raise ValueError("Blender executable not found. Please configure Blender executable in Applications settings.")
@@ -1161,9 +1163,15 @@ def is_exportable(obj):
         return True
     return False
 
+scene_name = config.get('sceneName')
 scenes = list(bpy.data.scenes)
 win_scene = bpy.context.window.scene if bpy.context.window and bpy.context.window.scene else bpy.context.scene
-if isinstance(selected, list) and len(selected) > 0:
+if scene_name:
+    best = bpy.data.scenes.get(scene_name)
+    if best is None:
+        raise RuntimeError(f'Blender scene {scene_name!r} no longer exists; rescan and select a scene')
+    bpy.context.window.scene = best
+elif isinstance(selected, list) and len(selected) > 0:
     sel_set = set(selected)
     best = max(scenes, key=lambda s: (sum(1 for o in s.objects if o.name in sel_set), 1 if (win_scene and s.name == win_scene.name) else 0))
     if best is not None:
@@ -1462,6 +1470,15 @@ for k in list(kwargs.keys()):
     if k not in props:
         del kwargs[k]
 
+# A single-frame scene is a posed snapshot. Animation export is required for
+# UsdSkel, but must not replace its saved pose with another render-range frame.
+export_scene = bpy.context.scene
+if (kwargs.get('export_armatures') and kwargs.get('export_animation')
+        and export_scene.frame_start == export_scene.frame_end):
+    pose_frame = export_scene.frame_current
+    export_scene.frame_start = pose_frame
+    export_scene.frame_end = pose_frame
+
 res = bpy.ops.wm.usd_export(**kwargs)
 if 'FINISHED' not in res:
     raise RuntimeError(f'bpy.ops.wm.usd_export returned {res}')
@@ -1510,7 +1527,7 @@ print('\nORCHFLOW_BLENDER_EXPORT:SUCCESS', flush=True)
             creationflags=0x08000000 if os.name == 'nt' else 0,
             text=True
         )
-        payload = json.dumps({"usdPath": temp_usd_path, "selectedObjects": extract_objects, "materialMode": material_mode, "exportSkeletons": export_skeletons})
+        payload = json.dumps({"usdPath": temp_usd_path, "selectedObjects": extract_objects, "materialMode": material_mode, "exportSkeletons": export_skeletons, "sceneName": requested_scene})
         try:
             stdout, stderr = proc.communicate(input=payload + "\n")
         finally:
@@ -1539,6 +1556,8 @@ print('\nORCHFLOW_BLENDER_EXPORT:SUCCESS', flush=True)
                     mat_bundles, _ = json.JSONDecoder().raw_decode(line[len("ORCHFLOW_BLENDER_MATERIALS:"):].lstrip())
                 except Exception:
                     pass
+        if requested_scene and scene_name != requested_scene:
+            raise RuntimeError(f'Blender did not confirm export of requested scene {requested_scene!r}')
         temp_layer = Sdf.Layer.FindOrOpen(temp_usd_path)
         if not temp_layer:
             raise RuntimeError("Failed to read exported USD from Blender")
@@ -1612,9 +1631,6 @@ print('\nORCHFLOW_BLENDER_EXPORT:SUCCESS', flush=True)
                     }, f)
                 os.replace(tmp_u, disk_usdc)
                 os.replace(tmp_j, disk_json)
-                import hashlib
-                path_hash = hashlib.sha256(norm_path.encode('utf-8')).hexdigest()[:12]
-                _cleanup_stale_source_cache(cache_dir, path_hash, {os.path.basename(disk_usdc), os.path.basename(disk_json)})
                 _prune_disk_caches(keep_paths=(disk_usdc, disk_json))
         except Exception:
             pass
@@ -1626,7 +1642,7 @@ print('\nORCHFLOW_BLENDER_EXPORT:SUCCESS', flush=True)
             "scene_objects": scene_objects,
             "default_visible": default_visible,
         }
-        full_key = (norm_path, mtime, scene_name, export_skeletons)
+        full_key = (norm_path, mtime, scene_name, export_skeletons, requested_scene)
         while len(_BLENDER_FULL_LAYER_CACHE) >= _MAX_BLENDER_FULL_CACHE:
             _BLENDER_FULL_LAYER_CACHE.pop(next(iter(_BLENDER_FULL_LAYER_CACHE)))
         _BLENDER_FULL_LAYER_CACHE[full_key] = raw_entry
@@ -1763,9 +1779,17 @@ def _filter_blender_stage_in_memory(stage, sel_set):
         if p and p.IsValid() and p.IsA(UsdGeom.Imageable):
             UsdGeom.Imageable(p).MakeInvisible()
 
+    has_sublayer_overlay = bool(stage.GetRootLayer().subLayerPaths)
     for path in to_remove:
-        if stage.GetPrimAtPath(path):
-            stage.RemovePrim(path)
+        p = stage.GetPrimAtPath(path)
+        if p and p.IsValid():
+            if has_sublayer_overlay:
+                p.SetActive(False)
+            else:
+                stage.RemovePrim(path)
+
+    if has_sublayer_overlay:
+        return
 
     def _has_geom_descendant(prim):
         if prim.IsInstance() and prim.GetPath() in kept_instance_paths:
@@ -1817,7 +1841,7 @@ def _filter_blender_stage_in_memory(stage, sel_set):
                 stage.RemovePrim(mat_prim.GetPath())
 
 
-def get_or_extract_blender_memory_stage(blend_path, selections=None, reload=False, material_mode='off', est_seconds=None, convert_procedurals=False, export_skeletons=False):
+def get_or_extract_blender_memory_stage(blend_path, selections=None, reload=False, material_mode='off', est_seconds=None, convert_procedurals=False, export_skeletons=False, scene_name=None):
     import os
     from pxr import Sdf, Usd, UsdGeom
     material_mode = material_mode if material_mode in ('off', 'auto', 'octane', 'cycles') else 'off'
@@ -1828,7 +1852,7 @@ def get_or_extract_blender_memory_stage(blend_path, selections=None, reload=Fals
     mtime = os.path.getmtime(blend_path)
     norm_path = os.path.normcase(os.path.abspath(blend_path))
     sel_key = None if selections is None else tuple(sorted(str(x) for x in selections))
-    cache_key = (norm_path, mtime, sel_key, material_mode, convert_procedurals, export_skeletons)
+    cache_key = (norm_path, mtime, sel_key, material_mode, convert_procedurals, export_skeletons, scene_name)
     if not reload and cache_key in _BLENDER_STAGE_CACHE:
         stage = _BLENDER_STAGE_CACHE.pop(cache_key)
         _BLENDER_STAGE_CACHE[cache_key] = stage
@@ -1846,10 +1870,12 @@ def get_or_extract_blender_memory_stage(blend_path, selections=None, reload=Fals
         _BLENDER_STAGE_CACHE[cache_key] = stage
         return stage
 
-    entry = _get_or_extract_full_blender_layer(blend_path, mtime, selected_objects=selections, reload=reload, material_mode=material_mode, convert_procedurals=convert_procedurals, export_skeletons=export_skeletons)
+    entry = _get_or_extract_full_blender_layer(blend_path, mtime, selected_objects=selections, reload=reload, material_mode=material_mode, convert_procedurals=convert_procedurals, export_skeletons=export_skeletons, scene_name=scene_name)
     full_layer = entry["layer"]
     mem_layer = Sdf.Layer.CreateAnonymous('blender_stage.usdc')
-    mem_layer.TransferContent(full_layer)
+    mem_layer.subLayerPaths = [full_layer.identifier]
+    if full_layer.defaultPrim:
+        mem_layer.defaultPrim = full_layer.defaultPrim
     stage = Usd.Stage.Open(mem_layer)
     if not stage:
         raise RuntimeError("Failed to open in-memory stage from Blender layer")
@@ -1861,6 +1887,8 @@ def get_or_extract_blender_memory_stage(blend_path, selections=None, reload=Fals
     if sel_key is not None or filter_set:
         report_status(f"Blender: Filtering {len(filter_set)} selected object(s)...")
         _filter_blender_stage_in_memory(stage, filter_set)
+    # Keep full_layer alive alongside the cached stage.
+    stage._orchflow_full_layer = full_layer
     while len(_BLENDER_STAGE_CACHE) >= _MAX_BLENDER_STAGE_CACHE:
         _BLENDER_STAGE_CACHE.pop(next(iter(_BLENDER_STAGE_CACHE)))
     _BLENDER_STAGE_CACHE[cache_key] = stage
@@ -1873,6 +1901,7 @@ def _compiled_graph_cache_paths(graph, needed, lookup, files, target):
     dep_stamps = []
     for nid in sorted(needed):
         n = lookup[nid]
+        dep_stamps.extend(_pose_dependency_stamps(n, files))
         for key_name in ('inputDependencyId', 'publishedDependencyId', 'nativeProjectDependencyId'):
             did = n.get(key_name)
             if did and did in files:
@@ -1979,6 +2008,7 @@ def _compiled_graph_cache_paths(graph, needed, lookup, files, target):
     dep_stamps = []
     for nid in sorted(needed):
         n = lookup[nid]
+        dep_stamps.extend(_pose_dependency_stamps(n, files))
         for key_name in ('inputDependencyId', 'publishedDependencyId', 'nativeProjectDependencyId'):
             did = n.get(key_name)
             if did and did in files:
@@ -2149,7 +2179,7 @@ def open_hair_preview_stage(stage, graph):
     return preview
 
 
-def compile_graph(graph, reload=False, *, live_transforms=None, mx_selections_out=None, interactive_hair=False, _disk_cache_threshold=0.35):
+def compile_graph(graph, reload=False, *, live_transforms=None, live_poses=None, mx_selections_out=None, interactive_hair=False, _disk_cache_threshold=0.35):
     import time
     from pxr import Gf, Sdf, Usd, UsdGeom, UsdUtils
     compile_start = time.perf_counter()
@@ -2218,6 +2248,7 @@ def compile_graph(graph, reload=False, *, live_transforms=None, mx_selections_ou
         not live_hair_nodes
         and all(lookup[nid].get('loadPayloads', True) is not False for nid in needed)
         and not any(lookup[nid].get('useAsPayload') for nid in needed)
+        and not any(lookup[nid].get('operation') == 'blender' for nid in needed)
         and not any(lookup[nid].get('operation') == 'application' and lookup[nid].get('liveAdjustment') for nid in needed)
     )
     graph_cache_paths = _compiled_graph_cache_paths(graph, needed, lookup, files, target) if can_disk_cache else None
@@ -2396,7 +2427,7 @@ def compile_graph(graph, reload=False, *, live_transforms=None, mx_selections_ou
     def _node_cache_sig(nid):
         import json as _json
         n = lookup[nid]
-        dep_stamps = []
+        dep_stamps = _pose_dependency_stamps(n, files)
         for k_name in ('inputDependencyId', 'publishedDependencyId', 'nativeProjectDependencyId'):
             did = n.get(k_name)
             if did and did in files:
@@ -2465,12 +2496,13 @@ def compile_graph(graph, reload=False, *, live_transforms=None, mx_selections_ou
                 material_mode = node.get('blenderMaterialMode') or 'off'
                 convert_procedurals = bool(node.get('blenderConvertProcedurals', False))
                 export_skeletons = bool(node.get('blenderExportSkeletons', False))
-                asset_key_tuple = ('blender', os.path.normcase(os.path.abspath(blend_path)), mtime, sel_key, instanced, material_mode, convert_procedurals, export_skeletons)
+                scene_name = node.get('blenderScene') or None
+                asset_key_tuple = ('blender', os.path.normcase(os.path.abspath(blend_path)), mtime, sel_key, instanced, material_mode, convert_procedurals, export_skeletons, scene_name)
                 if asset_key_tuple in assets:
                     wrapped = assets[asset_key_tuple]
                 else:
                     est_secs = node.get('lastExtractionSeconds')
-                    b_stage = get_or_extract_blender_memory_stage(blend_path, selections, reload=reload, material_mode=material_mode, est_seconds=est_secs, convert_procedurals=convert_procedurals, export_skeletons=export_skeletons)
+                    b_stage = get_or_extract_blender_memory_stage(blend_path, selections, reload=reload, material_mode=material_mode, est_seconds=est_secs, convert_procedurals=convert_procedurals, export_skeletons=export_skeletons, scene_name=scene_name)
                     keepalive.append(b_stage)
                     wrapped = wrap_source_stage(b_stage, instanced=instanced)
                     assets[asset_key_tuple] = wrapped
@@ -2479,10 +2511,24 @@ def compile_graph(graph, reload=False, *, live_transforms=None, mx_selections_ou
                 inputs.insert(0, ('own-source', source_stage(usd_dep, instanced=instanced)))
             elif not inputs:
                 raise ValueError(f'Blender node "{node.get("label", id)}" needs a linked .blend file.')
-        elif operation not in ('source', 'blender', 'transform', 'group', 'output', 'assetOverride', 'materialx', 'material_bind', 'light', 'hdri', 'hair', 'cache_edit', 'camera', 'delete', 'scatter', 'character'):
+        elif operation not in ('source', 'blender', 'transform', 'group', 'output', 'assetOverride', 'materialx', 'material_bind', 'light', 'hdri', 'hair', 'cache_edit', 'camera', 'delete', 'scatter', 'character', 'pose'):
             raise ValueError(f'Unsupported USD graph operation: {operation}')
         if not inputs:
             raise ValueError(f'{operation.title()} node needs a linked USD file or incoming USD connection')
+        if operation == 'pose':
+            if len(inputs) != 1:
+                raise ValueError('Pose needs one upstream stage; combine inputs with Output first')
+            upstream = inputs[0][1]
+            overlay = Sdf.Layer.CreateAnonymous('pose.usda')
+            overlay.subLayerPaths = [upstream.GetRootLayer().identifier]
+            stage = Usd.Stage.Open(overlay)
+            inherit_stage_metrics(stage, upstream)
+            stage.SetDefaultPrim(stage.GetPrimAtPath(upstream.GetDefaultPrim().GetPath()))
+            keepalive.extend([upstream, overlay, stage])
+            from pose_node import apply_pose
+            apply_pose(stage, node, files, keepalive, reload, live_poses=live_poses)
+            results[id] = stage
+            return
         if operation == 'character':
             stage, alive_char = compose_character_node(inputs, node, files=files, reload=reload, wrap_fn=wrap_source_stage)
             keepalive.extend(alive_char)
@@ -2661,6 +2707,7 @@ def compile_graph(graph, reload=False, *, live_transforms=None, mx_selections_ou
             id != live_node_id
             and id not in live_hair_nodes
             and op not in ('application', 'assetOverride')
+            and not (live_poses is not None and op == 'pose')
             and not skip_sim_active
             and not (mx_selections_out is not None and node.get('materialXRules') is not None)
         )
@@ -4403,11 +4450,78 @@ def _hair_query_matches(raw_query, prim_path_str):
     return any(_hit(t) for t in includes)
 
 
-def inspect_stage_skeletons(request):
-    from pxr import Usd, UsdGeom, UsdSkel
+_SKELETON_INSPECT_CACHE = None
 
-    graph = request['graph']
-    stage, alive, _ = compile_graph(graph, reload=bool(request.get('reload', False)))
+
+def pose_only_node(prev_graph, next_graph, live_poses):
+    if not isinstance(prev_graph, dict) or not isinstance(next_graph, dict) or not live_poses:
+        return None
+    target_id = next_graph.get('targetNodeId')
+    if not target_id or prev_graph.get('targetNodeId') != target_id:
+        return None
+    if any(
+        prev_graph.get(k) != next_graph.get(k)
+        for k in set(prev_graph.keys()) | set(next_graph.keys())
+        if k != 'nodes'
+    ):
+        return None
+    prev_nodes = prev_graph.get('nodes')
+    next_nodes = next_graph.get('nodes')
+    if not isinstance(prev_nodes, list) or not isinstance(next_nodes, list) or len(prev_nodes) != len(next_nodes):
+        return None
+    changed_node = None
+    for pn, nn in zip(prev_nodes, next_nodes):
+        if pn == nn:
+            continue
+        if (
+            not isinstance(pn, dict)
+            or not isinstance(nn, dict)
+            or pn.get('id') != nn.get('id')
+            or nn.get('id') not in live_poses
+            or nn.get('operation') != 'pose'
+        ):
+            return None
+        if {k: v for k, v in pn.items() if k != 'pose'} != {k: v for k, v in nn.items() if k != 'pose'}:
+            return None
+        if changed_node is not None:
+            return None
+        changed_node = nn
+    return changed_node
+
+
+def inspect_stage_skeletons(request):
+    global _SKELETON_INSPECT_CACHE
+    from pxr import Gf, Usd, UsdGeom, UsdSkel
+
+    if request.get('path'):
+        stage = _open_source_stage(request['path'], reload=bool(request.get('reload', False)))
+        alive = [stage]
+    else:
+        import copy
+        graph = request['graph']
+        reload_flag = bool(request.get('reload', False))
+        stage = None
+        if not reload_flag and _SKELETON_INSPECT_CACHE is not None:
+            c_graph, c_stage, c_alive, c_poses = _SKELETON_INSPECT_CACHE
+            if graph == c_graph:
+                stage, alive = c_stage, c_alive
+            else:
+                changed = pose_only_node(c_graph, graph, c_poses)
+                if changed is not None:
+                    from pose_node import update_live_pose
+                    if update_live_pose(changed, c_poses[changed['id']]):
+                        _SKELETON_INSPECT_CACHE = (graph, c_stage, c_alive, c_poses)
+                        stage, alive = c_stage, c_alive
+        if stage is None:
+            live_poses = {}
+            stage, alive, _ = compile_graph(graph, reload_flag, live_poses=live_poses)
+            _SKELETON_INSPECT_CACHE = (graph, stage, alive, live_poses)
+    cache = UsdSkel.Cache()
+    for p in stage.Traverse():
+        if p.IsA(UsdSkel.Root):
+            cache.Populate(UsdSkel.Root(p), Usd.PrimDefaultPredicate)
+    sample_time = float(request.get('frame', stage.GetStartTimeCode()))
+    xforms = UsdGeom.XformCache(sample_time)
     skeletons = []
     animations = []
     prims = []
@@ -4415,10 +4529,35 @@ def inspect_stage_skeletons(request):
         if prim.IsA(UsdSkel.Skeleton):
             skel = UsdSkel.Skeleton(prim)
             joints = skel.GetJointsAttr().Get()
+            query = cache.GetSkelQuery(skel)
+            anim_query = query.GetAnimQuery() if query else None
+            blend_shapes = list(anim_query.GetBlendShapeOrder()) if anim_query else []
+            blend_weights = list(anim_query.ComputeBlendShapeWeights(sample_time) or []) if anim_query else []
+            local = query.ComputeJointLocalTransforms(sample_time) if query else skel.GetRestTransformsAttr().Get()
+            joint_data = []
+            world_points = []
+            world_axes = []
+            if local:
+                translations, rotations, scales = UsdSkel.DecomposeTransforms(local)
+                joint_data = [{'name':str(name), 'translation':list(t), 'rotation':[q.GetReal(), *q.GetImaginary()], 'scale':list(scale), 'rotationOffset':[0,0,0], 'translationOffset':[0,0,0]} for name,t,q,scale in zip(joints, translations, rotations, scales)]
+                world = xforms.GetLocalToWorldTransform(prim)
+                skel_transforms = query.ComputeJointSkelTransforms(sample_time) if query else []
+                world_mats = [m * world for m in skel_transforms]
+                world_points = [list(wm.ExtractTranslation()) for wm in world_mats]
+                world_axes = [
+                    [
+                        list(wm.TransformDir(Gf.Vec3d(1, 0, 0)).GetNormalized()),
+                        list(wm.TransformDir(Gf.Vec3d(0, 1, 0)).GetNormalized()),
+                        list(wm.TransformDir(Gf.Vec3d(0, 0, 1)).GetNormalized()),
+                    ]
+                    for wm in world_mats
+                ]
             skeletons.append({
                 'path': str(prim.GetPath()),
                 'name': prim.GetName(),
                 'joints': [str(j) for j in joints] if joints else [],
+                'blendShapes':blend_shapes, 'blendShapeWeights':blend_weights,
+                'poseJoints': joint_data, 'worldPoints':world_points, 'worldAxes': world_axes, 'parents':list(UsdSkel.Topology(joints).GetParentIndices()),
                 'instanceProxy': bool(prim.IsInstanceProxy()),
             })
         elif prim.IsA(UsdSkel.Animation):
@@ -6006,3 +6145,14 @@ def convert_source_to_usd(request):
         'primCount': sum(1 for _ in stage.Traverse()),
         'sourceFormat': os.path.splitext(path)[1].lstrip('.').lower(),
     }
+
+
+def _pose_dependency_stamps(node, files):
+    result = []
+    for entry in (node.get('pose') or {}).get('entries', []):
+        did = entry.get('dependencyId')
+        if did:
+            path = os.path.normcase(os.path.realpath(files.get(did, '')))
+            stat = os.stat(path) if os.path.isfile(path) else None
+            result.append((did, path, stat.st_mtime_ns if stat else 0, stat.st_size if stat else 0))
+    return result

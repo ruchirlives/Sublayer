@@ -12,6 +12,7 @@ Sublayer is a Windows desktop application built with **Tauri 2**, **React / Type
   - Interactive orbit/pan/dolly, transform & camera gizmos, prim selection/isolation, scene overview, and GPU cache controls (`Reload stage`, `Flush GPU`).
 - **Materials & Shading**: `MaterialX` authoring (Standard Surface with `UsdPreviewSurface` fallback, procedural shading rules, `.mtlx` export) and `Material Bind` nodes, with selective Auto/Scene/Solid material preview diagnostics for missing shader assets.
 - **Hair, Cloth & Character Tools**: `Hair` node (NVIDIA Warp GPU physics simulation and guide-based interactive grooming), `Cache Sculptor` (`cache_edit` for cloth physics brushing and full-garment GPU cloth simulation), and `Character` nodes.
+- **Pose node**: Map upstream skeletons to loaded USD animations or poses in an inspector table. Switch entries, bypass individual mappings, play clips, or sample a fixed pose frame. Compatible joint names are required; no automatic retargeting. External animation assets stay linked in place.
 - **Lighting & Cameras**: `Light`, `HDRI`, and `Camera` nodes.
 - **DCC & Application Round Trips**: `Blender` and `Application` nodes with explicit handoff export, reversible coordinate/axis conversion snapshots, baseline comparison, selective sparse adjustment publishing, and upstream reconciliation (plus profile templates for ZBrush, Marvelous Designer, and Substance Painter).
 - **Local MCP Server**: `orchflow-mcp` exposes headless USD inspection, stage composition, and rendering over stdio.

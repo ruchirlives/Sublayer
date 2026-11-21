@@ -1,3 +1,4 @@
+import type { PoseEditing } from "./PoseViewportEditor";
 import {InspectorHint} from "./InspectorHint";
 import {HdriInspector} from "./HdriInspector";
 import {NumberInput} from "./NumberInput";
@@ -53,6 +54,7 @@ import { MaterialBindingInspector } from "./MaterialBindingInspector";
 import { LightInspector } from "./LightInspector";
 const HairInspector = lazy(() => import("./HairInspector").then((m) => ({ default: m.HairInspector })));
 const CacheEditInspector = lazy(() => import("./CacheEditInspector").then((m) => ({ default: m.CacheEditInspector })));
+const PoseInspector = lazy(() => import("./PoseInspector").then((m) => ({ default: m.PoseInspector })));
 const CharacterInspector = lazy(() => import("./CharacterInspector").then((m) => ({ default: m.CharacterInspector })));
 const BlenderInspector = lazy(() => import("./BlenderInspector").then((m) => ({ default: m.BlenderInspector })));
 import { TransformInspector } from "./TransformInspector";
@@ -323,7 +325,7 @@ const Card = memo(function Card({ id, data, selected }: NodeProps<StageNode>) {
       <div className="card-body">
         <strong>{data.label}</strong>
         <p>
-          {["delete", "scatter", "transform", "group", "output", "assetOverride", "materialx", "material_bind", "light", "hdri", "hair", "cache_edit", "character"].includes(data.operation)
+          {["delete", "scatter", "transform", "group", "output", "assetOverride", "materialx", "material_bind", "light", "hdri", "hair", "cache_edit", "pose", "character"].includes(data.operation)
             ? "Combined USD inputs"
             : data.operation === "blender"
               ? (data.nativeProject?.split(/[\\/]/).pop() || "No .blend linked")
@@ -367,6 +369,8 @@ const Card = memo(function Card({ id, data, selected }: NodeProps<StageNode>) {
           ? `/${(data.groupName || "Group").trim() || "Group"} · scale ${(data.transform || identityTransform).scale.join(", ")}`
           : data.operation === "scatter"
           ? `${(data.scatter || defaultScatter).count} instances · ${(data.scatter || defaultScatter).distribution}`
+          : data.operation === "pose"
+          ? `${(data.pose?.mappings || []).filter(r => r.enabled !== false && r.entryId).length} skeleton mappings`
           : data.operation === "character"
           ? `${(data.character?.animationOverrides || []).filter((r) => r.enabled).length} anim · ${(data.character?.skeletonBindings || []).filter((r) => r.enabled).length} skel · ${(data.character?.jointAttachments || []).filter((r) => r.enabled).length} joint`
           : data.operation === "output"
@@ -414,6 +418,7 @@ function Workspace() {
   const [inspectorWidth, setInspectorWidth] = useState(310);
   const [resizingInspector, setResizingInspector] = useState(false);
   const [viewportFrame, setViewportFrame] = useState(0);
+  const [poseEditing,setPoseEditing] = useState<PoseEditing|null>(null);
   const [seekFrameRequest, setSeekFrameRequest] = useState<{ frame: number; seq: number } | null>(null);
   const viewportFrameRef = useRef(0);
   viewportFrameRef.current = viewportFrame;
@@ -454,6 +459,7 @@ function Workspace() {
   const scanPromise = useRef<Promise<void> | null>(null);
   const projectSession=useRef(0);
   const currentProjectSession=projectSession.current;
+  useEffect(()=>setPoseEditing(null),[currentProjectSession]);
   const [clearScenePrompt,setClearScenePrompt]=useState(false);
   const clearSceneDialog=useRef<HTMLDialogElement>(null);
   useEffect(()=>{
@@ -1339,6 +1345,20 @@ function Workspace() {
                   "Cache sculpt stroke",
                 );
               }}
+              poseEditor={poseEditing && node?.id===poseEditing.nodeId && node.data.pose?.entries.find(e=>e.id===poseEditing.entryId)?.joints ? {
+                ...poseEditing,
+                joints:node.data.pose.entries.find(e=>e.id===poseEditing.entryId)!.joints!,
+                onSelectJoint:jointIndex=>setPoseEditing({...poseEditing,jointIndex}),
+                onRotateJoint:(jointIndex,axis,value)=>{
+                  const current=projectRef.current.nodes.find(n=>n.id===poseEditing.nodeId)?.data.pose;
+                  if(!current)return;
+                  const pose={...current,entries:current.entries.map(entry=>entry.id===poseEditing.entryId?{...entry,joints:entry.joints?.map((joint,index)=>{
+                    if(index!==jointIndex)return joint;const rotationOffset=[...joint.rotationOffset] as [number,number,number];rotationOffset[axis]=value;return {...joint,rotationOffset};
+                  })}:entry)};
+                  applyProject(editNodeData(projectRef.current,poseEditing.nodeId,{pose}),"Rotate pose joint",`pose-drag:${poseEditing.nodeId}:${poseEditing.entryId}:${jointIndex}`);
+                },
+                onCommit:()=>history.current.endGroup(),
+              }:null}
               transformGizmo={
                 node?.data.operation === "transform"
                   ? {
@@ -1452,6 +1472,7 @@ function Workspace() {
                 ["hair", "Hair"],
                 ["cache_edit", "Cache Sculptor"],
                 ["character", "Character"],
+                ["pose", "Pose"],
                 ["camera", "Camera"],
                 ["delete", "Delete prims"],
                 ["scatter", "Scatter"],
@@ -2030,6 +2051,15 @@ function Workspace() {
                   </Suspense>
                 )}
 
+                {node.data.operation === "pose" && (
+                  <Suspense fallback={<p>Loading Pose...</p>}>
+                    <PoseInspector key={node.id} value={node.data.pose} graph={graphPreview(projectModel,node.id)} dependencies={dependencies}
+                      currentFrame={viewportFrame} editing={poseEditing?.nodeId===node.id?poseEditing:null}
+                      onEdit={edit=>{setPoseEditing(edit?{...edit,nodeId:node.id}:null);if(edit)pin(node.id);}}
+                      onStatus={reportStatus} onChange={(pose,nextDeps) => applyProject({...projectModel, dependencies:nextDeps || dependencies,
+                        nodes:projectModel.nodes.map(n => n.id===node.id?{...n,data:{...n.data,pose}}:n)}, "Update Pose",document.activeElement?.tagName==="INPUT"?`pose-field:${node.id}`:null)} />
+                  </Suspense>
+                )}
                 {node.data.operation === "character" && (
                   <Suspense fallback={<p className="hint">Loading character inspector...</p>}>
                     <CharacterInspector

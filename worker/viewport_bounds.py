@@ -116,7 +116,16 @@ def isolate_prim_in_stage(stage, isolated_path_str):
     from pxr import Sdf, Usd, UsdGeom, UsdLux
 
     session = stage.GetSessionLayer()
-    session.Clear()
+
+    def _clear_vis(prim_spec):
+        if 'visibility' in prim_spec.properties:
+            prim_spec.RemoveProperty(prim_spec.properties['visibility'])
+        for child in list(prim_spec.nameChildren):
+            _clear_vis(child)
+
+    for root_spec in list(session.rootPrims):
+        _clear_vis(root_spec)
+
     if not isolated_path_str:
         return
 

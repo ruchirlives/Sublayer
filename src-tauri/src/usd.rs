@@ -127,7 +127,7 @@ fn ensure_worker_script_dir() -> Result<std::path::PathBuf, String> {
             return Ok(dir);
         }
     }
-    let files: [(&str, &str); 11] = [
+    let files: [(&str, &str); 12] = [
         (
             "geometry_exports.py",
             include_str!("../../worker/geometry_exports.py"),
@@ -150,6 +150,7 @@ fn ensure_worker_script_dir() -> Result<std::path::PathBuf, String> {
         ),
         ("cache_edit.py", include_str!("../../worker/cache_edit.py")),
         ("usd_graph.py", include_str!("../../worker/usd_graph.py")),
+        ("pose_node.py", include_str!("../../worker/pose_node.py")),
         (
             "usd_publish.py",
             include_str!("../../worker/usd_publish.py"),

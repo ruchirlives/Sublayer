@@ -1,3 +1,4 @@
+import { PoseViewportEditor, type LivePoseOverride, type PoseViewportProps } from "./PoseViewportEditor";
 import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent, type ReactNode } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -18,6 +19,8 @@ type Capabilities = {
   viewportError?: string;
 };
 type Frame = {
+  viewProjection?:number[][];
+  poseBones?: { worldPoints: number[][]; worldAxes: number[][][] } | null;
   image: string;
   imageBitmap?: ImageBitmap;
   viewportImageId?: string;
@@ -107,6 +110,7 @@ export function NativeViewport({
   comparison,
   viewportSettings,
   transformGizmo,
+  poseEditor,
   onRuntime,
   onMode,
   onSelectPrim,
@@ -129,6 +133,7 @@ export function NativeViewport({
   cameraKey?:string;
   comparison?:string;
   viewportSettings?: ViewportSettings;
+  poseEditor?: PoseViewportProps | null;
   transformGizmo?: {
     nodeId: string;
     transform: Transform;
@@ -331,12 +336,18 @@ export function NativeViewport({
   const [interacting, setInteracting] = useState(false);
   const [gizmoDragging, setGizmoDragging] = useState(false);
   const gizmoDraggingRef = useRef(false);
+  const [poseInteracting, setPoseInteracting] = useState(false);
+  const [livePoseOverride, setLivePoseOverride] = useState<LivePoseOverride | null>(null);
   const onGizmoInteractingChange = useCallback((active: boolean) => {
     gizmoDraggingRef.current = active;
     setGizmoDragging(active);
     setInteracting(active);
     if (active) setActiveStatus(null);
   }, []);
+  const onPoseInteractingChange = useCallback((active: boolean) => {
+    setPoseInteracting(active);
+    onGizmoInteractingChange(active);
+  }, [onGizmoInteractingChange]);
 
   const sameCamera = (
     a: typeof camera | null | undefined,
@@ -828,6 +839,7 @@ export function NativeViewport({
       if (Array.isArray(parsed?.nodes)) {
         parsed.nodes = parsed.nodes.map((n: Record<string, unknown>) => {
           if (n?.operation === "transform") return { ...n, transform: null };
+          if (n?.operation === "pose") return { ...n, pose: null };
           if (n?.operation === "cache_edit" && n.cacheEdit && typeof n.cacheEdit === "object") {
             const ce = n.cacheEdit as Record<string, unknown>;
             return {
@@ -1245,6 +1257,8 @@ export function NativeViewport({
           : undefined,
       showHairPins: (combMode || hairPopupOpen) && (showPins || brushTool === "pin" || brushTool === "unpin"),
       showCacheMask: effectiveShowCacheMask,
+      poseInteracting: poseInteracting || undefined,
+      livePose: livePoseOverride ?? undefined,
       revision,
       reloadTrigger,
       };
@@ -1282,6 +1296,8 @@ export function NativeViewport({
       revision,
       reloadTrigger,
       interacting,
+      poseInteracting,
+      livePoseOverride,
       gizmoNodeId,
       selectedPrim,
       isolatedPrim,
@@ -2163,6 +2179,7 @@ export function NativeViewport({
             />
           );
         })()}
+        {poseEditor && graph && frame && <PoseViewportEditor editor={poseEditor} graph={graph} frame={time} matrix={frame.viewProjection} width={size.width} height={size.height} interactive={sceneMode} onInteractingChange={onPoseInteractingChange} onLiveRotateJoint={setLivePoseOverride} liveBones={frame.poseBones ?? null} />}
         {transformGizmo && gizmoNodeId && frame?.cameraAnchor?.transformTarget === gizmoNodeId && (
           <TransformGizmo
             transform={transformGizmo.transform}

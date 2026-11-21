@@ -250,6 +250,7 @@ pub fn export_blender_to_usd(
     blend_path: &Path,
     usd_path: &Path,
     selected_objects: Option<&[String]>,
+    scene_name: Option<&str>,
 ) -> Result<(), String> {
     let _export_guard = BLENDER_EXPORT_MUTEX
         .lock()
@@ -276,8 +277,14 @@ if not line:
 config = json.loads(line)
 usd_path = config['usdPath']
 selected = config.get('selectedObjects')
+scene_name = config.get('sceneName')
 
-if isinstance(selected, list) and len(selected) > 0 and len(bpy.data.scenes) > 1:
+if scene_name:
+    target_scene = bpy.data.scenes.get(scene_name)
+    if target_scene is None:
+        raise RuntimeError(f'Blender scene {scene_name!r} no longer exists; rescan and select a scene')
+    bpy.context.window.scene = target_scene
+elif isinstance(selected, list) and len(selected) > 0 and len(bpy.data.scenes) > 1:
     sel_set_init = set(selected)
     win_scene = bpy.context.window.scene if bpy.context.window and bpy.context.window.scene else bpy.context.scene
     best = max(bpy.data.scenes, key=lambda s: (sum(1 for o in s.objects if o.name in sel_set_init), 1 if (win_scene and s.name == win_scene.name) else 0))
@@ -363,6 +370,8 @@ kwargs = {
 }
 if 'convert_orientation' in props:
     kwargs['convert_orientation'] = True
+if 'export_animation' in props:
+    kwargs['export_animation'] = True
 
 for obj in bpy.context.view_layer.objects:
     for attr in ('hide_viewport', 'hide_render'):
@@ -519,7 +528,36 @@ for k in list(kwargs.keys()):
     if k not in props:
         del kwargs[k]
 
+# A single-frame scene is a posed snapshot. Animation export is required for
+# UsdSkel, but must not replace its saved pose with another render-range frame.
+export_scene = bpy.context.scene
+if (kwargs.get('export_armatures') and kwargs.get('export_animation')
+        and export_scene.frame_start == export_scene.frame_end):
+    pose_frame = export_scene.frame_current
+    export_scene.frame_start = pose_frame
+    export_scene.frame_end = pose_frame
+
 res = bpy.ops.wm.usd_export(**kwargs)
+try:
+    from pxr import Usd, UsdSkel
+    stage = Usd.Stage.Open(usd_path)
+    if stage:
+        tc = Usd.TimeCode(bpy.context.scene.frame_current)
+        changed = False
+        for prim in stage.Traverse():
+            if prim.IsA(UsdSkel.Animation):
+                anim = UsdSkel.Animation(prim)
+                for attr_fn in (anim.GetTranslationsAttr, anim.GetRotationsAttr, anim.GetScalesAttr):
+                    attr = attr_fn()
+                    if attr and attr.HasAuthoredValue() and attr.Get(Usd.TimeCode.Default()) is None:
+                        val = attr.Get(tc)
+                        if val is not None:
+                            attr.Set(val, Usd.TimeCode.Default())
+                            changed = True
+        if changed:
+            stage.GetRootLayer().Save()
+except Exception:
+    pass
 if 'FINISHED' not in res:
     raise RuntimeError(f'bpy.ops.wm.usd_export returned {res}')
 
@@ -553,7 +591,8 @@ print('ORCHFLOW_BLENDER_EXPORT:SUCCESS')
         .map_err(|e| format!("Cannot start Blender: {e}"))?;
     let config = serde_json::json!({
         "usdPath": usd_path.to_string_lossy(),
-        "selectedObjects": selected_objects
+        "selectedObjects": selected_objects,
+        "sceneName": scene_name
     });
 
     if let Some(mut stdin) = child.stdin.take() {
@@ -610,6 +649,7 @@ mod tests {
                         "nativeProjectDependencyId": "dep_blend",
                         "publishedDependencyId": "dep_usd",
                         "blenderSelections": ["Suzanne", "Cube"],
+                        "blenderScene": "Octane",
                         "blenderObjects": [
                             { "name": "Suzanne", "type": "MESH", "vertices": 507, "polygons": 500 },
                             { "name": "Cube", "type": "MESH", "vertices": 8, "polygons": 6 }
@@ -630,6 +670,11 @@ mod tests {
             .expect("Project validation must succeed for blender node");
         let node = &project.nodes[0];
         assert_eq!(node.data.operation, "blender");
+        assert_eq!(node.data.blender_scene.as_deref(), Some("Octane"));
+        let saved = serde_json::to_value(&project).unwrap();
+        assert_eq!(saved["nodes"][0]["data"]["blenderScene"], "Octane");
+        let graph = crate::application::evaluation_graph(&project, "b1", false).unwrap();
+        assert_eq!(graph["nodes"][0]["blenderScene"], "Octane");
         assert_eq!(
             node.data.blender_selections.as_ref().unwrap(),
             &vec!["Suzanne", "Cube"]

@@ -378,6 +378,7 @@ pub fn evaluation_graph(
         }
         used.extend(n.data.asset_overrides.iter().map(|o| &o.replacement_dependency_id));
         if let Some(h) = &n.data.hdri { if let Some(tid) = &h.texture_dependency_id { used.insert(tid); } }
+        if let Some(pose) = &n.data.pose { for entry in &pose.entries { used.extend(entry.dependency_id.iter()); } }
         if let Some(ch) = &n.data.character {
             for cc in &ch.cloth_caches {
                 if let Some(did) = &cc.dependency_id {
@@ -389,7 +390,7 @@ pub fn evaluation_graph(
         }
         if !(n.id==node_id && application_input) {if let Some(live)=&n.data.live_adjustment {used.insert(&live.edited_dependency_id);used.insert(&live.baseline_dependency_id);used.insert(&live.handoff_dependency_id);}}
         let mut value=serde_json::json!({"id":n.id,"operation":operation,"inputDependencyId":n.data.input_dependency_id,"publishedDependencyId":published,"nativeProjectDependencyId":if n.id == node_id && application_input { None } else { n.data.native_project_dependency_id.as_ref() },"instanced":n.data.instanced.unwrap_or(false),"axis":n.data.axis,"frontAxis":n.data.front_axis,"scale":n.data.scale,"transform":n.data.transform,"assetOverrides":n.data.asset_overrides,"publication":if n.id == node_id && application_input {None} else {n.data.publication.as_ref().map(|p|serde_json::json!({"sourceRevisions":p.source_revisions}))}});
-        if n.data.operation=="blender"{if let Some(sel)=&n.data.blender_selections{value["blenderSelections"]=serde_json::to_value(sel).unwrap();}if let Some(mode)=&n.data.blender_material_mode{value["blenderMaterialMode"]=serde_json::to_value(mode).unwrap();}if let Some(cp)=n.data.blender_convert_procedurals{value["blenderConvertProcedurals"]=serde_json::to_value(cp).unwrap();}if let Some(es)=n.data.blender_export_skeletons{value["blenderExportSkeletons"]=serde_json::to_value(es).unwrap();}if let Some(secs)=n.data.last_extraction_seconds{value["lastExtractionSeconds"]=serde_json::to_value(secs).unwrap();}}
+        if n.data.operation=="blender"{if let Some(scene)=&n.data.blender_scene{value["blenderScene"]=serde_json::to_value(scene).unwrap();}if let Some(sel)=&n.data.blender_selections{value["blenderSelections"]=serde_json::to_value(sel).unwrap();}if let Some(mode)=&n.data.blender_material_mode{value["blenderMaterialMode"]=serde_json::to_value(mode).unwrap();}if let Some(cp)=n.data.blender_convert_procedurals{value["blenderConvertProcedurals"]=serde_json::to_value(cp).unwrap();}if let Some(es)=n.data.blender_export_skeletons{value["blenderExportSkeletons"]=serde_json::to_value(es).unwrap();}if let Some(secs)=n.data.last_extraction_seconds{value["lastExtractionSeconds"]=serde_json::to_value(secs).unwrap();}}
 if n.data.operation=="camera"{if let Some(cam)=&n.data.camera{value["camera"]=serde_json::to_value(cam).unwrap();}if let Some(views)=&n.data.camera_views{value["cameraViews"]=serde_json::to_value(views).unwrap();}}
         if !(n.id==node_id && application_input) {if let Some(live)=&n.data.live_adjustment {value["liveAdjustment"]=serde_json::to_value(live).unwrap();value["publishedDependencyId"]=serde_json::Value::Null;value["publication"]=serde_json::Value::Null;}}
         if n.data.operation=="delete" {value["deletePaths"]=serde_json::to_value(&n.data.delete_paths).unwrap();}
@@ -400,6 +401,7 @@ if n.data.operation=="camera"{if let Some(cam)=&n.data.camera{value["camera"]=se
         if n.data.operation=="hdri"{if let Some(hdri)=&n.data.hdri {value["hdri"]=serde_json::to_value(hdri).unwrap();}}
         if n.data.operation=="hair"{if let Some(hair)=&n.data.hair {value["hair"]=serde_json::to_value(hair).unwrap();}}
         if n.data.operation=="cache_edit"{if let Some(ce)=&n.data.cache_edit {value["cacheEdit"]=serde_json::to_value(ce).unwrap();}}
+        if n.data.operation=="pose" { value["pose"]=serde_json::to_value(&n.data.pose).unwrap(); }
         if n.data.operation=="character"{if let Some(ch)=&n.data.character {value["character"]=serde_json::to_value(ch).unwrap();}}
         if !(n.id == node_id && application_input) {
             if let Some(publication)=&n.data.publication {if !publication.revision.is_empty(){value["publication"]["revision"]=publication.revision.clone().into();}}

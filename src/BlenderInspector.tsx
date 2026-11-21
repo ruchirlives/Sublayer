@@ -68,7 +68,7 @@ export function BlenderInspector({
   const [customUsdPath, setCustomUsdPath] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
   const [sceneFilter, setSceneFilter] = useState<string | null>(() =>
-    getPreferredSceneName(objects)
+    node?.data.blenderScene || getPreferredSceneName(objects)
   );
 
   const [pendingSelections, setPendingSelections] = useState<string[] | null>(null);
@@ -86,7 +86,7 @@ export function BlenderInspector({
   );
   const blendPath = blendDep?.path || "";
 
-  function commitSelections(targetNodeId: string, next: string[]): StoredProject {
+  function commitSelections(targetNodeId: string, next: string[], sceneName?: string): StoredProject {
     const currentProject = projectRef.current;
     const updatedProject: StoredProject = {
       ...currentProject,
@@ -98,6 +98,7 @@ export function BlenderInspector({
               data: {
                 ...n.data,
                 blenderSelections: next,
+                ...(sceneName ? { blenderScene: sceneName } : {}),
               },
             }
       ),
@@ -123,7 +124,7 @@ export function BlenderInspector({
     if (nodeIdRef.current !== nodeId) {
       flushPendingSelections();
       nodeIdRef.current = nodeId;
-      setSceneFilter(getPreferredSceneName(objects));
+      setSceneFilter(node?.data.blenderScene || getPreferredSceneName(objects));
     }
     setPendingSelections(null);
     pendingSelectionsRef.current = null;
@@ -188,7 +189,7 @@ export function BlenderInspector({
       entry.allNamesSet.add(o.name);
       if (o.sceneVisible !== false) entry.visibleNamesSet.add(o.name);
       const cols = o.collections && o.collections.length > 0 ? o.collections : ["Scene Collection"];
-      const isSelected = selectedSet.has(o.name);
+      const isSelected = node?.data.blenderScene === sName && selectedSet.has(o.name);
       for (const colName of cols) {
         entry.collections.add(colName);
         if (o.sceneVisible !== false) entry.visibleCollections.add(colName);
@@ -198,7 +199,7 @@ export function BlenderInspector({
     return Array.from(map.values()).map((entry) => {
       const allNames = Array.from(entry.allNamesSet);
       const visibleNames = Array.from(entry.visibleNamesSet);
-      const selectedCount = allNames.filter((n) => selectedSet.has(n)).length;
+      const selectedCount = allNames.filter((n) => node?.data.blenderScene === entry.name && selectedSet.has(n)).length;
       return {
         name: entry.name,
         isActiveScene: entry.isActiveScene,
@@ -211,7 +212,7 @@ export function BlenderInspector({
         totalCount: allNames.length,
       };
     });
-  }, [objects, selectedSet]);
+  }, [objects, selectedSet, node?.data.blenderScene]);
 
   const effectiveSceneFilter =
     sceneFilter && sceneStats.some((s) => s.name === sceneFilter) ? sceneFilter : null;
@@ -235,7 +236,7 @@ export function BlenderInspector({
       const sName = o.scene || "Scene";
       if (effectiveSceneFilter && sName !== effectiveSceneFilter) continue;
       const cols = o.collections && o.collections.length > 0 ? o.collections : ["Scene Collection"];
-      const isSelected = selectedSet.has(o.name);
+      const isSelected = node?.data.blenderScene === sName && selectedSet.has(o.name);
       const isVisible = o.sceneVisible !== false;
       for (const colName of cols) {
         const key = `${sName}::${colName}`;
@@ -283,7 +284,7 @@ export function BlenderInspector({
         if (a.sceneVisible !== b.sceneVisible) return a.sceneVisible ? -1 : 1;
         return a.name.localeCompare(b.name);
       });
-  }, [objects, effectiveSceneFilter, selectedSet]);
+  }, [objects, effectiveSceneFilter, selectedSet, node?.data.blenderScene]);
 
   const filteredCollections = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
@@ -307,17 +308,24 @@ export function BlenderInspector({
   const targetUsdPath = customUsdPath || existingUsdPath || defaultUsdPath;
 
   const selectedCollectionsCount = collectionStats.filter((c) => c.selectedObjects > 0).length;
+  const collectionEditScene = node.data.blenderScene || effectiveSceneFilter || getPreferredSceneName(objects);
+  const editableCollections = filteredCollections.filter((c) => c.scene === collectionEditScene);
   const allFilteredColsSelected =
-    filteredCollections.length > 0 &&
-    filteredCollections.every((c) => c.selectedObjects === c.totalObjects && c.totalObjects > 0);
+    editableCollections.length > 0 &&
+    editableCollections.every((c) => c.selectedObjects === c.totalObjects && c.totalObjects > 0);
   const someFilteredColsSelected =
-    !allFilteredColsSelected && filteredCollections.some((c) => c.selectedObjects > 0);
+    !allFilteredColsSelected && editableCollections.some((c) => c.selectedObjects > 0);
 
-  function updateSelections(next: string[]) {
+  function updateSelections(next: string[], sceneName?: string) {
     pendingSelectionsRef.current = next;
     setPendingSelections(next);
     if (debounceRef.current !== null) {
       window.clearTimeout(debounceRef.current);
+    }
+    if (sceneName) {
+      debounceRef.current = null;
+      commitSelections(nodeIdRef.current, next, sceneName);
+      return;
     }
     debounceRef.current = window.setTimeout(() => {
       debounceRef.current = null;
@@ -329,36 +337,25 @@ export function BlenderInspector({
     setSceneFilter(sceneRow.name);
     const sceneNameSet = new Set(sceneRow.allNames);
     const hasOtherSceneSelections = selections.some((n) => !sceneNameSet.has(n));
-    if (sceneRow.selectedCount === 0 || hasOtherSceneSelections) {
+    if (node?.data.blenderScene !== sceneRow.name || sceneRow.selectedCount === 0 || hasOtherSceneSelections) {
       const toSelect =
         sceneRow.visibleNames.length > 0 ? sceneRow.visibleNames : sceneRow.allNames;
-      updateSelections(toSelect);
-    }
-  }
-
-  function handleToggleScene(sceneRow: SceneStatRow) {
-    setSceneFilter(sceneRow.name);
-    const sceneNameSet = new Set(sceneRow.allNames);
-    const hasOtherSceneSelections = selections.some((n) => !sceneNameSet.has(n));
-    if (sceneRow.selectedCount > 0 && !hasOtherSceneSelections) {
-      updateSelections([]);
+      updateSelections(toSelect, sceneRow.name);
     } else {
-      const toSelect =
-        sceneRow.visibleNames.length > 0 ? sceneRow.visibleNames : sceneRow.allNames;
-      updateSelections(toSelect);
+      updateSelections(selections, sceneRow.name);
     }
   }
 
   function handleToggleCollection(colRow: CollectionStatRow) {
     const allChecked =
       colRow.selectedObjects === colRow.totalObjects && colRow.totalObjects > 0;
-    const next = new Set(selections);
+    const next = new Set(node?.data.blenderScene === colRow.scene ? selections : []);
     if (allChecked) {
       for (const name of colRow.objectNames) next.delete(name);
     } else {
       for (const name of colRow.objectNames) next.add(name);
     }
-    updateSelections(Array.from(next));
+    updateSelections(Array.from(next), colRow.scene);
   }
 
   function handleMasterCollectionToggle() {
@@ -372,34 +369,34 @@ export function BlenderInspector({
   function handleSelectSceneVisible() {
     const next = new Set<string>();
     const activeSceneRow = sceneStats.find((s) => s.isActiveScene);
-    const targetScene = effectiveSceneFilter ?? activeSceneRow?.name ?? null;
+    const targetScene = node?.data.blenderScene ?? effectiveSceneFilter ?? activeSceneRow?.name ?? null;
     for (const col of collectionStats) {
       if (targetScene && col.scene !== targetScene) continue;
       if (!col.sceneVisible) continue;
       for (const name of col.visibleObjectNames) next.add(name);
     }
-    updateSelections(Array.from(next));
+    updateSelections(Array.from(next), targetScene || undefined);
   }
 
   function handleSelectAll() {
     const next = new Set(selections);
-    for (const col of filteredCollections) {
+    for (const col of editableCollections) {
       for (const name of col.objectNames) next.add(name);
     }
-    updateSelections(Array.from(next));
+    updateSelections(Array.from(next), collectionEditScene || undefined);
   }
 
   function handleSelectNone() {
     const next = new Set(selections);
-    for (const col of filteredCollections) {
+    for (const col of editableCollections) {
       for (const name of col.objectNames) next.delete(name);
     }
-    updateSelections(Array.from(next));
+    updateSelections(Array.from(next), collectionEditScene || undefined);
   }
 
   function handleInvertSelection() {
     const scopedNames = new Set<string>();
-    for (const col of filteredCollections) {
+    for (const col of editableCollections) {
       for (const name of col.objectNames) scopedNames.add(name);
     }
     const next = new Set(selections);
@@ -407,7 +404,7 @@ export function BlenderInspector({
       if (next.has(name)) next.delete(name);
       else next.add(name);
     }
-    updateSelections(Array.from(next));
+    updateSelections(Array.from(next), collectionEditScene || undefined);
   }
 
   async function handleBrowseBlend() {
@@ -452,6 +449,7 @@ export function BlenderInspector({
                   nativeProjectDependencyId: ids[0] || null,
                   blenderObjects: discovered,
                   blenderSelections: defaultSelected,
+                  blenderScene: preferredScene,
                 },
               }
         ),
@@ -484,17 +482,21 @@ export function BlenderInspector({
       const currentSelections =
         pendingSelectionsRef.current ?? (currentNode?.data.blenderSelections || []);
       const hasExistingConfig = currentNode?.data.blenderSelections !== undefined;
+      const chosenScene = currentNode?.data.blenderScene;
+      const missingScene = Boolean(chosenScene && !discovered.some((o) => o.scene === chosenScene));
+      const preferredScene = chosenScene || getPreferredSceneName(discovered);
+      const sceneObjects = discovered.filter((o) => !preferredScene || o.scene === preferredScene);
       const existingSet = new Set(currentSelections);
-      const validExisting = discovered
+      const validExisting = sceneObjects
         .filter((o) => existingSet.has(o.name))
         .map((o) => o.name);
       const updatedSelections =
-        !resetToSceneVisible && hasExistingConfig && validExisting.length > 0
+        missingScene ? currentSelections : !resetToSceneVisible && hasExistingConfig && validExisting.length > 0
           ? Array.from(new Set(validExisting))
-          : getDefaultSceneVisibleSelections(discovered);
+          : getDefaultSceneVisibleSelections(sceneObjects);
 
       if (resetToSceneVisible || !effectiveSceneFilter) {
-        setSceneFilter(getPreferredSceneName(discovered));
+        setSceneFilter(preferredScene);
       }
 
       const updatedProject: StoredProject = {
@@ -508,13 +510,16 @@ export function BlenderInspector({
                   ...n.data,
                   blenderObjects: discovered,
                   blenderSelections: updatedSelections,
+                  blenderScene: preferredScene,
                 },
               }
         ),
       };
 
       onProjectChangeRef.current(updatedProject);
-      onStatus(`Found ${discovered.length} object(s) in .blend file.`);
+      onStatus(missingScene
+        ? `Scene "${chosenScene}" no longer exists. Select a scene before extracting or exporting.`
+        : `Found ${discovered.length} object(s) in .blend file.`);
     } catch (err) {
       onStatus(`Rescan failed: ${String(err)}`);
     } finally {
@@ -562,6 +567,7 @@ export function BlenderInspector({
         blendPath,
         usdPath: finalUsdPath,
         selectedObjects: activeSelections,
+        sceneName: baseProject.nodes.find((n) => n.id === nodeId)?.data.blenderScene,
       });
 
       // Register the exported USD in dependencies
@@ -744,6 +750,9 @@ export function BlenderInspector({
                   </button>
                 )}
               </div>
+              <div style={{ fontSize: "11px", color: "#b5c8c0", marginBottom: "5px" }}>
+                Import scene: <strong>{node.data.blenderScene || "Choose a scene"}</strong>
+              </div>
               <div
                 style={{
                   maxHeight: "110px",
@@ -763,9 +772,6 @@ export function BlenderInspector({
                   </thead>
                   <tbody>
                     {sceneStats.map((s) => {
-                      const targetCount = s.visibleNames.length > 0 ? s.visibleNames.length : s.allNames.length;
-                      const allSceneChecked = s.selectedCount > 0 && s.selectedCount >= targetCount;
-                      const sceneIndeterminate = s.selectedCount > 0 && s.selectedCount < targetCount;
                       const isFiltering = effectiveSceneFilter === s.name;
                       return (
                         <tr
@@ -777,13 +783,12 @@ export function BlenderInspector({
                         >
                           <td style={{ padding: "3px 6px", textAlign: "center" }}>
                             <input
-                              type="checkbox"
-                              ref={(el) => {
-                                if (el) el.indeterminate = sceneIndeterminate;
-                              }}
-                              checked={allSceneChecked}
-                              onChange={() => handleToggleScene(s)}
-                              title={`Toggle visible collections in ${s.name}`}
+                              type="radio"
+                              name={`blender-scene-${nodeId}`}
+                              aria-label={`Import scene ${s.name}`}
+                              checked={node.data.blenderScene === s.name}
+                              onChange={() => handleSelectScene(s)}
+                              title={`Use ${s.name} for import and USD export`}
                               style={{ margin: 0, cursor: "pointer", accentColor: "#9fe2b6" }}
                             />
                           </td>
@@ -810,7 +815,7 @@ export function BlenderInspector({
                                   padding: "0px 4px",
                                 }}
                               >
-                                active
+                                file active
                               </span>
                             )}
                           </td>

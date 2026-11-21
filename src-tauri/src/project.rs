@@ -321,6 +321,8 @@ pub struct NodeData {
     #[serde(default)]
     pub blender_selections: Option<Vec<String>>,
     #[serde(default)]
+    pub blender_scene: Option<String>,
+    #[serde(default)]
     pub blender_objects: Option<Vec<BlenderObjectInfo>>,
     #[serde(default)]
     pub blender_material_mode: Option<String>,
@@ -338,6 +340,8 @@ pub struct NodeData {
     pub cache_edit: Option<CacheEditSettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub character: Option<CharacterSettings>,
+    #[serde(default)]
+    pub pose: Option<PoseSettings>,
     #[serde(default)]
     pub camera: Option<ViewportCamera>,
     #[serde(default)]
@@ -507,6 +511,54 @@ pub struct CharacterSettings {
     pub skeleton_bindings: Vec<CharacterSkeletonBinding>,
     #[serde(default)]
     pub cloth_caches: Vec<CharacterClothCache>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PoseSettings {
+    #[serde(default)]
+    pub mappings: Vec<PoseMapping>,
+    #[serde(default)]
+    pub entries: Vec<PoseEntry>,
+}
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PoseEntry {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub dependency_id: Option<String>,
+    pub animation_path: String,
+    pub mode: String,
+    pub pose_time: f64,
+    #[serde(default)]
+    pub joints: Option<Vec<PoseJoint>>,
+    #[serde(default)]
+    pub blend_shapes: Vec<String>,
+    #[serde(default)]
+    pub blend_shape_weights: Vec<f64>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PoseMapping {
+    pub id: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub skeleton_path: String,
+    #[serde(default)]
+    pub entry_id: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PoseJoint {
+    pub name: String,
+    pub translation: [f64; 3],
+    pub rotation: [f64; 4],
+    pub scale: [f64; 3],
+    pub rotation_offset: [f64; 3],
+    pub translation_offset: [f64; 3],
 }
 
 fn default_unit_scale() -> [f64; 3] {
@@ -1332,6 +1384,11 @@ impl Project {
         let mut indegree = HashMap::new();
         let mut outgoing: HashMap<&str, Vec<&str>> = HashMap::new();
         for n in &self.nodes {
+            if n.data.blender_scene.as_ref().is_some_and(|scene| {
+                scene.trim().is_empty() || scene.len() > 1024 || scene.contains('\0')
+            }) {
+                return Err("Blender scene must be a non-empty name of at most 1024 bytes".into());
+            }
             if n.data
                 .transform
                 .translation
@@ -1364,6 +1421,7 @@ impl Project {
                     "group",
                     "scatter",
                     "character",
+                    "pose",
                 ]
                 .contains(&n.data.operation.as_str())
             {
@@ -1588,6 +1646,64 @@ impl Project {
                 })
             {
                 return Err("Delete targets must be absolute USD prim paths".into());
+            }
+            if let Some(pose) = &n.data.pose {
+                let mut entry_ids = HashSet::new();
+                let mut mapping_ids = HashSet::new();
+                if pose.entries.len() > 128
+                    || pose.entries.iter().any(|e| {
+                        e.id.is_empty()
+                            || !entry_ids.insert(&e.id)
+                            || e.name.len() > 256
+                            || !["pose", "clip"].contains(&e.mode.as_str())
+                            || !e.pose_time.is_finite()
+                            || (e.joints.is_none() && !e.animation_path.starts_with('/'))
+                            || e.animation_path.len() > 4096
+                    })
+                    || pose.mappings.len() > 128
+                    || pose.mappings.iter().any(|m| {
+                        m.id.is_empty()
+                            || !mapping_ids.insert(&m.id)
+                            || m.skeleton_path.len() > 4096
+                            || !m.skeleton_path.starts_with('/')
+                            || m.entry_id
+                                .as_ref()
+                                .is_some_and(|id| !pose.entries.iter().any(|e| &e.id == id))
+                    })
+                {
+                    return Err("Invalid Pose library or active entry".into());
+                }
+                for entry in &pose.entries {
+                    if let Some(joints) = &entry.joints {
+                        let mut names = HashSet::new();
+                        if entry.blend_shapes.len() != entry.blend_shape_weights.len()
+                            || entry.blend_shape_weights.iter().any(|v| !v.is_finite())
+                            || entry.mode != "pose"
+                            || entry.dependency_id.is_some()
+                            || joints.is_empty()
+                            || joints.len() > 20000
+                            || joints.iter().any(|j| {
+                                j.name.is_empty()
+                                    || !names.insert(&j.name)
+                                    || j.translation
+                                        .iter()
+                                        .chain(j.rotation.iter())
+                                        .chain(j.scale.iter())
+                                        .chain(j.rotation_offset.iter())
+                                        .chain(j.translation_offset.iter())
+                                        .any(|v| !v.is_finite())
+                                    || j.rotation.iter().map(|v| v * v).sum::<f64>() < 1e-12
+                            })
+                        {
+                            return Err("Invalid authored Pose joints".into());
+                        }
+                    }
+                }
+                for entry in &pose.entries {
+                    if let Some(id) = &entry.dependency_id {
+                        check(id, &DependencyKind::Usd)?;
+                    }
+                }
             }
             if n.data.operation == "character" {
                 if let Some(ch) = &n.data.character {
@@ -2415,5 +2531,37 @@ mod tests {
         pg.nodes[0].data.kind = "not_a_node".into();
         bad_kind.procedural_graph = Some(pg);
         assert!(bad_kind.validate().is_err());
+    }
+    #[test]
+    fn pose_library_validates_and_survives_domain_graph() {
+        let mut p = project();
+        p.nodes[0].data.operation = "pose".into();
+        p.nodes[0].data.pose = Some(PoseSettings {
+            mappings: vec![PoseMapping {
+                enabled: true,
+                id: "body".into(),
+                skeleton_path: "/Scene/Rig/Skeleton".into(),
+                entry_id: Some("clip".into()),
+            }],
+            entries: vec![PoseEntry {
+                id: "clip".into(),
+                name: "Walk".into(),
+                joints: None,
+                blend_shapes: vec![],
+                blend_shape_weights: vec![],
+                dependency_id: p.nodes[0].data.input_dependency_id.clone(),
+                animation_path: "/Rig/Animation".into(),
+                mode: "clip".into(),
+                pose_time: 13.0,
+            }],
+        });
+        p.validate().unwrap();
+        let saved = serde_json::to_value(&p).unwrap();
+        let restored = Project::from_value(saved).unwrap();
+        assert_eq!(restored.nodes[0].data.pose, p.nodes[0].data.pose);
+        let graph = crate::application::evaluation_graph(&p, &p.nodes[0].id, false).unwrap();
+        assert_eq!(graph["nodes"][0]["pose"]["mappings"][0]["entryId"], "clip");
+        p.nodes[0].data.pose.as_mut().unwrap().mappings[0].entry_id = Some("missing".into());
+        assert!(p.validate().is_err());
     }
 }

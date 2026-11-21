@@ -174,7 +174,11 @@ def scene_children(request):
     from pxr import Usd
     global _outline_cache, _viewport
     graph=request.get('graph');graph=json.loads(graph) if isinstance(graph,str) else graph
-    key=json.dumps(graph,sort_keys=True) if graph else request.get('path')
+    def _outline_norm(g):
+        if not isinstance(g, dict) or not isinstance(g.get('nodes'), list):
+            return g
+        return {**g, 'nodes': [{**n, 'pose': None} if isinstance(n, dict) and n.get('operation') == 'pose' else n for n in g['nodes']]}
+    key=json.dumps(_outline_norm(graph),sort_keys=True) if graph else request.get('path')
     if not key:raise ValueError('Choose a stage to inspect')
     reload_flag=bool(request.get('reload'))
     if not reload_flag and _viewport is not None and _viewport.stage is not None:
@@ -523,8 +527,12 @@ class Viewport:
             self.pending_groom_graph = None
             self.pending_groom_frame = None
         transform_only_node = None
+        pose_only = None
         if stage_changed and not groom_committed and not needs_hair_session and graph and self.stage is not None and self.current_graph is not None and not request.get('reload') and self.renderer == renderer:
             transform_only_node = _transform_only_node(self.current_graph, graph, self.live_transforms)
+            if transform_only_node is None:
+                from usd_graph import pose_only_node as _pose_only_node
+                pose_only = _pose_only_node(self.current_graph, graph, getattr(self, 'live_poses', {}))
         if groom_committed:
             self.path = path
             self.current_graph = graph
@@ -547,6 +555,13 @@ class Viewport:
             self.path = path
             self.current_graph = copy.deepcopy(graph)
             self.outline_key = json.dumps(graph, sort_keys=True)
+        elif pose_only is not None and __import__('pose_node').update_live_pose(pose_only, self.live_poses[pose_only['id']]):
+            self.stage_cache.pop(self.path, None)
+            self._pose_time_bump = 1e-4 if not getattr(self, '_pose_time_bump', 0.0) else 0.0
+            if self.auto_preview is not None and self.auto_preview[0] != self.stage:
+                self.auto_preview = None
+            self.path = path
+            self.current_graph = graph
         elif stage_changed:
             # New engine prevents stale prims from a previously selected stage.
             if self.path is not None:
@@ -556,9 +571,10 @@ class Viewport:
                     raise RuntimeError('Unable to reinitialize selected delegate')
             cached = None if request.get('reload') or editable_hair_id is not None else self.stage_cache.get(path)
             if cached is not None:
-                stage, self.graph_stages, self.graph_stats, self.outline_key, self.has_scene_lights, self.live_transforms = cached
+                stage, self.graph_stages, self.graph_stats, self.outline_key, self.has_scene_lights, self.live_transforms, self.live_poses = cached
             else:
                 self.live_transforms = {}
+                self.live_poses = {}
                 private_hair_preview = False
                 if graph:
                     import usd_graph as _ug
@@ -567,6 +583,7 @@ class Viewport:
                     try:
                         stage, self.graph_stages, self.graph_stats = compile_graph(
                             graph, request.get('reload', False), live_transforms=self.live_transforms,
+                            live_poses=self.live_poses,
                             interactive_hair=editable_hair_id is not None,
                         )
                     finally:
@@ -589,7 +606,7 @@ class Viewport:
                 if editable_hair_id is None:
                     if len(self.stage_cache) >= 4:
                         self.stage_cache.pop(next(iter(self.stage_cache)))
-                    self.stage_cache[path] = (stage, self.graph_stages, self.graph_stats, self.outline_key, None, self.live_transforms)
+                    self.stage_cache[path] = (stage, self.graph_stages, self.graph_stats, self.outline_key, None, self.live_transforms, self.live_poses)
             self.stage, self.path = stage, path
             self.prepared_hair_node_id = editable_hair_id
             self.current_graph = copy.deepcopy(graph) if graph else None
@@ -601,6 +618,126 @@ class Viewport:
             self._normalized_lights_key = None
         stage = self.stage
         frame = finite_number(request.get('frame', stage.GetStartTimeCode()), 'frame', -1e12, 1e12)
+        live_pose = request.get('livePose')
+        live_pose_bones = None
+        if isinstance(live_pose, dict) and stage is not None:
+            lp_node = live_pose.get('nodeId')
+            lp_entry = live_pose.get('entryId')
+            lp_skel = live_pose.get('skeletonPath')
+            lp_idx = live_pose.get('jointIndex')
+            lp_base = live_pose.get('baseRotation')
+            lp_off = live_pose.get('rotationOffset')
+            targets = getattr(self, 'live_poses', {}).get(lp_node) if lp_node else None
+            if (
+                targets
+                and isinstance(lp_idx, int)
+                and isinstance(lp_base, list) and len(lp_base) == 4
+                and isinstance(lp_off, list) and len(lp_off) == 3
+            ):
+                for _row_id, t_entry_id, t_skel_path, output in targets:
+                    if t_entry_id == lp_entry and t_skel_path == lp_skel:
+                        from pxr import UsdShade, UsdSkel, Vt
+                        rot_attr = output.GetRotationsAttr()
+                        rots = list(rot_attr.Get() or [])
+                        if 0 <= lp_idx < len(rots):
+                            base = Gf.Rotation(Gf.Quatd(float(lp_base[0]), Gf.Vec3d(float(lp_base[1]), float(lp_base[2]), float(lp_base[3]))))
+                            offset = (
+                                Gf.Rotation(Gf.Vec3d(1, 0, 0), float(lp_off[0]))
+                                * Gf.Rotation(Gf.Vec3d(0, 1, 0), float(lp_off[1]))
+                                * Gf.Rotation(Gf.Vec3d(0, 0, 1), float(lp_off[2]))
+                            )
+                            qd = (offset * base).GetQuat()
+                            im = qd.GetImaginary()
+                            rots[lp_idx] = Gf.Quatf(float(qd.GetReal()), float(im[0]), float(im[1]), float(im[2]))
+                            rot_arr = Vt.QuatfArray(rots)
+                            rot_attr.Clear()
+                            rot_attr.Set(rot_arr)
+                            rot_attr.Set(rot_arr, Usd.TimeCode(frame))
+                            rot_attr.Set(rot_arr, Usd.TimeCode(frame + 1e-4))
+                            self._pose_time_bump = 1e-4 if not getattr(self, '_pose_time_bump', 0.0) else 0.0
+                            self.stage_cache.pop(self.path, None)
+                            skel_prim = stage.GetPrimAtPath(lp_skel)
+                            if skel_prim and skel_prim.IsValid():
+                                cache_key = (stage, lp_skel)
+                                if getattr(self, '_pose_skel_cache_key', None) != cache_key:
+                                    sc = UsdSkel.Cache()
+                                    curr = skel_prim
+                                    while curr and curr.IsValid() and not curr.IsA(UsdSkel.Root):
+                                        curr = curr.GetParent()
+                                    bound_meshes = []
+                                    if curr and curr.IsValid() and curr.IsA(UsdSkel.Root):
+                                        sc.Populate(UsdSkel.Root(curr), Usd.PrimDefaultPredicate)
+                                        target_skel_path = skel_prim.GetPath()
+                                        for binding in sc.ComputeSkelBindings(UsdSkel.Root(curr), Usd.PrimDefaultPredicate):
+                                            if binding.GetSkeleton().GetPath() == target_skel_path:
+                                                for skq in binding.GetSkinningTargets():
+                                                    mp = skq.GetPrim()
+                                                    if mp and mp.IsValid() and mp.IsA(UsdGeom.Mesh):
+                                                        m = UsdGeom.Mesh(mp)
+                                                        rest_pts = m.GetPointsAttr().Get(frame)
+                                                        fvc = m.GetFaceVertexCountsAttr().Get(frame)
+                                                        fvi = m.GetFaceVertexIndicesAttr().Get(frame)
+                                                        if rest_pts is not None and len(rest_pts) > 0 and fvc is not None and fvi is not None:
+                                                            mat_prim, _ = UsdShade.MaterialBindingAPI(mp).ComputeBoundMaterial()
+                                                            bound_meshes.append((mp.GetPath(), skq, rest_pts, fvc, fvi, mat_prim.GetPath() if mat_prim else None))
+                                    self._pose_skel_cache = sc
+                                    self._pose_skel_query = sc.GetSkelQuery(UsdSkel.Skeleton(skel_prim))
+                                    self._pose_bound_meshes = bound_meshes
+                                    self._pose_skel_cache_key = cache_key
+                                sq = getattr(self, '_pose_skel_query', None)
+                                if sq:
+                                    xc = UsdGeom.XformCache(frame)
+                                    w = xc.GetLocalToWorldTransform(skel_prim)
+                                    wmats = [m * w for m in sq.ComputeJointSkelTransforms(frame)]
+                                    live_pose_bones = {
+                                        'worldPoints': [list(wm.ExtractTranslation()) for wm in wmats],
+                                        'worldAxes': [
+                                            [
+                                                list(wm.TransformDir(Gf.Vec3d(1, 0, 0)).GetNormalized()),
+                                                list(wm.TransformDir(Gf.Vec3d(0, 1, 0)).GetNormalized()),
+                                                list(wm.TransformDir(Gf.Vec3d(0, 0, 1)).GetNormalized()),
+                                            ]
+                                            for wm in wmats
+                                        ],
+                                    }
+                                    bound_meshes = getattr(self, '_pose_bound_meshes', [])
+                                    if bound_meshes:
+                                        skin_layer = getattr(self, '_pose_skin_layer', None)
+                                        if skin_layer is None:
+                                            skin_layer = Sdf.Layer.CreateAnonymous('orchflow_pose_live_skin.usda')
+                                            self._pose_skin_layer = skin_layer
+                                        sess = stage.GetSessionLayer()
+                                        if skin_layer.identifier not in sess.subLayerPaths:
+                                            sess.subLayerPaths.insert(0, skin_layer.identifier)
+                                        skin_xforms = sq.ComputeSkinningTransforms(Usd.TimeCode(frame))
+                                        first_setup = not getattr(self, '_pose_skin_active', False)
+                                        with Usd.EditContext(stage, skin_layer):
+                                            if first_setup:
+                                                skin_layer.Clear()
+                                                UsdGeom.Xform.Define(stage, '/__OrchFlowPoseProxy')
+                                            for idx_m, (mpath, skq, rest_pts, fvc, fvi, mat_path) in enumerate(bound_meshes):
+                                                pts = Vt.Vec3fArray(rest_pts)
+                                                if not skq.ComputeSkinnedPoints(skin_xforms, pts, Usd.TimeCode(frame)):
+                                                    continue
+                                                proxy_path = Sdf.Path(f'/__OrchFlowPoseProxy/m_{idx_m}')
+                                                if first_setup:
+                                                    UsdGeom.Imageable(stage.OverridePrim(mpath)).CreateVisibilityAttr().Set(UsdGeom.Tokens.invisible)
+                                                    pm = UsdGeom.Mesh.Define(stage, proxy_path)
+                                                    pm.CreateFaceVertexCountsAttr().Set(fvc)
+                                                    pm.CreateFaceVertexIndicesAttr().Set(fvi)
+                                                    pm.CreateSubdivisionSchemeAttr().Set(UsdGeom.Tokens.none)
+                                                    orig_p = stage.GetPrimAtPath(mpath)
+                                                    if orig_p and orig_p.IsValid():
+                                                        pm.AddTransformOp().Set(xc.GetLocalToWorldTransform(orig_p))
+                                                    if mat_path:
+                                                        mat_p = stage.GetPrimAtPath(mat_path)
+                                                        if mat_p and mat_p.IsValid():
+                                                            UsdShade.MaterialBindingAPI.Apply(pm.GetPrim()).Bind(UsdShade.Material(mat_p))
+                                                else:
+                                                    pm = UsdGeom.Mesh(stage.GetPrimAtPath(proxy_path))
+                                                pm.CreatePointsAttr().Set(pts)
+                                        self._pose_skin_active = True
+                        break
         cloth_sim_step = request.get('clothSimStep')
         if isinstance(cloth_sim_step, dict) and cloth_sim_step.get('active') and stage is not None:
             active_graph = graph or self.current_graph
@@ -940,6 +1077,42 @@ class Viewport:
             if mask_layer is not None:
                 mask_layer.Clear()
             self._cache_mask_active = False
+        pose_interacting = bool(request.get('poseInteracting'))
+        if pose_interacting:
+            mute_layer = getattr(self, '_pose_hair_mute_layer', None)
+            if mute_layer is None:
+                mute_layer = Sdf.Layer.CreateAnonymous('orchflow_pose_hair_mute.usda')
+                self._pose_hair_mute_layer = mute_layer
+            session = stage.GetSessionLayer()
+            if mute_layer.identifier not in session.subLayerPaths:
+                session.subLayerPaths.insert(0, mute_layer.identifier)
+            if getattr(self, '_pose_hair_mute_stage', None) != stage or not getattr(self, '_pose_hair_muted', False):
+                mute_layer.Clear()
+                curve_paths = getattr(self, '_pose_hair_curve_paths', None)
+                if getattr(self, '_pose_hair_mute_stage', None) != stage or curve_paths is None:
+                    curve_paths = [
+                        p.GetPath()
+                        for p in stage.Traverse()
+                        if not p.IsInstanceProxy() and p.IsA(UsdGeom.BasisCurves)
+                    ]
+                    self._pose_hair_curve_paths = curve_paths
+                    self._pose_hair_mute_stage = stage
+                if curve_paths:
+                    with Usd.EditContext(stage, mute_layer):
+                        for ppath in curve_paths:
+                            UsdGeom.Imageable(stage.OverridePrim(ppath)).CreateVisibilityAttr().Set(UsdGeom.Tokens.invisible)
+                self._pose_hair_muted = True
+        else:
+            if getattr(self, '_pose_hair_muted', False):
+                mute_layer = getattr(self, '_pose_hair_mute_layer', None)
+                if mute_layer is not None:
+                    mute_layer.Clear()
+                self._pose_hair_muted = False
+            if getattr(self, '_pose_skin_active', False):
+                skin_layer = getattr(self, '_pose_skin_layer', None)
+                if skin_layer is not None:
+                    skin_layer.Clear()
+                self._pose_skin_active = False
         view = view_conversion * Gf.Matrix4d().SetLookAt(eye, center, up)
         frustum = Gf.Frustum()
         clip_radius = max(radius, getattr(self, 'scene_radius', radius))
@@ -978,8 +1151,8 @@ class Viewport:
                     for p in iter_scene_and_prototype_prims(stage)
                 )
                 if self.path in self.stage_cache:
-                    s, gs, gst, ok, _, live = self.stage_cache[self.path]
-                    self.stage_cache[self.path] = (s, gs, gst, ok, self.has_scene_lights, live)
+                    s, gs, gst, ok, _, live, live_poses = self.stage_cache[self.path]
+                    self.stage_cache[self.path] = (s, gs, gst, ok, self.has_scene_lights, live, live_poses)
             has_scene_lights = self.has_scene_lights
         session = stage.GetSessionLayer()
         if not has_scene_lights:
@@ -1032,7 +1205,7 @@ class Viewport:
         }
         _sync_bounds_proxy(stage, session, frame, draw_mode == 'bounds')
         params = UsdImagingGL.RenderParams()
-        params.frame = Usd.TimeCode(frame)
+        params.frame = Usd.TimeCode(frame + getattr(self, '_pose_time_bump', 0.0))
         params.clearColor = Gf.Vec4f(0.055, 0.08, 0.09, 1)
         params.enableLighting = draw_mode in ('shaded', 'solid')
         params.enableSceneLights = (draw_mode == 'shaded') and scene_materials
@@ -1117,6 +1290,8 @@ class Viewport:
         binary_frame = bool(request.get('binaryFrame'))
         response = {
                 'width': width, 'height': height, 'renderer': renderer,
+                'viewProjection': [list(row) for row in view * frustum.ComputeProjectionMatrix()],
+                'poseBones': live_pose_bones,
                 'interactive': interactive, 'encoding': encoding, 'encodedBytes': len(encoded),
                 'graphStats': self.graph_stats,
                 'selectionInfo':selection_info,
@@ -1382,10 +1557,32 @@ def dispatch(request):
             'note': 'Used layers are not an exhaustive asset dependency manifest.'}
 
 
+def _log_worker_error(request, exc):
+    try:
+        import datetime, traceback
+        base = os.environ.get('LOCALAPPDATA') or os.path.expanduser('~')
+        log_dir = os.path.join(base, 'OrchFlow')
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, 'worker-errors.log')
+        if os.path.isfile(log_path) and os.path.getsize(log_path) > 2 * 1024 * 1024:
+            backup = log_path + '.1'
+            if os.path.isfile(backup):
+                os.remove(backup)
+            os.replace(log_path, backup)
+        op = request.get('operation', 'render') if isinstance(request, dict) else 'unknown'
+        renderer = request.get('renderer', '') if isinstance(request, dict) else ''
+        with open(log_path, 'a', encoding='utf-8') as f:
+            f.write(f"[{datetime.datetime.now().isoformat(timespec='seconds')}] usd_worker op={op} renderer={renderer}: {exc}\n")
+            f.write(traceback.format_exc() + "\n")
+    except Exception:
+        pass
+
+
 def respond(request):
     try:
         return dispatch(request)
     except Exception as exc:
+        _log_worker_error(request, exc)
         return {'error': str(exc)}
 
 

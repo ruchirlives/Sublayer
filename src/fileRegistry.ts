@@ -473,6 +473,9 @@ export type CharacterClothCache = {
   timeOffset: number;
 };
 
+export type PoseJoint = { name:string; translation:[number,number,number]; rotation:[number,number,number,number]; scale:[number,number,number]; rotationOffset:[number,number,number]; translationOffset:[number,number,number] };
+export type PoseEntry = { id: string; name: string; dependencyId?: string | null; animationPath: string; mode: "pose" | "clip"; poseTime: number; joints?: PoseJoint[]; blendShapes?:string[]; blendShapeWeights?:number[] };
+export type PoseSettings = { mappings: {id: string; enabled?: boolean; skeletonPath: string; entryId: string | null}[]; entries: PoseEntry[] };
 export type CharacterSettings = {
   baseSkeletonPath: string;
   animationOverrides: CharacterAnimationOverride[];
@@ -528,6 +531,7 @@ export const defaultScatter: ScatterSettings = {
 
 export type Data = {
   blenderSelections?: string[];
+  blenderScene?: string | null;
   blenderObjects?: BlenderObjectInfo[];
   blenderMaterialMode?: "off" | "auto" | "octane" | "cycles";
   blenderConvertProcedurals?: boolean;
@@ -541,6 +545,7 @@ export type Data = {
   hair?: HairSettings;
   cacheEdit?: CacheEditSettings;
   character?: CharacterSettings | null;
+  pose?: PoseSettings | null;
   camera?: ViewportCamera | null;
   cameraViews?: CameraView[];
   publicationPolicy?:PolicySnapshot | null;
@@ -740,6 +745,7 @@ export function referencedBy(project: StoredProject, dependencyId: string) {
     project.nodes
       .filter((n) =>
         [
+          ...(n.data.pose?.entries || []).map(e => e.dependencyId),
           ...materialTextures(n.data.materialX),
           ...(n.data.materialXRules || []).flatMap(r => materialTextures(r.material)),
               n.data.inputDependencyId,
@@ -819,6 +825,7 @@ export function relinkDependency(
       ...n,
       data: {
         ...n.data,
+        pose: n.data.pose ? {...n.data.pose, entries:n.data.pose.entries.map(e => ({...e,dependencyId:e.dependencyId===id?target:e.dependencyId}))} : n.data.pose,
         materialXRules: n.data.materialXRules?.map((r) => ({
           ...r,
           material: relinkMaterialTextures(r.material, id, target)!,
@@ -953,7 +960,8 @@ export function editNodeData(
           (count, n) =>
             count +
             [
-              ...materialTextures(n.data.materialX),
+              ...(n.data.pose?.entries || []).map(e => e.dependencyId),
+          ...materialTextures(n.data.materialX),
           ...(n.data.materialXRules || []).flatMap(r => materialTextures(r.material)),
               n.data.inputDependencyId,
               n.data.nativeProjectDependencyId,
@@ -1039,6 +1047,7 @@ export function graphPreview(
       publishedDependencyId: applicationInput && n.id === targetNodeId ? null : n.data.publishedDependencyId,
       nativeProjectDependencyId: n.data.nativeProjectDependencyId,
       blenderSelections: n.data.blenderSelections,
+      blenderScene: n.data.blenderScene,
       blenderMaterialMode: n.data.blenderMaterialMode,
       blenderConvertProcedurals: Boolean(n.data.blenderConvertProcedurals),
       blenderExportSkeletons: Boolean(n.data.blenderExportSkeletons),
@@ -1058,6 +1067,7 @@ export function graphPreview(
       ...(n.data.operation==="hdri" && n.data.hdri ? {hdri: n.data.hdri}:{}),
       ...(n.data.operation==="hair" && n.data.hair ? {hair: n.data.hair}:{}),
       ...(n.data.operation==="cache_edit" ? {cacheEdit: n.data.cacheEdit || defaultCacheEditSettings}:{}),
+      ...(n.data.operation==="pose" ? {pose: n.data.pose || {mappings:[],entries:[]}}:{}),
       ...(n.data.operation==="character" ? {character: n.data.character || defaultCharacterSettings}:{}),
       ...(n.data.operation==="camera" && n.data.camera ? {camera: n.data.camera}:{}),
       ...(n.data.operation==="camera" && n.data.cameraViews ? {cameraViews: n.data.cameraViews}:{}),
@@ -1090,6 +1100,7 @@ export function graphPreview(
         n.liveAdjustment?.baselineDependencyId,
         n.liveAdjustment?.handoffDependencyId,
         n.hdri?.textureDependencyId,
+        ...(n.pose?.entries || []).map(e => e.dependencyId),
         ...(n.character?.clothCaches || []).map(c => c.dependencyId),
         ...(n.materialXRules || []).flatMap(r => materialTextures(r.material)),
       ])

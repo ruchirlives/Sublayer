@@ -2508,8 +2508,17 @@ class OvrtxViewport:
         vram_used, vram_total = _query_gpu_vram(interactive=is_fast_frame)
         if vram_used and vram_total and (vram_used / vram_total) > 0.70 and len(self.stage_pool) > 1:
             self._flush_stage_pool()
+        pose_camera_params = self._compute_camera_params(request, width, height)
+        pose_camera = Gf.Camera()
+        pose_camera.transform = pose_camera_params["matrix"]
+        pose_camera.horizontalAperture = pose_camera_params["horizontal_aperture"]
+        pose_camera.verticalAperture = pose_camera_params["vertical_aperture"]
+        pose_camera.focalLength = pose_camera_params["focal_length"]
+        pose_camera.clippingRange = Gf.Range1f(0.001, 1000000.0)
+        pose_vp = pose_camera.frustum.ComputeViewMatrix() * pose_camera.frustum.ComputeProjectionMatrix()
         response = {
             "width": width,
+            "viewProjection": [list(row) for row in pose_vp],
             "height": height,
             "renderer": "OmniverseRTX",
             "interactive": interactive,
@@ -2692,8 +2701,24 @@ def respond(request):
         phase("request complete", report=False)
         return result
     except Exception as exc:
-        import traceback
+        import datetime, traceback
         traceback.print_exc(file=sys.stderr)
+        try:
+            base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+            log_dir = os.path.join(base, "OrchFlow")
+            os.makedirs(log_dir, exist_ok=True)
+            log_path = os.path.join(log_dir, "worker-errors.log")
+            if os.path.isfile(log_path) and os.path.getsize(log_path) > 2 * 1024 * 1024:
+                backup = log_path + ".1"
+                if os.path.isfile(backup):
+                    os.remove(backup)
+                os.replace(log_path, backup)
+            op = request.get("operation", "render") if isinstance(request, dict) else "unknown"
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"[{datetime.datetime.now().isoformat(timespec='seconds')}] ovrtx_worker op={op}: {exc}\n")
+                f.write(traceback.format_exc() + "\n")
+        except Exception:
+            pass
         return {"error": str(exc)}
     finally:
         done.set()

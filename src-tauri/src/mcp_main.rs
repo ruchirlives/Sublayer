@@ -220,7 +220,25 @@ fn call(name: &str, a: &Value, service: &usd::UsdService) -> Result<Value, Strin
  "validate_manual_baseline"=>{let mut request=application::manual_baseline_request(&model(a)?,string(a,"nodeId")?,string(a,"baseline")?,&catalog(a)?)?;request["correspondence"]=a.get("correspondence").cloned().unwrap_or(json!([]));request["expectedDigest"]=a.get("expectedDigest").cloned().unwrap_or(Value::Null);service.request(request)},
  "review_publication"|"publish_reviewed"=>{let mapping=serde_json::from_value(a.get("correspondence").cloned().unwrap_or(json!([]))).map_err(|e|e.to_string())?;let deletes=serde_json::from_value(a.get("confirmedDeletions").cloned().unwrap_or(json!([]))).map_err(|e|e.to_string())?;let mut request=application::publication_request(&model(a)?,string(a,"nodeId")?,string(a,"edited")?,mapping,deletes,if name=="publish_reviewed"{Some(string(a,"destination")?.into())}else{None},if name=="publish_reviewed"{Some(string(a,"reviewToken")?.into())}else{None})?;request["newPrimPaths"]=a.get("newPrimPaths").cloned().unwrap_or(json!([]));service.request(request)},
  "reconcile_upstream"=>service.request(application::reconciliation_request(&model(a)?,string(a,"nodeId")?,string(a,"destination")?)?),
- "desktop_state"=>desktop_bridge::send_command("get_state", json!({})),
+ "desktop_state"=>{
+     let mut state = desktop_bridge::send_command("get_state", json!({}))?;
+     if let Some(obj) = state.as_object_mut() {
+         let log_path = std::env::var_os("LOCALAPPDATA")
+             .map(std::path::PathBuf::from)
+             .unwrap_or_else(|| std::path::PathBuf::from("."))
+             .join("OrchFlow")
+             .join("worker-errors.log");
+         let tail: Vec<String> = std::fs::read_to_string(&log_path)
+             .map(|text| {
+                 let lines: Vec<&str> = text.lines().collect();
+                 let start = lines.len().saturating_sub(80);
+                 lines[start..].iter().map(|s| (*s).to_string()).collect()
+             })
+             .unwrap_or_default();
+         obj.insert("recentWorkerErrors".into(), json!(tail));
+     }
+     Ok(state)
+ },
  "desktop_open_project"=>desktop_bridge::send_command("open_project", json!({"path": string(a,"path")?})),
  "desktop_select_node"=>desktop_bridge::send_command("select_node", json!({"nodeId": string(a,"nodeId")?})),
  "desktop_pin_node"=>desktop_bridge::send_command("pin_node", json!({"nodeId": a.get("nodeId").cloned().unwrap_or(Value::Null)})),
