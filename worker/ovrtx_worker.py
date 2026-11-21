@@ -1035,6 +1035,97 @@ class OvrtxViewport:
             sys.stderr.write(f"Ovrtx incremental hair update failed; rebuilding scene: {error}\n")
             return False
 
+    def _cache_stage_skel_bindings(self, stage, sample_frame):
+        from pxr import UsdSkel
+        tc = Usd.TimeCode(sample_frame)
+        sc = UsdSkel.Cache()
+        bindings_by_skel = {}
+        for p in stage.Traverse():
+            if p.IsA(UsdSkel.Root):
+                sr = UsdSkel.Root(p)
+                sc.Populate(sr, Usd.PrimDefaultPredicate)
+                for b in sc.ComputeSkelBindings(sr, Usd.PrimDefaultPredicate):
+                    skel = b.GetSkeleton()
+                    sq = sc.GetSkelQuery(skel)
+                    meshes = []
+                    for skq in b.GetSkinningTargets():
+                        mp = skq.GetPrim()
+                        if mp and mp.IsValid() and mp.IsA(UsdGeom.Mesh):
+                            rest_pts = UsdGeom.Mesh(mp).GetPointsAttr().Get(tc)
+                            if rest_pts is not None and len(rest_pts) > 0:
+                                meshes.append((str(mp.GetPath()), skq, rest_pts))
+                    if sq:
+                        bindings_by_skel[str(skel.GetPath())] = (sq, meshes)
+        self._ovrtx_skel_cache = sc
+        self._ovrtx_skel_bindings = bindings_by_skel
+        return bindings_by_skel
+
+    def _bake_stage_skel_for_ovstage(self, stage, sample_frame):
+        from pxr import UsdSkel, Vt
+        bindings_by_skel = self._cache_stage_skel_bindings(stage, sample_frame)
+        if not bindings_by_skel:
+            return None
+        tc = Usd.TimeCode(sample_frame)
+        bake_layer = Sdf.Layer.CreateAnonymous("ovrtx_pose_flatten_bake.usda")
+        sess = stage.GetSessionLayer()
+        sess.subLayerPaths.insert(0, bake_layer.identifier)
+        with Usd.EditContext(stage, bake_layer):
+            for _skel_path, (sq, meshes) in bindings_by_skel.items():
+                if not meshes:
+                    continue
+                skin_xforms = sq.ComputeSkinningTransforms(tc)
+                for mpath_str, skq, rest_pts in meshes:
+                    pts = Vt.Vec3fArray(rest_pts)
+                    if skq.ComputeSkinnedPoints(skin_xforms, pts, tc):
+                        over_m = stage.OverridePrim(Sdf.Path(mpath_str))
+                        UsdGeom.Mesh(over_m).CreatePointsAttr().Set(pts)
+                        UsdSkel.BindingAPI(over_m).CreateSkeletonRel().SetTargets([])
+        return bake_layer
+
+    def _apply_live_pose_to_ovstage(self, skel_paths, sample_frame):
+        from pxr import Vt
+        bindings = getattr(self, "_ovrtx_skel_bindings", None)
+        if not bindings and self.current_usd_stage is not None:
+            bindings = self._cache_stage_skel_bindings(self.current_usd_stage, sample_frame)
+        if not bindings or self.stage is None:
+            return False
+        tc = Usd.TimeCode(sample_frame)
+        updates = []
+        for sp in skel_paths:
+            entry = bindings.get(sp)
+            if not entry:
+                continue
+            sq, meshes = entry
+            if not meshes:
+                continue
+            skin_xforms = sq.ComputeSkinningTransforms(tc)
+            for mpath_str, skq, rest_pts in meshes:
+                pts = Vt.Vec3fArray(rest_pts)
+                if skq.ComputeSkinnedPoints(skin_xforms, pts, tc):
+                    updates.append((mpath_str, np.ascontiguousarray(pts, dtype=np.float32)))
+        if updates:
+            self._write_hair_points_to_ovstage(updates)
+        return True
+
+    def _try_fast_pose_delta(self, prev_graph, new_graph, sample_frame):
+        try:
+            live_poses = getattr(self, "live_poses", None)
+            if not live_poses or self.current_usd_stage is None or self.stage is None:
+                return False
+            changed = usd_graph.pose_only_node(prev_graph, new_graph, live_poses)
+            if changed is None:
+                return False
+            import pose_node
+            targets = live_poses.get(changed["id"]) or []
+            if not pose_node.update_live_pose(changed, targets):
+                return False
+            skel_paths = [t_skel_path for _r, _e, t_skel_path, _out in targets]
+            self._apply_live_pose_to_ovstage(skel_paths, sample_frame)
+            return True
+        except Exception as error:
+            sys.stderr.write(f"Ovrtx incremental pose update failed; rebuilding scene: {error}\n")
+            return False
+
     def _try_fast_materialx_delta(self, prev_graph, new_graph):
         """Author MaterialX-only parameter updates directly into a sparse delta layer.
 
@@ -1467,12 +1558,22 @@ class OvrtxViewport:
                 self.last_update_kind = "cache-delta"
                 scene_changed = False
                 camera_changed = True
+            elif self._try_fast_pose_delta(self.last_graph, graph, float(request.get("frame", 0))):
+                self.last_outline_key = outline_key
+                self.last_graph_hash = graph_hash
+                self.last_static_scene_key = static_scene_key
+                self.last_graph = graph
+                self.last_update_kind = "pose-delta"
+                scene_changed = False
+                camera_changed = True
         if scene_changed or not self.temp_usd_path:
             phase("compiling USD graph", timeout=300)
             compiled_mx_selections = {}
+            self.live_poses = {}
+            self._ovrtx_skel_bindings = None
             if graph:
                 stage, self.graph_stages, self.graph_stats = usd_graph.compile_graph(
-                    graph, request.get("reload", False), mx_selections_out=compiled_mx_selections,
+                    graph, request.get("reload", False), live_poses=self.live_poses, mx_selections_out=compiled_mx_selections,
                     interactive_hair=editable_hair_id is not None,
                 )
                 preview = usd_graph.open_hair_preview_stage(stage, graph)
@@ -1593,7 +1694,16 @@ class OvrtxViewport:
                 if abs(spin) > 1e-6:
                     xf.AddRotateZOp(opSuffix="ovrtxSpin").Set(spin)
             phase("flattening private USD preview")
-            flat = stage.Flatten()
+            bake_layer = self._bake_stage_skel_for_ovstage(stage, sample)
+            try:
+                flat = stage.Flatten()
+            finally:
+                if bake_layer is not None:
+                    bake_layer.Clear()
+                    try:
+                        stage.GetSessionLayer().subLayerPaths.remove(bake_layer.identifier)
+                    except Exception:
+                        pass
             incremental = False
             delta_path = None
             if (not self.live_groom_modified and self.base_layer is not None and self.last_suffix == scene_suffix and previous_path
@@ -1710,6 +1820,66 @@ class OvrtxViewport:
                     "graph_stats": self.graph_stats,
                     "mx_rule_selections": self.mx_rule_selections,
                 }
+
+        live_pose = request.get("livePose")
+        live_pose_bones = None
+        if isinstance(live_pose, dict) and self.current_usd_stage is not None and self.stage is not None:
+            from pxr import UsdSkel, Vt
+            lp_node = live_pose.get("nodeId")
+            lp_entry = live_pose.get("entryId")
+            lp_skel = live_pose.get("skeletonPath")
+            lp_idx = live_pose.get("jointIndex")
+            lp_base = live_pose.get("baseRotation")
+            lp_off = live_pose.get("rotationOffset")
+            targets = getattr(self, "live_poses", {}).get(lp_node) if lp_node else None
+            req_frame = float(request.get("frame", 0))
+            if (
+                targets
+                and isinstance(lp_idx, int)
+                and isinstance(lp_base, list) and len(lp_base) == 4
+                and isinstance(lp_off, list) and len(lp_off) == 3
+            ):
+                for _row_id, t_entry_id, t_skel_path, output in targets:
+                    if t_entry_id == lp_entry and t_skel_path == lp_skel:
+                        rot_attr = output.GetRotationsAttr()
+                        rots = list(rot_attr.Get() or [])
+                        if 0 <= lp_idx < len(rots):
+                            base = Gf.Rotation(Gf.Quatd(float(lp_base[0]), Gf.Vec3d(float(lp_base[1]), float(lp_base[2]), float(lp_base[3]))))
+                            offset = (
+                                Gf.Rotation(Gf.Vec3d(1, 0, 0), float(lp_off[0]))
+                                * Gf.Rotation(Gf.Vec3d(0, 1, 0), float(lp_off[1]))
+                                * Gf.Rotation(Gf.Vec3d(0, 0, 1), float(lp_off[2]))
+                            )
+                            qd = (offset * base).GetQuat()
+                            im = qd.GetImaginary()
+                            rots[lp_idx] = Gf.Quatf(float(qd.GetReal()), float(im[0]), float(im[1]), float(im[2]))
+                            rot_arr = Vt.QuatfArray(rots)
+                            rot_attr.Clear()
+                            rot_attr.Set(rot_arr)
+                            rot_attr.Set(rot_arr, Usd.TimeCode(req_frame))
+                            rot_attr.Set(rot_arr, Usd.TimeCode(req_frame + 1e-4))
+                            self._apply_live_pose_to_ovstage([lp_skel], req_frame)
+                            camera_changed = True
+                            self.last_update_kind = "live-pose"
+                            bindings = getattr(self, "_ovrtx_skel_bindings", None) or {}
+                            entry = bindings.get(lp_skel)
+                            skel_prim = self.current_usd_stage.GetPrimAtPath(lp_skel)
+                            if entry and skel_prim and skel_prim.IsValid():
+                                sq, _meshes = entry
+                                w = UsdGeom.XformCache(req_frame).GetLocalToWorldTransform(skel_prim)
+                                wmats = [m * w for m in sq.ComputeJointSkelTransforms(req_frame)]
+                                live_pose_bones = {
+                                    "worldPoints": [list(wm.ExtractTranslation()) for wm in wmats],
+                                    "worldAxes": [
+                                        [
+                                            list(wm.TransformDir(Gf.Vec3d(1, 0, 0)).GetNormalized()),
+                                            list(wm.TransformDir(Gf.Vec3d(0, 1, 0)).GetNormalized()),
+                                            list(wm.TransformDir(Gf.Vec3d(0, 0, 1)).GetNormalized()),
+                                        ]
+                                        for wm in wmats
+                                    ],
+                                }
+                        break
 
         # Explicit frame-by-frame cloth simulation step (triggered only by the Simulate button, never Play)
         cloth_sim_step = request.get("clothSimStep")
@@ -2519,6 +2689,7 @@ class OvrtxViewport:
         response = {
             "width": width,
             "viewProjection": [list(row) for row in pose_vp],
+            "poseBones": live_pose_bones,
             "height": height,
             "renderer": "OmniverseRTX",
             "interactive": interactive,
