@@ -692,56 +692,104 @@ def _extract_blender_materials(target_scene, material_mode):
             return None, getattr(src_node, 'a_value', None) or (getattr(src_node.inputs[0], 'default_value', None) if src_node.inputs else None)
         if bid == 'OctaneGreyscaleColor':
             return None, getattr(src_node, 'a_value', None)
+        fallback_val = None
         for cand_name in ('Color', 'Image', 'Input', 'Texture', 'A', 'B', 'Color1', 'Color2', 'Normal', 'Height'):
-            s = src_node.inputs.get(cand_name) if hasattr(src_node, 'inputs') else None
-            if s and s.is_linked:
-                tex, val = _find_texture_or_color(s, visited, group_stack)
-                if tex or val is not None:
-                    return tex, val
+            for s in getattr(src_node, 'inputs', []):
+                if s.name == cand_name and s.is_linked:
+                    tex, val = _find_texture_or_color(s, visited, group_stack)
+                    if tex:
+                        return tex, val
+                    if fallback_val is None and val is not None:
+                        fallback_val = val
         for s in getattr(src_node, 'inputs', []):
-            if s.is_linked:
+            if s.is_linked and getattr(s, 'name', '') not in ('Fac', 'Factor'):
                 tex, val = _find_texture_or_color(s, visited, group_stack)
-                if tex or val is not None:
+                if tex:
                     return tex, val
+                if fallback_val is None and val is not None:
+                    fallback_val = val
+        if fallback_val is not None:
+            return None, fallback_val
         return None, getattr(sock, 'default_value', None)
 
-    def _unwrap_shader(node, visited=None, group_stack=()):
+    def _resolve_mix_factor(sock, group_stack=()):
+        if sock is None:
+            return 0.5
+        if not sock.is_linked:
+            return _to_float(getattr(sock, 'default_value', 0.5), 0.5)
+        link = sock.links[0]
+        src_node = link.from_node
+        if src_node.bl_idname == 'NodeGroupInput' and group_stack:
+            outer = group_stack[-1]
+            outer_sock = outer.inputs.get(link.from_socket.name)
+            if outer_sock is not None:
+                return _resolve_mix_factor(outer_sock, group_stack[:-1])
+        # When Factor is driven by an internal mask/texture/ramp network,
+        # inputs[1] (s1) is the base shader and inputs[2] (s2) is the masked decal/overlay.
+        return 0.0
+
+    def _unwrap_shader(node, visited=None, group_stack=(), via_socket=None):
         if node is None:
             return None, 1.0, group_stack
         if visited is None:
             visited = set()
-        if node in visited:
+        visit_key = (node, getattr(via_socket, 'name', '') if via_socket is not None else '')
+        if visit_key in visited:
             return None, 1.0, group_stack
-        visited.add(node)
+        visited.add(visit_key)
         bid = node.bl_idname
+        if bid == 'NodeGroupInput' and group_stack and via_socket is not None:
+            outer = group_stack[-1]
+            outer_sock = outer.inputs.get(via_socket.name)
+            if outer_sock is not None and outer_sock.is_linked:
+                l0 = outer_sock.links[0]
+                return _unwrap_shader(l0.from_node, visited, group_stack[:-1], l0.from_socket)
+            return None, 1.0, group_stack
         if bid == 'ShaderNodeGroup' and getattr(node, 'node_tree', None):
             out_n = next((n for n in node.node_tree.nodes if n.bl_idname == 'NodeGroupOutput'), None)
             if out_n:
                 next_stack = group_stack + (node,)
                 for s in out_n.inputs:
                     if s.is_linked and (s.type == 'SHADER' or s.name in ('Surface', 'Shader', 'BSDF', 'Material')):
-                        return _unwrap_shader(s.links[0].from_node, visited, next_stack)
+                        l0 = s.links[0]
+                        return _unwrap_shader(l0.from_node, visited, next_stack, l0.from_socket)
                 for s in out_n.inputs:
                     if s.is_linked:
-                        return _unwrap_shader(s.links[0].from_node, visited, next_stack)
+                        l0 = s.links[0]
+                        return _unwrap_shader(l0.from_node, visited, next_stack, l0.from_socket)
+        if bid == 'ShaderNodeAddShader':
+            l1 = node.inputs[0].links[0] if len(node.inputs) > 0 and node.inputs[0].is_linked else None
+            l2 = node.inputs[1].links[0] if len(node.inputs) > 1 and node.inputs[1].is_linked else None
+            for cand_l in (l1, l2):
+                if cand_l is not None:
+                    sub, op, gs = _unwrap_shader(cand_l.from_node, set(visited), group_stack, cand_l.from_socket)
+                    if sub is not None and getattr(sub, 'bl_idname', '') != 'NodeUndefined':
+                        return sub, op, gs
+            return None, 1.0, group_stack
         if bid == 'ShaderNodeMixShader':
-            fac = _to_float(getattr(node.inputs[0], 'default_value', 0.5), 0.5) if len(node.inputs) > 0 else 0.5
-            s1 = node.inputs[1].links[0].from_node if len(node.inputs) > 1 and node.inputs[1].is_linked else None
-            s2 = node.inputs[2].links[0].from_node if len(node.inputs) > 2 and node.inputs[2].is_linked else None
-            if s1 and s1.bl_idname == 'ShaderNodeBsdfTransparent' and s2:
-                sub, op, gs = _unwrap_shader(s2, visited, group_stack)
+            fac = _resolve_mix_factor(node.inputs[0] if len(node.inputs) > 0 else None, group_stack)
+            l1 = node.inputs[1].links[0] if len(node.inputs) > 1 and node.inputs[1].is_linked else None
+            l2 = node.inputs[2].links[0] if len(node.inputs) > 2 and node.inputs[2].is_linked else None
+            s1 = l1.from_node if l1 else None
+            s2 = l2.from_node if l2 else None
+            if s1 and s1.bl_idname == 'ShaderNodeBsdfTransparent' and l2:
+                sub, op, gs = _unwrap_shader(s2, visited, group_stack, l2.from_socket)
                 return sub, min(op, _clamp01(fac)), gs
-            if s2 and s2.bl_idname == 'ShaderNodeBsdfTransparent' and s1:
-                sub, op, gs = _unwrap_shader(s1, visited, group_stack)
+            if s2 and s2.bl_idname == 'ShaderNodeBsdfTransparent' and l1:
+                sub, op, gs = _unwrap_shader(s1, visited, group_stack, l1.from_socket)
                 return sub, min(op, _clamp01(1.0 - fac)), gs
-            pick = s2 if (s2 and (fac >= 0.5 or not s1)) else s1
-            return _unwrap_shader(pick, visited, group_stack)
+            pick_l = l2 if (l2 and (fac >= 0.5 or not l1)) else l1
+            if not pick_l:
+                return None, 1.0, group_stack
+            return _unwrap_shader(pick_l.from_node, visited, group_stack, pick_l.from_socket)
         if bid == 'OctaneMixMaterial':
-            amt = _to_float(getattr(node.inputs.get('Amount'), 'default_value', 0.5), 0.5)
-            s1 = node.inputs.get('First material').links[0].from_node if node.inputs.get('First material') and node.inputs['First material'].is_linked else None
-            s2 = node.inputs.get('Second material').links[0].from_node if node.inputs.get('Second material') and node.inputs['Second material'].is_linked else None
-            pick = s2 if (s2 and (amt >= 0.5 or not s1)) else s1
-            return _unwrap_shader(pick, visited, group_stack)
+            amt = _resolve_mix_factor(node.inputs.get('Amount'), group_stack)
+            l1 = node.inputs['First material'].links[0] if node.inputs.get('First material') and node.inputs['First material'].is_linked else None
+            l2 = node.inputs['Second material'].links[0] if node.inputs.get('Second material') and node.inputs['Second material'].is_linked else None
+            pick_l = l2 if (l2 and (amt >= 0.5 or not l1)) else l1
+            if not pick_l:
+                return None, 1.0, group_stack
+            return _unwrap_shader(pick_l.from_node, visited, group_stack, pick_l.from_socket)
         return node, 1.0, group_stack
 
     def _pick_output(nt):
@@ -751,7 +799,10 @@ def _extract_blender_materials(target_scene, material_mode):
         prefer_octane = (material_mode == 'octane') or (material_mode == 'auto' and 'octane' in engine)
         def _score(o):
             tgt = getattr(o, 'target', 'ALL') or 'ALL'
-            src, _, _ = _unwrap_shader(o.inputs['Surface'].links[0].from_node)
+            l0 = o.inputs['Surface'].links[0]
+            src, _, _ = _unwrap_shader(l0.from_node, None, (), l0.from_socket)
+            if src is None or getattr(src, 'bl_idname', '') == 'NodeUndefined':
+                return (99, 0 if getattr(o, 'is_active_output', False) else 1)
             is_oct = _is_octane_node(src)
             if prefer_octane:
                 if tgt == 'OCTANE' or is_oct:
@@ -800,7 +851,8 @@ def _extract_blender_materials(target_scene, material_mode):
         out_node = _pick_output(mat.node_tree)
         if not out_node:
             continue
-        shader, mix_opacity, group_stack = _unwrap_shader(out_node.inputs['Surface'].links[0].from_node)
+        l0_main = out_node.inputs['Surface'].links[0]
+        shader, mix_opacity, group_stack = _unwrap_shader(l0_main.from_node, None, (), l0_main.from_socket)
         if not shader:
             continue
         bid = shader.bl_idname
@@ -1008,7 +1060,7 @@ def _blender_disk_cache_paths(norm_path, mtime, size, export_skeletons=False, sc
     cache_dir = os.path.join(tempfile.gettempdir(), 'sublayer_blender_cache')
     path_hash = hashlib.sha256(norm_path.encode('utf-8')).hexdigest()[:12]
     skel_tag = 'skel1' if export_skeletons else 'skel0'
-    key = hashlib.sha256(f"{norm_path}|{mtime}|{size}|v8|{skel_tag}|{scene_name!r}".encode('utf-8')).hexdigest()[:24]
+    key = hashlib.sha256(f"{norm_path}|{mtime}|{size}|v10|{skel_tag}|{scene_name!r}".encode('utf-8')).hexdigest()[:24]
     return cache_dir, os.path.join(cache_dir, f"{path_hash}_{key}.usdc"), os.path.join(cache_dir, f"{path_hash}_{key}.json")
 
 
@@ -1280,6 +1332,52 @@ for obj in bpy.data.objects:
     except Exception:
         pass
 
+# Realize collection instances and apply topology-generating modifiers (e.g. Mirror/Array/Solidify)
+# on instanced/modifier-driven meshes so Blender's USD exporter does not fall back to
+# the un-evaluated base mesh datablock, while preserving Armature modifiers when export_skeletons=True.
+inst_empties = [
+    o for o in list(bpy.context.view_layer.objects)
+    if o.type == 'EMPTY'
+    and getattr(o, 'instance_type', None) == 'COLLECTION'
+    and getattr(o, 'instance_collection', None) is not None
+]
+if inst_empties:
+    if bpy.context.mode != 'OBJECT':
+        try:
+            bpy.ops.object.mode_set(mode='OBJECT')
+        except Exception:
+            pass
+    for ie in inst_empties:
+        try:
+            bpy.ops.object.select_all(action='DESELECT')
+            ie.select_set(True)
+            bpy.context.view_layer.objects.active = ie
+            bpy.ops.object.duplicates_make_real(use_base_parent=True, use_hierarchy=True)
+            ie.instance_type = 'NONE'
+        except Exception:
+            pass
+try:
+    bpy.context.view_layer.update()
+    TOPO_MODS = {'MIRROR', 'ARRAY', 'SOLIDIFY'}
+    for obj in list(bpy.context.view_layer.objects):
+        if obj.type != 'MESH' or not obj.modifiers:
+            continue
+        topo_names = [m.name for m in obj.modifiers if m.type in TOPO_MODS and m.show_viewport]
+        if not topo_names:
+            continue
+        if obj.data and obj.data.users > 1:
+            obj.data = obj.data.copy()
+        bpy.ops.object.select_all(action='DESELECT')
+        obj.select_set(True)
+        bpy.context.view_layer.objects.active = obj
+        for mname in topo_names:
+            try:
+                bpy.ops.object.modifier_apply(modifier=mname)
+            except Exception:
+                pass
+except Exception:
+    pass
+
 linked_mat_names = {m.name for m in bpy.data.materials if getattr(m, 'library', None) is not None}
 used_mat_names = {m.name for m in bpy.data.materials}
 for m in bpy.data.materials:
@@ -1304,6 +1402,9 @@ if export_targets:
             while curr is not None:
                 to_select.add(curr)
                 curr = curr.parent
+            if obj.type == 'EMPTY':
+                for child in getattr(obj, 'children_recursive', ()):
+                    to_select.add(child)
             for m in getattr(obj, 'modifiers', ()):
                 if getattr(m, 'type', None) == 'ARMATURE' and getattr(m, 'object', None) is not None:
                     arm = m.object
@@ -3191,7 +3292,7 @@ def coordinate_preflight(request, include_stage=False):
     graph = request.get('graph')
     if not isinstance(graph, dict) or any(n.get('id') == graph.get('targetNodeId') and n.get('operation') == 'application' for n in graph.get('nodes', [])):
         raise ValueError('Coordinate preparation requires the application INPUT graph, not its publication')
-    stage, alive, stats = compile_graph(graph, reload=True)
+    stage, alive, stats = compile_graph(graph, reload=bool(request.get('reload', True)))
     selection=normalize_handoff_selection(request.get('selection'))
     if selection is not None:
         stage,selected_alive=selected_handoff_input(stage,selection);alive.extend(selected_alive)
@@ -4195,10 +4296,24 @@ def apply_material_bindings(stage, bindings):
                 binding_api.Bind(material, bindingStrength=strength)
 
 
+def decompose_camera_transform(matrix):
+    from pxr import Gf
+    t = matrix.ExtractTranslation()
+    rot = matrix.ExtractRotation()
+    rz, ry, rx = rot.Decompose(Gf.Vec3d(0, 0, 1), Gf.Vec3d(0, 1, 0), Gf.Vec3d(1, 0, 0))
+    return {
+        'translate': [round(float(t[0]), 4), round(float(t[1]), 4), round(float(t[2]), 4)],
+        'rotate': [round(float(rx), 3), round(float(ry), 3), round(float(rz), 3)],
+    }
+
+
 def apply_light_overrides(stage, overrides):
-    from pxr import Gf, Sdf, Usd, UsdLux
+    from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux
     if not isinstance(overrides, list):
         return
+    valid_types = {
+        'DistantLight', 'RectLight', 'DiskLight', 'SphereLight', 'CylinderLight', 'DomeLight'
+    }
     for item in overrides:
         if not isinstance(item, dict):
             continue
@@ -4206,8 +4321,9 @@ def apply_light_overrides(stage, overrides):
         if not path_str:
             continue
 
+        mode = item.get('mode')
         prim = stage.GetPrimAtPath(Sdf.Path(path_str))
-        if not prim or not prim.IsValid():
+        if mode != 'create' and (not prim or not prim.IsValid()):
             alt_path = Sdf.Path('/Scene' + ('' if path_str.startswith('/') else '/') + path_str)
             alt_prim = stage.GetPrimAtPath(alt_path)
             if alt_prim and alt_prim.IsValid():
@@ -4222,21 +4338,41 @@ def apply_light_overrides(stage, overrides):
                             path_str = p_path
                             break
 
-        if not prim or not prim.IsValid():
+        light_type = item.get('lightType')
+        if light_type not in valid_types:
+            light_type = None
+
+        if mode == 'create' or not prim or not prim.IsValid():
             target_path = path_str if path_str.startswith('/') else ('/Scene/' + path_str)
             sdf_path = Sdf.Path(target_path)
-            light_type = item.get('lightType')
+            # Ensure intermediate parent prims exist as Xforms so created lights are valid in Hydra
+            parent_path = sdf_path.GetParentPath()
+            ancestors = []
+            while parent_path and parent_path != Sdf.Path.absoluteRootPath:
+                ancestors.append(parent_path)
+                parent_path = parent_path.GetParentPath()
+            for anc in reversed(ancestors):
+                anc_prim = stage.GetPrimAtPath(anc)
+                if not anc_prim or not anc_prim.IsValid():
+                    UsdGeom.Xform.Define(stage, anc)
             if not light_type:
                 lower = target_path.lower()
                 if 'dome' in lower or 'env' in lower or 'ambient' in lower:
                     light_type = 'DomeLight'
                 elif 'sphere' in lower or 'point' in lower:
                     light_type = 'SphereLight'
+                elif 'rect' in lower or 'area' in lower:
+                    light_type = 'RectLight'
+                elif 'disk' in lower:
+                    light_type = 'DiskLight'
+                elif 'cylinder' in lower:
+                    light_type = 'CylinderLight'
                 else:
                     light_type = 'DistantLight'
             define_cls = getattr(UsdLux, light_type, UsdLux.DistantLight)
             light_schema = define_cls.Define(stage, sdf_path)
             prim = light_schema.GetPrim()
+            path_str = str(prim.GetPath())
 
         if prim.IsInstanceProxy():
             curr = prim
@@ -4251,6 +4387,24 @@ def apply_light_overrides(stage, overrides):
 
         if hasattr(UsdLux, 'LightAPI') and not prim.HasAPI(UsdLux.LightAPI):
             UsdLux.LightAPI.Apply(prim)
+
+        # Apply transform if specified
+        t_val = item.get('translate')
+        r_val = item.get('rotate')
+        s_val = item.get('scale')
+        if t_val is not None or r_val is not None or s_val is not None:
+            xformable = UsdGeom.Xformable(prim)
+            xformable.ClearXformOpOrder()
+            xform_api = UsdGeom.XformCommonAPI(prim)
+            if isinstance(t_val, list) and len(t_val) == 3:
+                xform_api.SetTranslate(Gf.Vec3d(float(t_val[0]), float(t_val[1]), float(t_val[2])))
+            if isinstance(r_val, list) and len(r_val) == 3:
+                xform_api.SetRotate(
+                    Gf.Vec3f(float(r_val[0]), float(r_val[1]), float(r_val[2])),
+                    UsdGeom.XformCommonAPI.RotationOrderXYZ,
+                )
+            if isinstance(s_val, list) and len(s_val) == 3:
+                xform_api.SetScale(Gf.Vec3f(float(s_val[0]), float(s_val[1]), float(s_val[2])))
 
         enabled = item.get('enabled', True)
         if not enabled:
@@ -4299,6 +4453,17 @@ def apply_light_overrides(stage, overrides):
             if prim.HasAttribute('colorTemperature'):
                 prim.GetAttribute('colorTemperature').Set(val)
 
+        for field, attr_name in (
+            ('width', 'inputs:width'),
+            ('height', 'inputs:height'),
+            ('radius', 'inputs:radius'),
+            ('angle', 'inputs:angle'),
+        ):
+            if item.get(field) is not None:
+                val = float(item[field])
+                attr = prim.GetAttribute(attr_name) if prim.HasAttribute(attr_name) else prim.CreateAttribute(attr_name, Sdf.ValueTypeNames.Float)
+                attr.Set(val)
+
 
 def inspect_stage_materials(request):
     from pxr import Usd, UsdShade
@@ -4315,7 +4480,7 @@ def inspect_stage_materials(request):
 
 
 def inspect_stage_lights(request):
-    from pxr import Usd, UsdLux
+    from pxr import Usd, UsdGeom, UsdLux
     graph = request['graph']
     stage, alive, _ = compile_graph(graph, reload=bool(request.get('reload', False)))
     lights = []
@@ -4357,6 +4522,13 @@ def inspect_stage_lights(request):
             elif prim.HasAttribute('colorTemperature'):
                 temp = float(prim.GetAttribute('colorTemperature').Get() or 6500.0)
 
+            xform_data = {'translate': [0.0, 0.0, 0.0], 'rotate': [0.0, 0.0, 0.0]}
+            try:
+                local_mat = UsdGeom.Xformable(prim).GetLocalTransformation(Usd.TimeCode.Default())
+                xform_data = decompose_camera_transform(local_mat)
+            except Exception:
+                pass
+
             lights.append({
                 'path': str(prim.GetPath()),
                 'name': prim.GetName(),
@@ -4366,6 +4538,8 @@ def inspect_stage_lights(request):
                 'color': color,
                 'enableColorTemperature': temp_enabled,
                 'colorTemperature': temp,
+                'translate': xform_data['translate'],
+                'rotate': xform_data['rotate'],
             })
     return {'lights': lights}
 
