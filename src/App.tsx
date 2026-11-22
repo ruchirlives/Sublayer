@@ -422,6 +422,7 @@ function Workspace() {
   const [seekFrameRequest, setSeekFrameRequest] = useState<{ frame: number; seq: number } | null>(null);
   const viewportFrameRef = useRef(0);
   viewportFrameRef.current = viewportFrame;
+  const viewportCameraTransformRef = useRef<{ translate: [number, number, number]; rotate: [number, number, number] } | null>(null);
   function startInspectorResize(e: React.MouseEvent) {
     e.preventDefault();
     const startX = e.clientX;
@@ -580,6 +581,8 @@ function Workspace() {
     [target.path, target.graph],
   );
   const [primSelection,setPrimSelection]=useState({key:"",path:""});
+  const [isolatedPrim, setIsolatedPrim] = useState<string | null>(null);
+  const [hiddenPrims, setHiddenPrims] = useState<string[]>([]);
   const selectedPrim=primSelection.key===sceneKey?primSelection.path:"";
   const flowInstance=useRef<ReactFlowInstance<StageNode,Edge>|null>(null);
   const [dropTarget,setDropTarget]=useState<DropTarget>(null);
@@ -992,11 +995,29 @@ function Workspace() {
               status: ctx.status,
               error: (ctx as Record<string, unknown>).error ?? null,
               viewportError: (ctx as Record<string, unknown>).viewportError ?? null,
-              nodes: current.nodes.map((n) => ({
-                id: n.id,
-                operation: n.data.operation,
-                label: n.data.label,
-              })),
+              nodes: current.nodes.map((n) => {
+                const d = n.data;
+                const op = d.operation;
+                let settings: Record<string, unknown> | undefined;
+                if (op === "light") settings = { lightOverrides: d.lightOverrides ?? [] };
+                else if (op === "hdri") settings = { hdri: d.hdri ?? null };
+                else if (op === "materialx") settings = d.materialXRules ? { materialXRules: d.materialXRules } : { materialX: d.materialX ?? null };
+                else if (op === "transform") settings = { transform: d.transform ?? null, transformTargets: d.transformTargets ?? null };
+                else if (op === "pose") settings = { pose: d.pose ?? null };
+                else if (op === "delete") settings = { deletePaths: d.deletePaths ?? [] };
+                else if (op === "camera") settings = { camera: d.camera ?? null, cameraViews: d.cameraViews ?? [] };
+                else if (op === "blender") settings = { blenderScene: d.blenderScene ?? null, blenderSelections: d.blenderSelections ?? [], blenderMaterialMode: d.blenderMaterialMode ?? null, blenderExportSkeletons: d.blenderExportSkeletons ?? null, scale: d.scale ?? 1 };
+                else if (op === "hair" && d.hair) {
+                  const { groomDeltas: _g, ...hairSummary } = d.hair as Record<string, unknown>;
+                  settings = { hair: hairSummary };
+                }
+                return {
+                  id: n.id,
+                  operation: op,
+                  label: d.label,
+                  ...(settings ? { settings } : {}),
+                };
+              }),
               edges: current.edges,
             });
           } else if (action === "close") {
@@ -1206,7 +1227,7 @@ function Workspace() {
       )}
         <div className="application-tab-host" hidden={activeTab!=="applications"}><Suspense fallback={null}>{activeTab==="applications" && <ApplicationSettings focusProfileId={settingsTarget.id} focusVisit={settingsTarget.visit}/>}</Suspense></div>
         <section className="workspace" style={activeTab==="applications"?{display:"none"}:undefined}>
-          <SceneOverview path={target.path} graph={target.graph} selected={selectedPrim} onSelect={path=>setPrimSelection({key:sceneKey,path})} onStatus={reportStatus}/>
+          <SceneOverview path={target.path} graph={target.graph} selected={selectedPrim} onSelect={path=>setPrimSelection({key:sceneKey,path})} onAddToMaterialX={materialXEditorId && projectModel.nodes.some(n=>n.id===materialXEditorId && n.data.operation==="materialx") ? (primPath)=>setMaterialXPrimDrop(c=>({primPath,seq:(c?.seq ?? 0)+1})) : undefined} isolatedPrim={isolatedPrim} hiddenPrims={hiddenPrims} onHidePrim={p=>setHiddenPrims(prev=>prev.includes(p)?prev:[...prev,p])} onShowPrim={p=>setHiddenPrims(prev=>prev.filter(x=>x!==p))} onIsolatePrim={p=>setIsolatedPrim(cur=>cur===p?null:p)} onShowAll={()=>{setHiddenPrims([]);setIsolatedPrim(null);}} onStatus={reportStatus}/>
           <div className={"canvas " + (sceneMode ? "scene-mode" : "")} onDrop={dropNode} onDragOver={e=>{
             if(e.dataTransfer.types.includes("application/orchflow-node")){e.preventDefault();e.dataTransfer.dropEffect="copy";const target=targetAt(e.target);setDropTarget(previous=>JSON.stringify(previous)===JSON.stringify(target)?previous:target);}
           }} onDragLeave={e=>{if(!e.currentTarget.contains(e.relatedTarget as Node))setDropTarget(null);}}>
@@ -1260,6 +1281,9 @@ function Workspace() {
                 )
               }
               onTimeChange={setViewportFrame}
+              onCameraTransformChange={(t) => {
+                viewportCameraTransformRef.current = t;
+              }}
               seekFrameRequest={seekFrameRequest}
               onCommitHairGroom={(nodeId, groomDeltas) => {
                 const targetNode = projectRef.current.nodes.find((n) => n.id === nodeId);
@@ -1376,6 +1400,10 @@ function Workspace() {
                     }
                   : null
               }
+              isolatedPrim={isolatedPrim}
+              onIsolatedPrimChange={setIsolatedPrim}
+              hiddenPrims={hiddenPrims}
+              onHiddenPrimsChange={setHiddenPrims}
               onSelectPrim={path=>setPrimSelection({key:sceneKey,path})}
               onAddToMaterialX={materialXEditorId && projectModel.nodes.some(n=>n.id===materialXEditorId && n.data.operation==="materialx") ? (primPath)=>setMaterialXPrimDrop(c=>({primPath,seq:(c?.seq ?? 0)+1})) : undefined}
             />
@@ -1765,6 +1793,8 @@ function Workspace() {
                     project={projectModel}
                     nodeId={node.id}
                     overrides={node.data.lightOverrides}
+                    getViewportCameraTransform={() => viewportCameraTransformRef.current}
+                    onStatus={reportStatus}
                     onChange={(lightOverrides) => update({ lightOverrides })}
                   />
                 )}

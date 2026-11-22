@@ -140,5 +140,44 @@ class BlenderNodeTests(unittest.TestCase):
         self.assertTrue(st.GetPrimAtPath('/root/prototypes/Unused_SRC').IsValid())
         self.assertTrue(st.GetPrimAtPath('/root/_materials/Unused').IsValid())
 
+    def test_blender_node_applies_scale_without_transform_node(self):
+        cube_usd = os.path.join(self._tmp.name, 'cube_cm.usda')
+        st = Usd.Stage.CreateNew(cube_usd)
+        UsdGeom.SetStageUpAxis(st, UsdGeom.Tokens.y)
+        UsdGeom.SetStageMetersPerUnit(st, 0.01)
+        root = UsdGeom.Xform.Define(st, '/root')
+        st.SetDefaultPrim(root.GetPrim())
+        cube = UsdGeom.Cube.Define(st, '/root/Box')
+        cube.CreateSizeAttr().Set(2.0)
+        st.GetRootLayer().Save()
+
+        base_graph = {
+            'targetNodeId': 'blender1',
+            'nodes': [
+                {
+                    'id': 'blender1',
+                    'operation': 'blender',
+                    'label': 'Blender',
+                    'publishedDependencyId': 'dep_usd',
+                    'scale': 1.0,
+                }
+            ],
+            'edges': [],
+            'dependencies': [{'id': 'dep_usd', 'path': cube_usd}],
+        }
+        stage_1x, _, _ = usd_graph.compile_graph(base_graph)
+        bbox_1x = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_]).ComputeWorldBound(stage_1x.GetPrimAtPath('/Scene/root/Box')).ComputeAlignedRange()
+
+        scaled_graph = {
+            **base_graph,
+            'nodes': [{**base_graph['nodes'][0], 'scale': 100.0}],
+        }
+        stage_100x, _, _ = usd_graph.compile_graph(scaled_graph)
+        bbox_100x = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_]).ComputeWorldBound(stage_100x.GetPrimAtPath('/Scene/root/Box')).ComputeAlignedRange()
+
+        # 0.01 m/unit * 2.0 = 0.02 m at scale=1.0; 100x scale restores 2.0 m
+        self.assertAlmostEqual(bbox_1x.GetSize()[0], 0.02, places=4)
+        self.assertAlmostEqual(bbox_100x.GetSize()[0], 2.0, places=4)
+
 if __name__ == '__main__':
     unittest.main()

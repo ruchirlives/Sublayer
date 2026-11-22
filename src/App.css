@@ -200,7 +200,7 @@ nav button{padding:9px}
 .native-project-panel small{color:#96b7bf}
 .coordinate-panel{border:1px solid #385259;border-radius:8px;gap:10px;padding:12px;display:grid}
 .coordinate-panel h3,.coordinate-panel p{margin:0}
-.application-preview-controls{z-index:12;background:#152126ee;border:1px solid #30474c;border-radius:8px;flex-wrap:wrap;align-items:center;gap:4px;max-width:calc(100% - 40px);padding:4px;font-size:12px;display:flex;position:absolute;top:74px;left:20px}
+.application-preview-controls{z-index:12;background:#152126ee;border:1px solid #30474c;border-radius:8px;flex-wrap:wrap;align-items:center;gap:4px;max-width:100%;padding:4px;font-size:12px;display:flex;pointer-events:auto}
 .application-preview-controls span{color:#afcfce}
 .application-preview-controls button{background:transparent;border:1px solid transparent;border-radius:6px;color:#afcfce;padding:4px 10px;font-size:11px;font-weight:500;cursor:pointer}
 .application-preview-controls button.active{background:#244348;border-color:#5f9a88;color:#e7faf2;font-weight:600}

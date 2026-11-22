@@ -267,6 +267,8 @@ class OvrtxViewport:
         self.prepared_hair_node_id = None
         self.live_groom_modified = False
         self.overlay_handle = None
+        self._pose_overlay_handle = None
+        self._pose_overlay_seq = 0
         self.overlay_path = None
         self._pin_mat_overlay_active = False
         self._pre_pin_overlay_path = None
@@ -282,6 +284,8 @@ class OvrtxViewport:
         self._cuda_readback_cache = {}
         self.native_popup = None
         self._native_popup_active = False
+        self._pt_stall_count = 0
+        self._pt_stall_rebuilt_for = None
         self._ensure_initialized()
 
     def _ensure_initialized(self):
@@ -361,6 +365,8 @@ class OvrtxViewport:
         self.temp_usd_path = None
         self.overlay_path = None
         self.overlay_handle = None
+        self._pose_overlay_handle = None
+        self._pose_overlay_seq = 0
         self.base_layer = None
         self.mx_rule_selections = {}
         self.current_usd_stage = None
@@ -441,6 +447,8 @@ class OvrtxViewport:
                 pass
             self.overlay_path = None
         self.overlay_handle = None
+        self._pose_overlay_handle = None
+        self._pose_overlay_seq = 0
         self.base_layer = None
         self.mx_rule_selections = {}
     def _compute_camera_params(self, request, width, height):
@@ -547,6 +555,9 @@ class OvrtxViewport:
             "aspect": float(width) / float(max(height, 1)),
         }
         matrix = Gf.Matrix4d().SetLookAt(eye, center, up).GetInverse()
+        self._last_camera_transform = usd_graph.decompose_camera_transform(
+            matrix, self.current_usd_stage, Usd.TimeCode(float(request.get("frame", 0)))
+        )
         horizontal_aperture = 36.0 * width / height
         vertical_aperture = 36.0
         focal_length = 36.0 / (2 * math.tan(half_fov))
@@ -632,9 +643,87 @@ class OvrtxViewport:
             model=ovstage.HierarchyComputationModel.CPU_INCREMENTAL)
         self.stage.advance_write_floor(self.ordinal).wait()
         # apply_usd_changes re-syncs /Render/RenderProduct_Viewport from temp_usd_path
-        # (which has omni:rtx:pt:samplesPerPixel = 1); mark it to be raised to target_spp.
+        # (which has omni:rtx:pt:samplesPerPixel = 1 and maxBounces = 8); mark both to be re-synced.
         self._pt_spp_at_one = True
+        self._pt_max_bounces = 8
+        self._pt_stall_count = 0
         self.overlay_path = new_path
+
+    def _write_pt_samples_per_pixel(self, target_spp):
+        self.ordinal += 1
+        with ovstage.PathDictionary(self.stage) as paths:
+            prod_plist = paths.create_path_list_from_strings(["/Render/RenderProduct_Viewport"])
+            try:
+                prod_query = self.stage.query_from_path_list(prod_plist)
+                self.stage.write_attribute(
+                    prod_query,
+                    "omni:rtx:pt:samplesPerPixel",
+                    self.ordinal,
+                    np.asarray([target_spp], dtype=np.uint32),
+                    is_array=False,
+                    semantic=0,
+                ).wait()
+            finally:
+                paths.destroy_path_list(prod_plist)
+        self.stage.compute_hierarchy(
+            self.ordinal,
+            self.ordinal,
+            model=ovstage.HierarchyComputationModel.CPU_INCREMENTAL,
+        )
+        self.stage.advance_write_floor(self.ordinal).wait()
+        self._pt_spp_at_one = False
+
+    def _recover_stalled_ovstage(self, request, render_mode, target_spp):
+        """Rebuild the live ovstage in place from the existing preview snapshot & overlays
+        when ovrtx path-tracing accumulation stalls at sample 1 across multiple refinement steps."""
+        if not self.temp_usd_path or not os.path.isfile(self.temp_usd_path) or self.renderer is None:
+            return False
+        try:
+            self.renderer.detach_ovstage()
+        except Exception:
+            pass
+        if self.stage is not None:
+            try:
+                self.stage.destroy()
+            except Exception:
+                pass
+        self.stage = ovstage.Stage("orchflow_ovrtx_" + uuid.uuid4().hex)
+        self.renderer.attach_ovstage(self.stage)
+        self.overlay_handle = None
+        self._pose_overlay_handle = None
+        self.ordinal = 1
+        tps = self.current_usd_stage.GetTimeCodesPerSecond() if self.current_usd_stage is not None else 24.0
+        ovstage.population.open_usd(
+            self.stage,
+            self.temp_usd_path,
+            ordinal=self.ordinal,
+            time=float(request.get("frame", 0)) / max(1e-5, tps),
+        )
+        added_overlay = False
+        if self.overlay_path and os.path.isfile(self.overlay_path):
+            self.overlay_handle = ovstage.population.add_usd_reference(self.stage, self.overlay_path, "/")
+            added_overlay = True
+        pose_path = getattr(self, "_pose_overlay_path", None)
+        if pose_path and os.path.isfile(pose_path):
+            self._pose_overlay_handle = ovstage.population.add_usd_reference(self.stage, pose_path, "/")
+            added_overlay = True
+        if added_overlay:
+            ovstage.population.apply_usd_changes(self.stage, ordinal=self.ordinal)
+        self.stage.compute_hierarchy(
+            self.ordinal,
+            self.ordinal,
+            model=ovstage.HierarchyComputationModel.CPU_INCREMENTAL,
+        )
+        self.stage.advance_write_floor(self.ordinal).wait()
+        self.last_camera_key = None
+        self.last_width = 0
+        self.last_height = 0
+        self.last_requested_selection = []
+        self.active_selection = []
+        self._pt_spp_at_one = (render_mode == "pathTracing" and target_spp > 1)
+        self._pt_max_bounces = 8
+        self._pt_stall_count = 0
+        return True
 
     def _write_hair_points_to_ovstage(self, updates):
         if not updates:
@@ -1069,6 +1158,7 @@ class OvrtxViewport:
         bake_layer = Sdf.Layer.CreateAnonymous("ovrtx_pose_flatten_bake.usda")
         sess = stage.GetSessionLayer()
         sess.subLayerPaths.insert(0, bake_layer.identifier)
+        self._initial_pose_points = []
         with Usd.EditContext(stage, bake_layer):
             for _skel_path, (sq, meshes) in bindings_by_skel.items():
                 if not meshes:
@@ -1077,10 +1167,75 @@ class OvrtxViewport:
                 for mpath_str, skq, rest_pts in meshes:
                     pts = Vt.Vec3fArray(rest_pts)
                     if skq.ComputeSkinnedPoints(skin_xforms, pts, tc):
+                        self._initial_pose_points.append((mpath_str, pts))
                         over_m = stage.OverridePrim(Sdf.Path(mpath_str))
                         UsdGeom.Mesh(over_m).CreatePointsAttr().Set(pts)
                         UsdSkel.BindingAPI(over_m).CreateSkeletonRel().SetTargets([])
         return bake_layer
+
+    def _strip_skel_from_flat(self, flat):
+        bindings = getattr(self, "_ovrtx_skel_bindings", None) or {}
+        for _skel_path, (_sq, meshes) in bindings.items():
+            for mpath_str, _skq, _rest_pts in meshes:
+                ps = flat.GetPrimAtPath(mpath_str)
+                if not ps:
+                    continue
+                for prop_name in list(ps.properties.keys()):
+                    if prop_name == "points" or prop_name.startswith("skel:") or prop_name.startswith("primvars:skel:"):
+                        del ps.properties[prop_name]
+                api = ps.GetInfo("apiSchemas")
+                if api:
+                    items = [t for t in api.GetAddedOrExplicitItems() if t != "SkelBindingAPI"]
+                    new_op = Sdf.TokenListOp()
+                    new_op.explicitItems = items
+                    ps.SetInfo("apiSchemas", new_op)
+        def _clear_skel_roots(prim_spec):
+            if prim_spec.typeName == "SkelRoot":
+                prim_spec.typeName = "Xform"
+            for child in prim_spec.nameChildren.values():
+                _clear_skel_roots(child)
+        for root_prim in flat.rootPrims.values():
+            _clear_skel_roots(root_prim)
+
+    def _swap_pose_overlay(self, updates, apply_changes=True):
+        ov_layer = Sdf.Layer.CreateAnonymous("ovrtx_pose_overlay.usdc")
+        for mpath_str, pts_vt in updates:
+            spec = Sdf.CreatePrimInLayer(ov_layer, Sdf.Path(mpath_str))
+            spec.specifier = Sdf.SpecifierOver
+            attr = Sdf.AttributeSpec(spec, "points", Sdf.ValueTypeNames.Point3fArray)
+            attr.default = pts_vt
+        scratch_dir = os.path.dirname(self.temp_usd_path) if self.temp_usd_path else (
+            os.environ.get("ORCHFLOW_OVRTX_SCRATCH") or os.path.join(tempfile.gettempdir(), "orchflow_ovrtx_scratch")
+        )
+        os.makedirs(scratch_dir, exist_ok=True)
+        seq = getattr(self, "_pose_overlay_seq", 0) + 1
+        self._pose_overlay_seq = seq
+        new_path = os.path.join(scratch_dir, f"orchflow_ovrtx_pose_{seq}_{uuid.uuid4().hex[:8]}.usdc")
+        ov_layer.Export(new_path)
+        prev_handle = getattr(self, "_pose_overlay_handle", None)
+        prev_path = getattr(self, "_pose_overlay_path", None)
+        if prev_handle is not None:
+            ovstage.population.remove_usd(self.stage, prev_handle)
+            self._pose_overlay_handle = None
+        self._pose_overlay_handle = ovstage.population.add_usd_reference(self.stage, new_path, "/")
+        self._pose_overlay_path = new_path
+        if prev_path and prev_path != new_path and os.path.isfile(prev_path):
+            try:
+                os.remove(prev_path)
+            except OSError:
+                pass
+        if apply_changes:
+            self.ordinal += 1
+            ovstage.population.apply_usd_changes(self.stage, ordinal=self.ordinal)
+            self.stage.compute_hierarchy(
+                self.ordinal,
+                self.ordinal,
+                model=ovstage.HierarchyComputationModel.CPU_INCREMENTAL,
+            )
+            self.stage.advance_write_floor(self.ordinal).wait()
+            self._pt_spp_at_one = True
+            self._pt_max_bounces = 8
+            self._pt_stall_count = 0
 
     def _apply_live_pose_to_ovstage(self, skel_paths, sample_frame):
         from pxr import Vt
@@ -1102,9 +1257,9 @@ class OvrtxViewport:
             for mpath_str, skq, rest_pts in meshes:
                 pts = Vt.Vec3fArray(rest_pts)
                 if skq.ComputeSkinnedPoints(skin_xforms, pts, tc):
-                    updates.append((mpath_str, np.ascontiguousarray(pts, dtype=np.float32)))
+                    updates.append((mpath_str, pts))
         if updates:
-            self._write_hair_points_to_ovstage(updates)
+            self._swap_pose_overlay(updates, apply_changes=True)
         return True
 
     def _try_fast_pose_delta(self, prev_graph, new_graph, sample_frame):
@@ -1117,8 +1272,9 @@ class OvrtxViewport:
                 return False
             import pose_node
             targets = live_poses.get(changed["id"]) or []
-            if not pose_node.update_live_pose(changed, targets):
-                return False
+            with Usd.EditContext(self.current_usd_stage, self.current_usd_stage.GetRootLayer()):
+                if not pose_node.update_live_pose(changed, targets):
+                    return False
             skel_paths = [t_skel_path for _r, _e, t_skel_path, _out in targets]
             self._apply_live_pose_to_ovstage(skel_paths, sample_frame)
             return True
@@ -1185,6 +1341,8 @@ class OvrtxViewport:
                     {
                         "id": r.get("id"),
                         "enabled": r.get("enabled"),
+                        "mode": r.get("mode"),
+                        "overrideParams": sorted(r.get("overrideParams") or []),
                         "searchType": r.get("searchType"),
                         "query": r.get("query"),
                         "material": _strip_mx_params(r.get("material")),
@@ -1219,6 +1377,12 @@ class OvrtxViewport:
 
         try:
             overlay = Sdf.Layer.CreateAnonymous("mx_fast_delta.usda")
+            # Preserve any active non-MaterialX delta opinions (e.g. Light, HDRI, Transform)
+            # currently applied on top of self.base_layer so fast MaterialX edits never reset them.
+            if self.overlay_path and os.path.isfile(self.overlay_path):
+                prev_overlay = Sdf.Layer.FindOrOpen(self.overlay_path)
+                if prev_overlay is not None:
+                    overlay.TransferContent(prev_overlay)
             overlay.subLayerPaths = [self.base_layer.identifier]
             tmp_stage = Usd.Stage.Open(overlay)
             default_prim = tmp_stage.GetPrimAtPath("/Scene")
@@ -1493,6 +1657,9 @@ class OvrtxViewport:
                 self.last_graph_hash = graph_hash
                 self.last_suffix = scene_suffix
                 self.last_update_kind = "frame-reopen"
+                self._pt_spp_at_one = (render_mode == "pathTracing" and target_spp > 1)
+                self._pt_max_bounces = 8
+                self._pt_stall_count = 0
                 scene_changed = switched_scene = False
                 camera_changed = True
         elif scene_changed and not self.live_groom_modified and editable_hair_id is None and graph_hash in self.stage_pool:
@@ -1507,6 +1674,9 @@ class OvrtxViewport:
             self.graph_stages = cached["graph_stages"]
             self.graph_stats = cached["graph_stats"]
             self.mx_rule_selections = cached.get("mx_rule_selections", {})
+            self.live_poses = cached.get("live_poses", {})
+            self._ovrtx_skel_bindings = cached.get("ovrtx_skel_bindings")
+            self._ovrtx_skel_cache = cached.get("ovrtx_skel_cache")
             self.last_graph_hash = graph_hash
             self.last_static_scene_key = static_scene_key
             self.last_graph = graph
@@ -1540,6 +1710,9 @@ class OvrtxViewport:
                     "graph_stages": self.graph_stages,
                     "graph_stats": self.graph_stats,
                     "mx_rule_selections": self.mx_rule_selections,
+                    "live_poses": getattr(self, "live_poses", {}),
+                    "ovrtx_skel_bindings": getattr(self, "_ovrtx_skel_bindings", None),
+                    "ovrtx_skel_cache": getattr(self, "_ovrtx_skel_cache", None),
                 }
                 scene_changed = False
             elif self._try_fast_hair_delta(self.last_graph, graph, float(request.get("frame", 0)), editable_hair_id):
@@ -1612,26 +1785,52 @@ class OvrtxViewport:
             elif mode == "scene" and (self.material_diagnostics or issues):
                 raise ValueError("NVIDIA source materials contain unresolved shader assets or invalid inputs; use Auto or repair their links")
 
-            # Ensure studio ambient dome if no DomeLight exists, and key light if no scene lights exist
-            has_dome = any(
-                'DomeLight' in prim.GetTypeName()
-                and not prim.GetPath().HasPrefix(Sdf.Path('/Render/DefaultLights'))
-                for prim in stage.Traverse(Usd.TraverseInstanceProxies())
-            )
+            # Ensure default studio lights only when no scene lights exist and no Light/HDRI node is in the active subgraph
+            def _graph_has_lighting_node(g):
+                if not isinstance(g, dict):
+                    return False
+                tgt = g.get("targetNodeId")
+                nmap = {n.get("id"): n for n in (g.get("nodes") or []) if isinstance(n, dict) and n.get("id")}
+                if not tgt or tgt not in nmap:
+                    return False
+                inc = {}
+                for e in (g.get("edges") or []):
+                    if isinstance(e, dict) and e.get("target") and e.get("source"):
+                        inc.setdefault(e["target"], []).append(e["source"])
+                seen, stack = set(), [tgt]
+                while stack:
+                    nid = stack.pop()
+                    if nid in seen:
+                        continue
+                    seen.add(nid)
+                    n = nmap.get(nid)
+                    if not n:
+                        continue
+                    op = n.get("operation") or (n.get("data") or {}).get("operation")
+                    if op in ("light", "hdri"):
+                        return True
+                    stack.extend(inc.get(nid, ()))
+                return False
+
+            has_lighting_node = _graph_has_lighting_node(graph)
             has_scene_lights = any(
                 ('Light' in prim.GetTypeName() or (hasattr(UsdLux, 'LightAPI') and prim.HasAPI(UsdLux.LightAPI)))
                 and not prim.GetPath().HasPrefix(Sdf.Path('/Render/DefaultLights'))
                 for prim in stage.Traverse(Usd.TraverseInstanceProxies())
             )
-            if not has_dome or not has_scene_lights:
+            if not has_lighting_node and not has_scene_lights:
                 if not stage.GetPrimAtPath('/Render/DefaultLights'):
                     UsdGeom.Scope.Define(stage, '/Render/DefaultLights')
-                if not has_dome and not stage.GetPrimAtPath('/Render/DefaultLights/DomeLight'):
+                if not stage.GetPrimAtPath('/Render/DefaultLights/DomeLight'):
                     dome = UsdLux.DomeLight.Define(stage, "/Render/DefaultLights/DomeLight")
+                    if hasattr(UsdLux, 'ShadowAPI'):
+                        UsdLux.ShadowAPI.Apply(dome.GetPrim()).CreateShadowEnableAttr().Set(True)
                     dome.CreateIntensityAttr().Set(3000.0)
                     dome.CreateColorAttr().Set(Gf.Vec3f(0.95, 0.97, 1.0))
-                if not has_scene_lights and not stage.GetPrimAtPath('/Render/DefaultLights/KeyLight'):
+                if not stage.GetPrimAtPath('/Render/DefaultLights/KeyLight'):
                     key = UsdLux.DistantLight.Define(stage, "/Render/DefaultLights/KeyLight")
+                    if hasattr(UsdLux, 'ShadowAPI'):
+                        UsdLux.ShadowAPI.Apply(key.GetPrim()).CreateShadowEnableAttr().Set(True)
                     key.CreateIntensityAttr().Set(3000.0)
                     key.CreateColorAttr().Set(Gf.Vec3f(1.0, 0.98, 0.95))
                     key.AddRotateXYZOp().Set(Gf.Vec3f(-45.0, 45.0, 0.0))
@@ -1656,17 +1855,20 @@ class OvrtxViewport:
                 product_prim.CreateAttribute("omni:rtx:post:aa:op", Sdf.ValueTypeNames.Token, custom=False).Set("dlss")
                 product_prim.CreateAttribute("omni:rtx:post:dlss:execMode", Sdf.ValueTypeNames.Token, custom=False).Set("quality")
                 product_prim.CreateAttribute("omni:rtx:rt:sss:enabled", Sdf.ValueTypeNames.Bool, custom=False).Set(True)
+                product_prim.CreateAttribute("omni:rtx:translucency:enabled", Sdf.ValueTypeNames.Bool, custom=False).Set(True)
+                product_prim.CreateAttribute("omni:rtx:translucency:maxRefractionBounces", Sdf.ValueTypeNames.Int, custom=False).Set(8)
+                product_prim.CreateAttribute("omni:rtx:raytracing:fractionalCutoutOpacity", Sdf.ValueTypeNames.Bool, custom=False).Set(True)
             else:
                 spp_per_iter = max(1, int(request.get("samples", 1)))
                 self._pt_spp_at_one = target_spp > 1
                 product_prim.CreateAttribute("omni:rtx:post:aa:op", Sdf.ValueTypeNames.Token, custom=False).Set("none")
                 product_prim.CreateAttribute("omni:rtx:pt:dlss:enabled", Sdf.ValueTypeNames.Bool, custom=False).Set(False)
                 product_prim.CreateAttribute("omni:rtx:pt:denoising:enabled", Sdf.ValueTypeNames.Bool, custom=False).Set(True)
-                product_prim.CreateAttribute("omni:rtx:pt:denoising:optix:temporal", Sdf.ValueTypeNames.Bool, custom=False).Set(True)
-                product_prim.CreateAttribute("omni:rtx:pt:limits:maxBounces", Sdf.ValueTypeNames.UInt, custom=False).Set(4)
+                product_prim.CreateAttribute("omni:rtx:pt:denoising:optix:temporal", Sdf.ValueTypeNames.Bool, custom=False).Set(False)
+                product_prim.CreateAttribute("omni:rtx:pt:limits:maxBounces", Sdf.ValueTypeNames.UInt, custom=False).Set(8)
                 product_prim.CreateAttribute("omni:rtx:pt:samplesPerIteration", Sdf.ValueTypeNames.Int, custom=False).Set(spp_per_iter)
                 product_prim.CreateAttribute("omni:rtx:pt:samplesPerPixel", Sdf.ValueTypeNames.UInt, custom=False).Set(1)
-                self._pt_max_bounces = 4
+                self._pt_max_bounces = 8
 
             var = UsdRender.Var.Define(stage, "/Render/RenderVar_LdrColor")
             var.CreateSourceNameAttr().Set("LdrColor")
@@ -1693,10 +1895,35 @@ class OvrtxViewport:
                     xf.AddRotateXOp(opSuffix="ovrtxUp").Set(-90.0)
                 if abs(spin) > 1e-6:
                     xf.AddRotateZOp(opSuffix="ovrtxSpin").Set(spin)
+            # Prevent transmissive shells from casting opaque shadows inward in Realtime RTX (and thick dielectrics in PT).
+            # Note: thin_walled surfaces in PathTracing already pass light physically without doNotCastShadows (which would double-light them).
+            from pxr import UsdShade
+            for prim in stage.Traverse():
+                if not prim.IsA(UsdGeom.Mesh):
+                    continue
+                mat, _ = UsdShade.MaterialBindingAPI(prim).ComputeBoundMaterial()
+                if not mat:
+                    continue
+                is_transmissive = False
+                is_thin_walled = False
+                for sp in Usd.PrimRange(mat.GetPrim()):
+                    if not sp.IsA(UsdShade.Shader):
+                        continue
+                    sh = UsdShade.Shader(sp)
+                    tr_inp = sh.GetInput("transmission")
+                    if tr_inp and (tr_inp.Get() or 0) > 0.5:
+                        is_transmissive = True
+                    tw_inp = sh.GetInput("thin_walled")
+                    if tw_inp and bool(tw_inp.Get()):
+                        is_thin_walled = True
+                if is_transmissive and (render_mode == "realtime" or not is_thin_walled):
+                    UsdGeom.PrimvarsAPI(prim).CreatePrimvar("doNotCastShadows", Sdf.ValueTypeNames.Bool, UsdGeom.Tokens.constant).Set(True)
             phase("flattening private USD preview")
             bake_layer = self._bake_stage_skel_for_ovstage(stage, sample)
             try:
                 flat = stage.Flatten()
+                if bake_layer is not None:
+                    self._strip_skel_from_flat(flat)
             finally:
                 if bake_layer is not None:
                     bake_layer.Clear()
@@ -1733,6 +1960,9 @@ class OvrtxViewport:
                     "graph_stages": self.graph_stages,
                     "graph_stats": self.graph_stats,
                     "mx_rule_selections": self.mx_rule_selections,
+                    "live_poses": getattr(self, "live_poses", {}),
+                    "ovrtx_skel_bindings": getattr(self, "_ovrtx_skel_bindings", None),
+                    "ovrtx_skel_cache": getattr(self, "_ovrtx_skel_cache", None),
                 }
             else:
                 base_key = None
@@ -1762,6 +1992,8 @@ class OvrtxViewport:
                 self._update_camera(flat_stage, request, width, height)
                 phase("writing temporary preview snapshot")
                 new_usd_path = export_preview_snapshot(flat)
+                old_pose_overlay = getattr(self, "_pose_overlay_path", None)
+                self._pose_overlay_path = None
 
                 old_overlay_path = self.overlay_path
                 old_temp_path = self.temp_usd_path
@@ -1778,8 +2010,10 @@ class OvrtxViewport:
                     self.stage = ovstage.Stage("orchflow_ovrtx_" + uuid.uuid4().hex)
                     self.renderer.attach_ovstage(self.stage)
                     self.overlay_handle = None
+                    self._pose_overlay_handle = None
+                    self._pose_overlay_seq = 0
                     self.ordinal = 0
-                for old_fp in (old_overlay_path, old_temp_path):
+                for old_fp in (old_overlay_path, old_temp_path, old_pose_overlay):
                     if old_fp and os.path.isfile(old_fp):
                         try:
                             os.remove(old_fp)
@@ -1790,6 +2024,9 @@ class OvrtxViewport:
                 phase("populating NVIDIA scene")
                 ovstage.population.open_usd(self.stage, self.temp_usd_path, ordinal=self.ordinal,
                     time=float(request.get("frame", 0)) / stage.GetTimeCodesPerSecond())
+                if getattr(self, "_initial_pose_points", None):
+                    self._swap_pose_overlay(self._initial_pose_points, apply_changes=False)
+                    ovstage.population.apply_usd_changes(self.stage, ordinal=self.ordinal)
                 phase("computing transform hierarchy")
                 self.stage.compute_hierarchy(self.ordinal, self.ordinal,
                     model=ovstage.HierarchyComputationModel.CPU_INCREMENTAL)
@@ -1819,6 +2056,9 @@ class OvrtxViewport:
                     "graph_stages": self.graph_stages,
                     "graph_stats": self.graph_stats,
                     "mx_rule_selections": self.mx_rule_selections,
+                    "live_poses": getattr(self, "live_poses", {}),
+                    "ovrtx_skel_bindings": getattr(self, "_ovrtx_skel_bindings", None),
+                    "ovrtx_skel_cache": getattr(self, "_ovrtx_skel_cache", None),
                 }
 
         live_pose = request.get("livePose")
@@ -1854,10 +2094,12 @@ class OvrtxViewport:
                             im = qd.GetImaginary()
                             rots[lp_idx] = Gf.Quatf(float(qd.GetReal()), float(im[0]), float(im[1]), float(im[2]))
                             rot_arr = Vt.QuatfArray(rots)
-                            rot_attr.Clear()
-                            rot_attr.Set(rot_arr)
-                            rot_attr.Set(rot_arr, Usd.TimeCode(req_frame))
-                            rot_attr.Set(rot_arr, Usd.TimeCode(req_frame + 1e-4))
+                            out_stage = output.GetPrim().GetStage()
+                            with Usd.EditContext(out_stage, out_stage.GetRootLayer()):
+                                rot_attr.Clear()
+                                rot_attr.Set(rot_arr)
+                                rot_attr.Set(rot_arr, Usd.TimeCode(req_frame))
+                                rot_attr.Set(rot_arr, Usd.TimeCode(req_frame + 1e-4))
                             self._apply_live_pose_to_ovstage([lp_skel], req_frame)
                             camera_changed = True
                             self.last_update_kind = "live-pose"
@@ -1974,6 +2216,10 @@ class OvrtxViewport:
                     if size_changed:
                         self.stage.write_attribute(prod_query, "resolution", self.ordinal,
                             np.asarray([[width, height]], dtype=np.int32), is_array=False, semantic=0).wait()
+                        if render_mode == "pathTracing" and target_spp > 1 and not getattr(self, "_pt_spp_at_one", False):
+                            self.stage.write_attribute(prod_query, "omni:rtx:pt:samplesPerPixel", self.ordinal,
+                                np.asarray([1], dtype=np.uint32), is_array=False, semantic=0).wait()
+                            self._pt_spp_at_one = True
                     dof_enabled = cam_params["dof_enabled"]
                     self.stage.write_attribute(prod_query, "omni:rtx:post:dof:enabled", self.ordinal,
                         np.asarray([dof_enabled], dtype=np.bool_), is_array=False, semantic=0).wait()
@@ -2218,6 +2464,8 @@ class OvrtxViewport:
                     self.stage = ovstage.Stage("orchflow_ovrtx_" + uuid.uuid4().hex)
                     self.renderer.attach_ovstage(self.stage)
                     self.overlay_handle = None
+                    self._pose_overlay_handle = None
+                    self._pose_overlay_seq = 0
                     self.ordinal = 1
                     ovstage.population.open_usd(
                         self.stage,
@@ -2232,6 +2480,9 @@ class OvrtxViewport:
                     )
                     self.stage.advance_write_floor(self.ordinal).wait()
                     self.overlay_path = None
+                    self._pt_spp_at_one = (render_mode == "pathTracing" and target_spp > 1)
+                    self._pt_max_bounces = 8
+                    self._pt_stall_count = 0
                     self._pin_mat_overlay_active = False
                     self._pre_pin_overlay_path = None
                     self._cache_mask_overlay_active = False
@@ -2501,28 +2752,7 @@ class OvrtxViewport:
         if not scene_changed and getattr(self, "_first_refinement_pending", False):
             self._first_refinement_pending = False
         if need_pt_spp_raise:
-            self.ordinal += 1
-            with ovstage.PathDictionary(self.stage) as paths:
-                prod_plist = paths.create_path_list_from_strings(["/Render/RenderProduct_Viewport"])
-                try:
-                    prod_query = self.stage.query_from_path_list(prod_plist)
-                    self.stage.write_attribute(
-                        prod_query,
-                        "omni:rtx:pt:samplesPerPixel",
-                        self.ordinal,
-                        np.asarray([target_spp], dtype=np.uint32),
-                        is_array=False,
-                        semantic=0,
-                    ).wait()
-                finally:
-                    paths.destroy_path_list(prod_plist)
-            self.stage.compute_hierarchy(
-                self.ordinal,
-                self.ordinal,
-                model=ovstage.HierarchyComputationModel.CPU_INCREMENTAL,
-            )
-            self.stage.advance_write_floor(self.ordinal).wait()
-            self._pt_spp_at_one = False
+            self._write_pt_samples_per_pixel(target_spp)
 
         step_ms = (time.perf_counter() - t_step_start) * 1000
         t_capture_start = time.perf_counter()
@@ -2537,7 +2767,43 @@ class OvrtxViewport:
         if render_mode == "pathTracing":
             display_samples = min(target_spp, max(1, current_samples - 1 if current_samples > 1 else current_samples))
             converged = (not need_pt_spp_raise) and (bool(frame.converged) or display_samples >= target_spp)
+            if (
+                target_spp > 1
+                and not interactive
+                and not first_frame
+                and not need_pt_spp_raise
+                and not hair_brushed
+                and not groom_committed
+                and not converged
+                and display_samples <= 1
+            ):
+                self._pt_stall_count = getattr(self, "_pt_stall_count", 0) + 1
+                if self._pt_stall_count == 2:
+                    sys.stderr.write(
+                        f"OVRTX PT progression stalled at {display_samples}/{target_spp} "
+                        f"(raw={current_samples}, converged={bool(frame.converged)}, ordinal={self.ordinal}, "
+                        f"steps={step_count}, updateKind={self.last_update_kind}); re-writing samplesPerPixel.\n"
+                    )
+                    try:
+                        self._write_pt_samples_per_pixel(target_spp)
+                    except Exception as err:
+                        sys.stderr.write(f"OVRTX samplesPerPixel nudge failed: {err}\n")
+                elif self._pt_stall_count >= 4:
+                    stall_key = (self.last_graph_hash, self.overlay_path)
+                    if getattr(self, "_pt_stall_rebuilt_for", None) != stall_key:
+                        sys.stderr.write(
+                            f"OVRTX PT progression still stalled at {display_samples}/{target_spp} after {self._pt_stall_count} "
+                            f"refinement ticks (raw={current_samples}, ordinal={self.ordinal}, updateKind={self.last_update_kind}); "
+                            "rebuilding ovstage in place.\n"
+                        )
+                        self._pt_stall_rebuilt_for = stall_key
+                        self._recover_stalled_ovstage(request, render_mode, target_spp)
+            else:
+                self._pt_stall_count = 0
+                if display_samples > 1 or converged:
+                    self._pt_stall_rebuilt_for = None
         else:
+            self._pt_stall_count = 0
             rt_samples = max(1, current_samples - 49) if current_samples >= 50 else max(1, current_samples)
             display_samples = min(target_spp, rt_samples)
             converged = bool(frame.converged) or rt_samples >= target_spp
@@ -2709,6 +2975,7 @@ class OvrtxViewport:
                 "unitScale": (1.0 / max(1e-6, float(UsdGeom.GetStageMetersPerUnit(self.current_usd_stage) or 1.0))) if self.current_usd_stage else 1.0,
             } if self.camera_fit_key[0] else None,
             "cameraSync": self._pending_camera_sync,
+            "cameraTransform": getattr(self, "_last_camera_transform", None),
             "raySamples": {"current": display_samples, "target": target_spp},
             "frame": float(request.get("frame", 0)),
             "renderMs": render_ms,

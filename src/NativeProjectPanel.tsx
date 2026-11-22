@@ -5,6 +5,7 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import { defaultEditScope } from "./profilePolicy";
 import { useApplicationCatalog, findProfile } from "./applicationProfiles";
 import { PublicationPanel } from "./PublicationPanel";
+import { SubstancePainterPanel } from "./SubstancePainterPanel";
 import { CoordinatePanel } from "./CoordinatePanel";
 import { prepareQuickstart, recordNativeCreation } from "./fileRegistry";
 import type {
@@ -646,6 +647,16 @@ export function NativeProjectPanel({
           </p>
         )}
       </details>
+      {(data.app === "Substance Painter" || data.applicationProfileId === "substance-painter") && (
+        <SubstancePainterPanel
+          project={project}
+          nodeId={nodeId}
+          data={data}
+          onNativeCreated={onNativeCreated}
+          onLive={onLive}
+          onStatus={onStatus}
+        />
+      )}
     </div>
   );
 }

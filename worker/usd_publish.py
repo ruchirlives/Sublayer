@@ -1040,7 +1040,7 @@ def compose_live_adjustment(graph,adjustment):
         from usd_graph import coordinate_preflight as preflight
     validate_revisions(adjustment.get('fileRevisions',[]))
     conversion=adjustment['conversion']
-    _,current,alive=preflight({'graph':graph,'app':conversion['app'],'upAxis':conversion['upAxis'],'metersPerUnit':conversion['metersPerUnit'],'scale':conversion['scale'],'measure':False},include_stage=True)
+    _,current,alive=preflight({'graph':graph,'app':conversion['app'],'upAxis':conversion['upAxis'],'metersPerUnit':conversion['metersPerUnit'],'scale':conversion['scale'],'measure':False,'reload':False},include_stage=True)
     for path,guard in adjustment.get('guards',{}).items():
         prim=current.GetPrimAtPath(path)
         if not prim or mesh_topology_guard(prim)!=guard:raise ValueError('Input paths or topology changed. Recreate the handoff and review application edits using the current scene paths. The saved adjustment and external files were preserved: '+path)
@@ -1075,4 +1075,11 @@ def compose_live_adjustment(graph,adjustment):
     for setter,getter in [('SetStartTimeCode','GetStartTimeCode'),('SetEndTimeCode','GetEndTimeCode'),('SetTimeCodesPerSecond','GetTimeCodesPerSecond'),('SetFramesPerSecond','GetFramesPerSecond')]:getattr(root,setter)(getattr(output,getter)())
     scene.GetPrim().GetReferences().AddReference(layer.identifier,output.GetDefaultPrim().GetPath())
     prepend_root_transform(scene.GetPrim(),Gf.Matrix4d(*[v for row in conversion['inverse'] for v in row]),'returnCoordinates')
+    upstream_stage=alive[-2] if len(alive)>=2 and hasattr(alive[-2],'GetPseudoRoot') else None
+    if upstream_stage is not None:
+        default_path=upstream_stage.GetDefaultPrim().GetPath() if upstream_stage.GetDefaultPrim() else Sdf.Path('/Scene')
+        for sibling in upstream_stage.GetPseudoRoot().GetChildren():
+            if sibling.GetPath()==default_path:continue
+            ref_prim=root.DefinePrim(sibling.GetPath(),sibling.GetTypeName())
+            ref_prim.GetReferences().AddReference(upstream_stage.GetRootLayer().identifier,sibling.GetPath())
     return root,[*alive,current,base,layer,output,root]

@@ -5,6 +5,7 @@ import {
   type BlenderObjectInfo,
   type StoredProject,
 } from "./fileRegistry";
+import { NumberInput } from "./NumberInput";
 
 interface BlenderInspectorProps {
   project: StoredProject;
@@ -728,6 +729,64 @@ export function BlenderInspector({
             />
             <span>Export skeletons (UsdSkel)</span>
           </label>
+        )}
+        {(blendPath || node?.data.publishedDependencyId) && (
+          <div
+            style={{
+              marginTop: "8px",
+              display: "flex",
+              alignItems: "center",
+              gap: "6px",
+              fontSize: "11px",
+            }}
+          >
+            <span style={{ color: "#9eb6ab", whiteSpace: "nowrap" }}>Scale</span>
+            <NumberInput
+              aria-label="Blender import scale"
+              min="0.000001"
+              step="0.1"
+              value={typeof node?.data.scale === "number" && node.data.scale > 0 ? node.data.scale : 1}
+              onChange={(e) => {
+                const scale = Number(e.target.value);
+                if (!Number.isFinite(scale) || scale <= 0) return;
+                const base = flushPendingSelections();
+                onProjectChange({
+                  ...base,
+                  nodes: base.nodes.map((n) =>
+                    n.id !== nodeId ? n : { ...n, data: { ...n.data, scale } }
+                  ),
+                });
+              }}
+              style={{ width: "74px", fontSize: "11px", padding: "3px 5px" }}
+            />
+            {[0.01, 1, 100].map((preset) => {
+              const currentScale = typeof node?.data.scale === "number" && node.data.scale > 0 ? node.data.scale : 1;
+              const active = Math.abs(currentScale - preset) < 1e-9;
+              return (
+                <button
+                  key={preset}
+                  type="button"
+                  title={`Set import scale to ${preset}x`}
+                  onClick={() => {
+                    const base = flushPendingSelections();
+                    onProjectChange({
+                      ...base,
+                      nodes: base.nodes.map((n) =>
+                        n.id !== nodeId ? n : { ...n, data: { ...n.data, scale: preset } }
+                      ),
+                    });
+                  }}
+                  style={{
+                    fontSize: "10px",
+                    padding: "2px 5px",
+                    ...(active ? { borderColor: "#9fe2b6", color: "#9fe2b6" } : {}),
+                  }}
+                >
+                  {preset}×
+                </button>
+              );
+            })}
+          </div>
         )}
       </div>
 

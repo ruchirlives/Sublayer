@@ -155,9 +155,19 @@ export function HairGroomPopup() {
   const queue = useMemo(() => new LatestRenderQueue<Record<string, unknown>, Record<string, unknown>>({
     render: async (req) => {
       const register = Boolean(req.graph && req.graphKey !== registeredGraphRef.current);
-      const payload = { ...req, ...(register ? {} : { graph: undefined }) };
-      const buf = await invoke<ArrayBuffer>("render_viewport_frame", { request: payload });
-      if (register && typeof req.graphKey === "string") {
+      const send = (withGraph: boolean) =>
+        invoke<ArrayBuffer>("render_viewport_frame", {
+          request: { ...req, ...(withGraph ? {} : { graph: undefined }) },
+        });
+      let buf: ArrayBuffer;
+      try {
+        buf = await send(register);
+      } catch (err) {
+        if (!req.graph || !String(err).includes("Unknown render graph handle")) throw err;
+        registeredGraphRef.current = null;
+        buf = await send(true);
+      }
+      if (typeof req.graphKey === "string") {
         registeredGraphRef.current = req.graphKey;
       }
       const view = new DataView(buf);

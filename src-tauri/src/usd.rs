@@ -486,6 +486,7 @@ impl UsdService {
             Some("export_character_body"),
             Some("reset_hair"),
             Some("convert_source_to_usd"),
+            Some("sp_build_materials"),
         ]
         .contains(&op)
         {
@@ -605,7 +606,9 @@ impl UsdService {
                 Ok((mut value, bin)) => {
                     if let Some(error) = value.get("error").and_then(Value::as_str) {
                         let message = error.to_string();
-                        eprintln!("OVRTX error: {message}");
+                        if !message.contains("Unknown render graph handle") {
+                            eprintln!("OVRTX error: {message}");
+                        }
                         if message.contains("stalled") || message.contains("CUDA") {
                             *slot = None;
                         }

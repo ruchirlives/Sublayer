@@ -398,6 +398,10 @@ pub struct TransformTargetRule {
 pub struct LightOverride {
     pub id: String,
     pub light_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub light_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
     #[serde(default = "default_true")]
     pub enabled: bool,
     pub intensity: Option<f64>,
@@ -405,6 +409,20 @@ pub struct LightOverride {
     pub color: Option<[f64; 3]>,
     pub enable_color_temperature: Option<bool>,
     pub color_temperature: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub translate: Option<[f64; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotate: Option<[f64; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale: Option<[f64; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radius: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub angle: Option<f64>,
 }
 fn default_true() -> bool {
     true
@@ -608,8 +626,13 @@ pub struct HairSettings {
     pub collision_margin: f64,
     #[serde(default = "default_hair_friction")]
     pub friction: f64,
+    #[serde(default = "default_hair_sim_scale")]
+    pub sim_scale: f64,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub groom_deltas: BTreeMap<String, HairGroomDelta>,
+}
+fn default_hair_sim_scale() -> f64 {
+    1.0
 }
 fn default_hair_width_mode() -> String {
     "multiply".into()
@@ -863,6 +886,10 @@ fn default_hdri_format() -> String {
 pub struct MaterialXRule {
     pub id: String,
     pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub override_params: Option<Vec<String>>,
     pub search_type: String,
     pub query: String,
     pub material: MaterialXSettings,
@@ -1915,6 +1942,9 @@ impl Project {
                         || !hair.collision_margin.is_finite()
                         || hair.collision_margin < 0.0
                         || hair.collision_margin > 1.0
+                        || !hair.sim_scale.is_finite()
+                        || hair.sim_scale < 0.001
+                        || hair.sim_scale > 10000.0
                         || !hair.friction.is_finite()
                         || hair.friction < 0.0
                         || hair.friction > 1.0
@@ -1935,18 +1965,40 @@ impl Project {
             if n.data.operation == "light" {
                 let mut light_ids = HashSet::new();
                 if let Some(overrides) = &n.data.light_overrides {
+                    const VALID_LIGHT_TYPES: &[&str] = &[
+                        "DistantLight",
+                        "RectLight",
+                        "DiskLight",
+                        "SphereLight",
+                        "CylinderLight",
+                        "DomeLight",
+                    ];
                     if overrides.len() > 256
                         || overrides.iter().any(|o| {
                             o.id.is_empty()
                                 || !light_ids.insert(&o.id)
                                 || o.light_path.trim().is_empty()
                                 || !o.light_path.starts_with('/')
+                                || o.light_type
+                                    .as_deref()
+                                    .map_or(false, |t| !VALID_LIGHT_TYPES.contains(&t))
+                                || o.mode
+                                    .as_deref()
+                                    .map_or(false, |m| m != "override" && m != "create")
                                 || o.intensity.map_or(false, |v| !v.is_finite() || v < 0.)
                                 || o.exposure.map_or(false, |v| !v.is_finite())
                                 || o.color
                                     .map_or(false, |c| c.iter().any(|v| !v.is_finite() || *v < 0.))
                                 || o.color_temperature
                                     .map_or(false, |v| !v.is_finite() || v < 0.)
+                                || o.translate
+                                    .map_or(false, |t| t.iter().any(|v| !v.is_finite()))
+                                || o.rotate.map_or(false, |r| r.iter().any(|v| !v.is_finite()))
+                                || o.scale.map_or(false, |s| s.iter().any(|v| !v.is_finite()))
+                                || o.width.map_or(false, |v| !v.is_finite() || v < 0.)
+                                || o.height.map_or(false, |v| !v.is_finite() || v < 0.)
+                                || o.radius.map_or(false, |v| !v.is_finite() || v < 0.)
+                                || o.angle.map_or(false, |v| !v.is_finite() || v < 0.)
                         })
                     {
                         return Err("Invalid light overrides".into());

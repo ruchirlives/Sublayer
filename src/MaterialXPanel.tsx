@@ -323,16 +323,59 @@ export function MaterialXPanel({
     });
   }
 
+  const PARAM_TO_OVERRIDE_KEY: Record<string, string> = {
+    base_color: "baseColor",
+    specular_roughness: "roughness",
+    metalness: "metalness",
+    specular: "specular",
+    specular_color: "specularColor",
+    specular_IOR: "specularIor",
+    opacity: "opacity",
+    coat: "coat",
+    coat_color: "coatColor",
+    coat_roughness: "coatRoughness",
+    sheen: "sheen",
+    sheen_color: "sheenColor",
+    sheen_roughness: "sheenRoughness",
+    transmission: "transmission",
+    transmission_color: "transmissionColor",
+    subsurface: "subsurface",
+    subsurface_color: "subsurfaceColor",
+    subsurface_scale: "subsurfaceScale",
+    subsurface_radius: "subsurfaceRadius",
+    emission: "emission",
+    emission_color: "emissionColor",
+  };
+
   function cellProcProps(ruleId: string, parameter: string, baseClass?: string) {
     const driver = findProceduralDriver(ruleId, parameter);
     const isHighlighted = highlightedCell?.ruleId === ruleId && highlightedCell?.parameter === parameter;
+    const row = rows.find((r) => r.id === ruleId);
+    const overrideKey = PARAM_TO_OVERRIDE_KEY[parameter];
+    const isOverride = row?.mode === "override" && Boolean(overrideKey);
+    const isOverrideActive = isOverride && (row!.overrideParams ?? []).includes(overrideKey);
+    const isDimmed = row?.mode === "override" && !isOverrideActive;
     const cls = [baseClass, driver ? "materialx-proc-driven" : "", isHighlighted ? "materialx-proc-flash" : ""]
       .filter(Boolean)
       .join(" ");
     return {
       className: cls || undefined,
+      style: isDimmed ? { opacity: 0.28, cursor: "context-menu" } : isOverride ? { cursor: "context-menu" } : undefined,
       title: driver
         ? `Driven by procedural (${driver.data.mappingType || "replace"}). Double-click to open Output node.`
+        : isDimmed
+          ? "Untouched in Override mode (right-click to enable override)"
+          : isOverrideActive
+            ? "Overridden (right-click to disable)"
+            : undefined,
+      onContextMenu: isOverride
+        ? (e: React.MouseEvent) => {
+            e.preventDefault();
+            e.stopPropagation();
+            const prev = row!.overrideParams ?? [];
+            const next = isOverrideActive ? prev.filter((k) => k !== overrideKey) : [...prev, overrideKey];
+            patch(ruleId, { overrideParams: next });
+          }
         : undefined,
       onDoubleClick: driver
         ? () => {
@@ -469,7 +512,7 @@ export function MaterialXPanel({
                       : tableView === "trans"
                         ? ["Trans", "Trans Color", "Emis", "Emis Color"]
                         : tableView === "sss"
-                          ? ["SSS", "SSS Scale", "SSS Radius (RGB)"]
+                          ? ["SSS", "SSS Color", "SSS Scale", "SSS Radius (RGB)"]
                           : ["UV Source", "Base Color Tex", "Metal Tex", "Rough Tex", "Normal Tex"]),
                 "Matches",
                 "Actions",
@@ -519,6 +562,26 @@ export function MaterialXPanel({
                     >
                       <option value="simple">Simple</option>
                       <option value="regex">Regex</option>
+                    </select>
+                    <select
+                      aria-label={`Rule mode row ${index + 1}`}
+                      disabled={busy}
+                      value={row.mode ?? "replace"}
+                      onChange={(e) => {
+                        const mode = e.target.value as "replace" | "override";
+                        patch(row.id, {
+                          mode,
+                          overrideParams:
+                            mode === "override" && !(row.overrideParams?.length)
+                              ? ["subsurface", "subsurfaceScale"]
+                              : row.overrideParams,
+                        });
+                      }}
+                      style={{ marginLeft: 4 }}
+                      title="Replace: author a new MaterialX shader. Override: sparsely tweak parameters on the existing bound shader."
+                    >
+                      <option value="replace">Replace</option>
+                      <option value="override">Override</option>
                     </select>
                   </td>
                   <td
@@ -733,6 +796,9 @@ export function MaterialXPanel({
                   {tableView === "sss" && (
                     <>
                       <td {...cellProcProps(row.id, "subsurface")}><NumberInput disabled={busy} min="0" max="1" step="0.05" value={rowMat.subsurface ?? 0} onChange={(e) => material(row.id, { subsurface: Number(e.target.value) })} /></td>
+                      <td {...cellProcProps(row.id, "subsurface_color", "materialx-color-cell")}>
+                        <input disabled={busy} type="color" value={rgbToHex(rowMat.subsurfaceColor ?? rowMat.baseColor)} onChange={(e) => material(row.id, { subsurfaceColor: hexToRgb(e.target.value) })} />
+                      </td>
                       <td {...cellProcProps(row.id, "subsurface_scale")}><NumberInput disabled={busy} min="0" max="100" step="0.05" value={rowMat.subsurfaceScale ?? 1.0} onChange={(e) => material(row.id, { subsurfaceScale: Number(e.target.value) })} /></td>
                       <td {...cellProcProps(row.id, "subsurface_radius")}>
                         <div className="materialx-rgb">

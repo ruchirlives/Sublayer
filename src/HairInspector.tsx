@@ -609,6 +609,19 @@ export function HairInspector({ value, graph, onChange }: Props) {
                     }}
                   />
                 </label>
+                <label title="Scale multiplier for hair physics units (e.g. 0.01 for cm-authored assets in meter stages, or 100 for m-authored assets in cm stages)">
+                  <span className="field-label">Sim scale</span>
+                  <NumberInput
+                    min={0.001}
+                    max={10000}
+                    step={0.1}
+                    value={settings.simScale ?? 1.0}
+                    onChange={(e) => {
+                      const v = Number(e.target.value);
+                      if (Number.isFinite(v) && v >= 0.001 && v <= 10000) update({ simScale: v });
+                    }}
+                  />
+                </label>
                 <label>
                   <span className="field-label">Collision margin (m)</span>
                   <NumberInput

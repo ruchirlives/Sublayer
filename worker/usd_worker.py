@@ -15,6 +15,7 @@ import os
 import sys
 import time
 import functools
+import usd_graph
 if 'compile_graph' not in globals():
     from usd_graph import compile_graph, coordinate_preflight, export_handoff, materialx_document, materialx_rule_matches, asset_override_inputs, reuse_handoff, inspect_stage_materials, inspect_stage_lights, inspect_stage_curves, inspect_stage_skeletons, export_character_body, convert_source_to_usd, clear_graph_caches, query_scene_children, compute_material_users, resolve_prim_material, _open_source_stage, _build_transform_matrix
 from usd_graph import editable_hair_node_id, graph_after_groom_commit, groom_frame_view, open_hair_preview_stage
@@ -1114,6 +1115,7 @@ class Viewport:
                     skin_layer.Clear()
                 self._pose_skin_active = False
         view = view_conversion * Gf.Matrix4d().SetLookAt(eye, center, up)
+        camera_transform = usd_graph.decompose_camera_transform(view.GetInverse(), stage, Usd.TimeCode(frame))
         frustum = Gf.Frustum()
         clip_radius = max(radius, getattr(self, 'scene_radius', radius))
         trans_reach = Gf.Vec3d(*cur_trans).GetLength() if cur_trans else 0.0
@@ -1145,7 +1147,30 @@ class Viewport:
             has_scene_lights = False
         else:
             if self.has_scene_lights is None:
-                self.has_scene_lights = any(
+                has_lighting_node = False
+                if isinstance(self.current_graph, dict):
+                    tgt = self.current_graph.get('targetNodeId')
+                    nmap = {n.get('id'): n for n in (self.current_graph.get('nodes') or []) if isinstance(n, dict) and n.get('id')}
+                    if tgt and tgt in nmap:
+                        inc = {}
+                        for e in (self.current_graph.get('edges') or []):
+                            if isinstance(e, dict) and e.get('target') and e.get('source'):
+                                inc.setdefault(e['target'], []).append(e['source'])
+                        seen, stack = set(), [tgt]
+                        while stack:
+                            nid = stack.pop()
+                            if nid in seen:
+                                continue
+                            seen.add(nid)
+                            n = nmap.get(nid)
+                            if not n:
+                                continue
+                            op = n.get('operation') or (n.get('data') or {}).get('operation')
+                            if op in ('light', 'hdri'):
+                                has_lighting_node = True
+                                break
+                            stack.extend(inc.get(nid, ()))
+                self.has_scene_lights = has_lighting_node or any(
                     ('Light' in p.GetTypeName() or (hasattr(UsdLux, 'LightAPI') and p.HasAPI(UsdLux.LightAPI)))
                     and not p.GetPath().HasPrefix(Sdf.Path('/Render/DefaultLights'))
                     for p in iter_scene_and_prototype_prims(stage)
@@ -1184,13 +1209,7 @@ class Viewport:
             if self._normalized_lights_key != (id(stage), frame):
                 _normalize_storm_lights(stage, session, frame)
                 self._normalized_lights_key = (id(stage), frame)
-            has_dome = any(
-                'DomeLight' in p.GetTypeName()
-                and not p.GetPath().HasPrefix(Sdf.Path('/Render/DefaultLights'))
-                for p in iter_scene_and_prototype_prims(stage)
-            )
-            scene_amb = Gf.Vec4f(0.04, 0.04, 0.04, 1.0) if has_dome else Gf.Vec4f(0.14, 0.15, 0.17, 1.0)
-            engine.SetLightingState([], Glf.SimpleMaterial(), scene_amb)
+            engine.SetLightingState([], Glf.SimpleMaterial(), Gf.Vec4f(0.04, 0.04, 0.04, 1.0))
         purpose = request.get('purpose', 'render')
         if purpose not in ('render', 'proxy', 'both'):
             purpose = 'render'
@@ -1299,6 +1318,7 @@ class Viewport:
                 'pickedMaterial': picked_material,
                 'pickedPoint': picked_point,
                 'cameraSync': camera_sync,
+                'cameraTransform': camera_transform,
                 'materialMode': material_mode,
                 'fallbackMaterials':fallback_materials,
                 'hairGroomDeltas': committed_groom_deltas,
@@ -1528,6 +1548,14 @@ def dispatch(request):
         return result
     if operation == 'render':
         return viewport().render(request)
+    if operation == 'sp_build_materials':
+        from sp_materials import build_sp_material_layer
+        graph = request.get('graph')
+        manifest = request.get('manifest')
+        if not graph or not manifest:
+            raise ValueError('sp_build_materials requires graph and manifest')
+        stage, _keepalive, _ = compile_graph(json.loads(graph) if isinstance(graph, str) else graph)
+        return build_sp_material_layer(stage, manifest)
     if operation != 'inspect':
         raise ValueError('Unsupported USD worker operation')
     path = request.get('path')

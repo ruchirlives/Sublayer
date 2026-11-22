@@ -894,6 +894,10 @@ def _extract_blender_materials(target_scene, material_mode):
             _set_float_or_tex('Sheen Roughness', 'sheenRoughness', None, 0.5)
             _set_color_or_tex('Sheen Tint', 'sheenColor', None, (1.0, 1.0, 1.0))
             _set_float_or_tex('Transmission Weight', 'transmission', 'transmissionTexture', 0.0)
+            if 'transmission' not in d:
+                _set_float_or_tex('Transmission', 'transmission', 'transmissionTexture', 0.0)
+            if d.get('transmission', 0.0) > 0.5 and (d.get('specularIor', 1.45) < 1.15 or any(k in mat.name.lower() for k in ('eye', 'tear', 'cornea', 'shell', 'cartilage', 'saliva', 'lacrimal'))):
+                d['thinWalled'] = True
             _set_float_or_tex('Subsurface Weight', 'subsurface', None, 0.0)
             _set_float_or_tex('Subsurface Scale', 'subsurfaceScale', None, 0.05)
             if inps.get('Subsurface Radius') and not inps['Subsurface Radius'].is_linked:
@@ -956,6 +960,13 @@ def _extract_blender_materials(target_scene, material_mode):
                 _set_color_or_tex('Transmission', 'transmissionColor', 'transmissionTexture', (1.0, 1.0, 1.0))
                 tc = d.get('transmissionColor', [0.0, 0.0, 0.0])
                 d['transmission'] = 1.0 if 'transmissionTexture' in d else _clamp01(max(tc))
+                thin_sock = inps.get('Thin wall') or inps.get('Fake shadows')
+                if d['transmission'] > 0.5 and (
+                    (thin_sock is not None and bool(getattr(thin_sock, 'default_value', False)))
+                    or d.get('specularIor', 1.5) < 1.15
+                    or any(k in mat.name.lower() for k in ('eye', 'tear', 'cornea', 'shell', 'cartilage', 'saliva', 'lacrimal'))
+                ):
+                    d['thinWalled'] = True
             med = _extract_octane_medium(inps.get('Medium'), group_stack)
             if 'baseColorTexture' in d and 'baseColorTexture' in med:
                 med.pop('baseColorTexture', None)
@@ -1035,6 +1046,34 @@ def _extract_blender_materials(target_scene, material_mode):
             _set_float_or_tex('Index of refraction', 'specularIor', None, 1.45)
             _set_float_or_tex('Opacity', 'opacity', 'opacityTexture', mix_opacity)
             d.update(_extract_octane_medium(inps.get('Medium'), group_stack))
+            d['subsurface'] = 0.0
+            thin_sock = inps.get('Thin wall') or inps.get('Fake shadows')
+            if (
+                (thin_sock is not None and bool(getattr(thin_sock, 'default_value', False)))
+                or d.get('specularIor', 1.45) < 1.15
+                or any(k in mat.name.lower() for k in ('eye', 'tear', 'cornea', 'shell', 'cartilage', 'saliva', 'lacrimal'))
+            ):
+                d['thinWalled'] = True
+            results[mat.name] = d
+        elif bid == 'ShaderNodeBsdfGlass':
+            _set_color_or_tex('Color', 'transmissionColor', 'transmissionTexture', (1.0, 1.0, 1.0))
+            d['transmission'] = 1.0
+            d['baseColor'] = list(d.get('transmissionColor', [1.0, 1.0, 1.0]))
+            _set_float_or_tex('Roughness', 'roughness', 'roughnessTexture', 0.0)
+            _set_float_or_tex('IOR', 'specularIor', None, 1.45)
+            d['opacity'] = mix_opacity
+            if d.get('specularIor', 1.45) < 1.15 or any(k in mat.name.lower() for k in ('eye', 'tear', 'cornea', 'shell', 'cartilage', 'saliva', 'lacrimal')):
+                d['thinWalled'] = True
+            results[mat.name] = d
+        elif bid == 'ShaderNodeBsdfTransparent':
+            _set_color_or_tex('Color', 'transmissionColor', 'transmissionTexture', (1.0, 1.0, 1.0))
+            d['transmission'] = 1.0
+            d['baseColor'] = [1.0, 1.0, 1.0]
+            d['roughness'] = 0.0
+            d['specular'] = 0.0
+            d['specularIor'] = 1.0
+            d['opacity'] = 0.0
+            d['thinWalled'] = True
             results[mat.name] = d
         elif bid == 'OctaneHairMaterial':
             mel = _to_float(getattr(inps.get('Melanin'), 'default_value', 0.8), 0.8) if inps.get('Melanin') else 0.8
@@ -1060,8 +1099,103 @@ def _blender_disk_cache_paths(norm_path, mtime, size, export_skeletons=False, sc
     cache_dir = os.path.join(tempfile.gettempdir(), 'sublayer_blender_cache')
     path_hash = hashlib.sha256(norm_path.encode('utf-8')).hexdigest()[:12]
     skel_tag = 'skel1' if export_skeletons else 'skel0'
-    key = hashlib.sha256(f"{norm_path}|{mtime}|{size}|v10|{skel_tag}|{scene_name!r}".encode('utf-8')).hexdigest()[:24]
+    key = hashlib.sha256(f"{norm_path}|{mtime}|{size}|v11|{skel_tag}|{scene_name!r}".encode('utf-8')).hexdigest()[:24]
     return cache_dir, os.path.join(cache_dir, f"{path_hash}_{key}.usdc"), os.path.join(cache_dir, f"{path_hash}_{key}.json")
+
+
+def _run_blender_extract_process(cmd, payload, timeout_seconds=240.0):
+    import subprocess
+    import threading
+    import time
+
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        creationflags=0x08000000 if os.name == 'nt' else 0,
+        text=True,
+        encoding='utf-8',
+        errors='replace',
+    )
+    stdout_lines = []
+    stderr_lines = []
+    success_event = threading.Event()
+
+    def _read_stdout():
+        try:
+            for line in iter(proc.stdout.readline, ''):
+                stdout_lines.append(line)
+                if 'ORCHFLOW_BLENDER_EXPORT:SUCCESS' in line:
+                    success_event.set()
+        except Exception:
+            pass
+
+    def _read_stderr():
+        try:
+            for line in iter(proc.stderr.readline, ''):
+                stderr_lines.append(line)
+        except Exception:
+            pass
+
+    stdout_thread = threading.Thread(target=_read_stdout, daemon=True)
+    stderr_thread = threading.Thread(target=_read_stderr, daemon=True)
+    stdout_thread.start()
+    stderr_thread.start()
+
+    try:
+        if proc.stdin is not None:
+            try:
+                proc.stdin.write(payload + "\n")
+                proc.stdin.flush()
+            except OSError:
+                pass
+            finally:
+                try:
+                    proc.stdin.close()
+                except OSError:
+                    pass
+
+        deadline = time.monotonic() + float(timeout_seconds)
+        while True:
+            if success_event.wait(timeout=0.05):
+                try:
+                    proc.wait(timeout=3.0)
+                except subprocess.TimeoutExpired:
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=2.0)
+                    except Exception:
+                        pass
+                stdout_thread.join(timeout=0.5)
+                stderr_thread.join(timeout=0.2)
+                return 0, "".join(stdout_lines), "".join(stderr_lines)
+
+            if proc.poll() is not None:
+                stdout_thread.join(timeout=2.0)
+                stderr_thread.join(timeout=1.0)
+                rc = 0 if success_event.is_set() else proc.returncode
+                return rc, "".join(stdout_lines), "".join(stderr_lines)
+
+            if time.monotonic() > deadline:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=2.0)
+                except Exception:
+                    pass
+                stdout_thread.join(timeout=0.5)
+                stderr_thread.join(timeout=0.5)
+                raise RuntimeError(
+                    f"Blender headless extraction timed out after {int(timeout_seconds)}s: "
+                    f"{''.join(stderr_lines)[-1000:]} {''.join(stdout_lines)[-1000:]}"
+                )
+    finally:
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
 
 
 def _get_or_extract_full_blender_layer(blend_path, mtime, selected_objects=None, reload=False, material_mode='off', est_seconds=None, convert_procedurals=False, export_skeletons=False, scene_name=None):
@@ -1610,6 +1744,9 @@ print('\nORCHFLOW_BLENDER_META:' + json.dumps(meta), flush=True)
 if mat_bundles:
     print('\nORCHFLOW_BLENDER_MATERIALS:' + json.dumps(mat_bundles), flush=True)
 print('\nORCHFLOW_BLENDER_EXPORT:SUCCESS', flush=True)
+sys.stdout.flush()
+sys.stderr.flush()
+os._exit(0)
 """
     temp_py_path = None
     try:
@@ -1620,20 +1757,12 @@ print('\nORCHFLOW_BLENDER_EXPORT:SUCCESS', flush=True)
         if material_mode == 'off':
             cmd.append("--factory-startup")
         cmd.extend([blend_path, "--python-exit-code", "1", "--python", temp_py_path])
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            creationflags=0x08000000 if os.name == 'nt' else 0,
-            text=True
-        )
         payload = json.dumps({"usdPath": temp_usd_path, "selectedObjects": extract_objects, "materialMode": material_mode, "exportSkeletons": export_skeletons, "sceneName": requested_scene})
         try:
-            stdout, stderr = proc.communicate(input=payload + "\n")
+            returncode, stdout, stderr = _run_blender_extract_process(cmd, payload)
         finally:
             report_status("")
-        if proc.returncode != 0 or 'ORCHFLOW_BLENDER_EXPORT:SUCCESS' not in stdout:
+        if returncode != 0 or 'ORCHFLOW_BLENDER_EXPORT:SUCCESS' not in stdout:
             raise RuntimeError(f"Blender headless extraction failed: {stderr} {stdout}")
         if not os.path.isfile(temp_usd_path) or os.path.getsize(temp_usd_path) == 0:
             raise RuntimeError(f"Blender failed to produce USD data for {blend_path}")
@@ -2598,18 +2727,19 @@ def compile_graph(graph, reload=False, *, live_transforms=None, live_poses=None,
                 convert_procedurals = bool(node.get('blenderConvertProcedurals', False))
                 export_skeletons = bool(node.get('blenderExportSkeletons', False))
                 scene_name = node.get('blenderScene') or None
-                asset_key_tuple = ('blender', os.path.normcase(os.path.abspath(blend_path)), mtime, sel_key, instanced, material_mode, convert_procedurals, export_skeletons, scene_name)
+                node_scale = node.get('scale', 1.0)
+                asset_key_tuple = ('blender', os.path.normcase(os.path.abspath(blend_path)), mtime, sel_key, instanced, material_mode, convert_procedurals, export_skeletons, scene_name, float(node_scale))
                 if asset_key_tuple in assets:
                     wrapped = assets[asset_key_tuple]
                 else:
                     est_secs = node.get('lastExtractionSeconds')
                     b_stage = get_or_extract_blender_memory_stage(blend_path, selections, reload=reload, material_mode=material_mode, est_seconds=est_secs, convert_procedurals=convert_procedurals, export_skeletons=export_skeletons, scene_name=scene_name)
                     keepalive.append(b_stage)
-                    wrapped = wrap_source_stage(b_stage, instanced=instanced)
+                    wrapped = wrap_source_stage(b_stage, instanced=instanced, node_scale=node_scale)
                     assets[asset_key_tuple] = wrapped
                 inputs.insert(0, ('own-source', wrapped))
             elif usd_dep and usd_dep in files:
-                inputs.insert(0, ('own-source', source_stage(usd_dep, instanced=instanced)))
+                inputs.insert(0, ('own-source', source_stage(usd_dep, instanced=instanced, node_scale=node.get('scale', 1.0))))
             elif not inputs:
                 raise ValueError(f'Blender node "{node.get("label", id)}" needs a linked .blend file.')
         elif operation not in ('source', 'blender', 'transform', 'group', 'output', 'assetOverride', 'materialx', 'material_bind', 'light', 'hdri', 'hair', 'cache_edit', 'camera', 'delete', 'scatter', 'character', 'pose'):
@@ -2807,7 +2937,7 @@ def compile_graph(graph, reload=False, *, live_transforms=None, live_poses=None,
         can_node_cache = (
             id != live_node_id
             and id not in live_hair_nodes
-            and op not in ('application', 'assetOverride')
+            and op not in ('application', 'assetOverride', 'light', 'hdri')
             and not (live_poses is not None and op == 'pose')
             and not skip_sim_active
             and not (mx_selections_out is not None and node.get('materialXRules') is not None)
@@ -3733,9 +3863,23 @@ def author_materialx(stage,settings,files,procedural_subgraph=None):
     surface.CreateInput('sheen_color',Sdf.ValueTypeNames.Color3f).Set(safe_vec3f(sheen_c))
     surface.CreateInput('subsurface',Sdf.ValueTypeNames.Float).Set(subsurface)
     surface.CreateInput('subsurface_color',Sdf.ValueTypeNames.Color3f).Set(safe_vec3f(sub_c))
-    surface.CreateInput('subsurface_radius',Sdf.ValueTypeNames.Color3f).Set(safe_vec3f(m.get('subsurfaceRadius')))
-    surface.CreateInput('subsurface_scale',Sdf.ValueTypeNames.Float).Set(val('subsurfaceScale',1.0))
+    sss_rad=safe_vec3f(m.get('subsurfaceRadius'))
+    surface.CreateInput('subsurface_radius',Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(max(0.005, float(sss_rad[0])), max(0.005, float(sss_rad[1])), max(0.005, float(sss_rad[2]))))
+    surface.CreateInput('subsurface_scale',Sdf.ValueTypeNames.Float).Set(max(1e-4, float(val('subsurfaceScale',1.0))))
+    _thin_name = str(m.get('name') or '').lower()
+    _is_eye_film = transmission > 0.5 and any(
+        k in _thin_name for k in ('eye', 'tear', 'cornea', 'shell', 'cartilage', 'saliva', 'lacrimal', 'wet')
+    )
+    _auto_thin = transmission > 0.5 and (specular_ior < 1.15 or _is_eye_film)
+    # Thin eye/tear/cornea shells sit micrometers in front of the eyeball; in RTX Path Tracing,
+    # pure transmission (opacity=1.0) spawns a secondary ray whose self-intersection epsilon can
+    # skip past the iris behind it. Fractional cutout opacity passes primary rays cleanly via any-hit
+    # while keeping wet corneal specular highlights.
+    if _is_eye_film and opacity >= 0.99 and not m.get('opacityTexture') and not m.get('opacityTextureDependencyId'):
+        opacity = 0.12
     surface.CreateInput('opacity',Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(opacity))
+    if bool(m.get('thinWalled')) or _auto_thin:
+        surface.CreateInput('thin_walled',Sdf.ValueTypeNames.Bool).Set(True)
 
     # Dual-context UsdPreviewSurface fallback (weighted diffuse/subsurface for rasterizers)
     diffuse_mult=base_weight*(1.0-subsurface)*(1.0-metalness)*(1.0-transmission)
@@ -4111,6 +4255,87 @@ def materialx_rule_selection(stage,rules):
     return selected,stats
 
 
+def _apply_material_param_overrides(stage, targets, mat_settings, override_params):
+    if not override_params:
+        return
+    from pxr import Gf, Sdf, Usd, UsdShade
+    # Map MaterialXSettings keys -> (MaterialX input, UsdPreviewSurface input, Sdf.ValueTypeName, is_color)
+    PARAM_MAP = {
+        'baseColor': ('base_color', 'diffuseColor', Sdf.ValueTypeNames.Color3f, True),
+        'roughness': ('specular_roughness', 'roughness', Sdf.ValueTypeNames.Float, False),
+        'metalness': ('metalness', 'metallic', Sdf.ValueTypeNames.Float, False),
+        'specular': ('specular', None, Sdf.ValueTypeNames.Float, False),
+        'specularColor': ('specular_color', 'specularColor', Sdf.ValueTypeNames.Color3f, True),
+        'specularIor': ('specular_IOR', 'ior', Sdf.ValueTypeNames.Float, False),
+        'ior': ('specular_IOR', 'ior', Sdf.ValueTypeNames.Float, False),
+        'opacity': ('opacity', 'opacity', Sdf.ValueTypeNames.Float, False),
+        'coat': ('coat', 'clearcoat', Sdf.ValueTypeNames.Float, False),
+        'coatColor': ('coat_color', None, Sdf.ValueTypeNames.Color3f, True),
+        'coatRoughness': ('coat_roughness', 'clearcoatRoughness', Sdf.ValueTypeNames.Float, False),
+        'sheen': ('sheen', None, Sdf.ValueTypeNames.Float, False),
+        'sheenColor': ('sheen_color', None, Sdf.ValueTypeNames.Color3f, True),
+        'sheenRoughness': ('sheen_roughness', None, Sdf.ValueTypeNames.Float, False),
+        'transmission': ('transmission', None, Sdf.ValueTypeNames.Float, False),
+        'transmissionColor': ('transmission_color', None, Sdf.ValueTypeNames.Color3f, True),
+        'subsurface': ('subsurface', None, Sdf.ValueTypeNames.Float, False),
+        'subsurfaceColor': ('subsurface_color', None, Sdf.ValueTypeNames.Color3f, True),
+        'subsurfaceScale': ('subsurface_scale', None, Sdf.ValueTypeNames.Float, False),
+        'subsurfaceRadius': ('subsurface_radius', None, Sdf.ValueTypeNames.Color3f, True),
+        'emission': ('emission', None, Sdf.ValueTypeNames.Float, False),
+        'emissionColor': ('emission_color', 'emissiveColor', Sdf.ValueTypeNames.Color3f, True),
+    }
+    seen_shaders = set()
+    for path in targets:
+        prim = stage.GetPrimAtPath(path)
+        if not prim or not prim.IsValid():
+            continue
+        binding = UsdShade.MaterialBindingAPI(prim)
+        for purpose in (UsdShade.Tokens.allPurpose, UsdShade.Tokens.full, UsdShade.Tokens.preview):
+            mat, _ = binding.ComputeBoundMaterial(materialPurpose=purpose)
+            if not mat:
+                continue
+            for p in Usd.PrimRange(mat.GetPrim()):
+                if not p.IsA(UsdShade.Shader) or p.GetPath() in seen_shaders:
+                    continue
+                shader = UsdShade.Shader(p)
+                sid = str(shader.GetIdAttr().Get() or '')
+                is_preview = sid == 'UsdPreviewSurface'
+                is_mtlx = sid == 'ND_standard_surface_surfaceshader' or 'standard_surface' in sid
+                if not is_preview and not is_mtlx:
+                    continue
+                seen_shaders.add(p.GetPath())
+                for key in override_params:
+                    spec = PARAM_MAP.get(key)
+                    if not spec or key not in mat_settings:
+                        continue
+                    mtlx_name, prev_name, vtype, is_color = spec
+                    inp_name = prev_name if is_preview else mtlx_name
+                    if not inp_name:
+                        continue
+                    val = mat_settings[key]
+                    existing = shader.GetInput(inp_name)
+                    target_type = existing.GetTypeName() if existing else vtype
+                    inp = existing if existing else shader.CreateInput(inp_name, vtype)
+                    if inp.HasConnectedSource():
+                        inp.DisconnectSource()
+                    if target_type == Sdf.ValueTypeNames.Color3f:
+                        if isinstance(val, (list, tuple)) and len(val) >= 3:
+                            c0, c1, c2 = float(val[0]), float(val[1]), float(val[2])
+                            if inp_name == 'subsurface_radius':
+                                c0, c1, c2 = max(0.005, c0), max(0.005, c1), max(0.005, c2)
+                            inp.Set(Gf.Vec3f(c0, c1, c2))
+                        else:
+                            fv = float(val)
+                            if inp_name == 'subsurface_radius':
+                                fv = max(0.005, fv)
+                            inp.Set(Gf.Vec3f(fv, fv, fv))
+                    else:
+                        fv = float(val[0]) if isinstance(val, (list, tuple)) else float(val)
+                        if inp_name == 'subsurface_scale':
+                            fv = max(1e-4, fv)
+                        inp.Set(fv)
+
+
 def author_materialx_rules(stage,node,files,procedural_graph=None,selected_override=None,selected_out=None):
     procedural_mtlx = _procedural_mtlx()
     rules=node.get('materialXRules')
@@ -4127,6 +4352,9 @@ def author_materialx_rules(stage,node,files,procedural_graph=None,selected_overr
     for index,rule in enumerate(rules):
         targets=[path for path,owner in selected.items() if owner==index]
         if targets:
+            if rule.get('mode') == 'override':
+                _apply_material_param_overrides(stage, targets, rule.get('material') or {}, rule.get('overrideParams') or [])
+                continue
             sub=procedural_mtlx.collect_rule_subgraph(procedural_graph,node.get('id'),rule.get('id'))
             material=author_materialx(stage,{**rule['material'],'bindingTargets':targets},files,procedural_subgraph=sub)
             from pxr import Sdf,UsdShade
@@ -4296,10 +4524,18 @@ def apply_material_bindings(stage, bindings):
                 binding_api.Bind(material, bindingStrength=strength)
 
 
-def decompose_camera_transform(matrix):
-    from pxr import Gf
-    t = matrix.ExtractTranslation()
-    rot = matrix.ExtractRotation()
+def decompose_camera_transform(matrix, stage=None, time_code=None):
+    from pxr import Gf, Usd, UsdGeom
+    local_matrix = matrix
+    if stage is not None:
+        scene_prim = stage.GetPrimAtPath('/Scene')
+        if scene_prim and scene_prim.IsValid():
+            tc = time_code if time_code is not None else Usd.TimeCode.Default()
+            scene_xf = UsdGeom.XformCache(tc).GetLocalToWorldTransform(scene_prim)
+            if abs(scene_xf.GetDeterminant()) > 1e-18:
+                local_matrix = matrix * scene_xf.GetInverse()
+    t = local_matrix.ExtractTranslation()
+    rot = local_matrix.RemoveScaleShear().ExtractRotation()
     rz, ry, rx = rot.Decompose(Gf.Vec3d(0, 0, 1), Gf.Vec3d(0, 1, 0), Gf.Vec3d(1, 0, 0))
     return {
         'translate': [round(float(t[0]), 4), round(float(t[1]), 4), round(float(t[2]), 4)],
@@ -4372,6 +4608,9 @@ def apply_light_overrides(stage, overrides):
             define_cls = getattr(UsdLux, light_type, UsdLux.DistantLight)
             light_schema = define_cls.Define(stage, sdf_path)
             prim = light_schema.GetPrim()
+            if hasattr(UsdLux, 'ShadowAPI'):
+                shadow_api = UsdLux.ShadowAPI.Apply(prim)
+                shadow_api.CreateShadowEnableAttr().Set(True)
             path_str = str(prim.GetPath())
 
         if prim.IsInstanceProxy():
@@ -4541,7 +4780,32 @@ def inspect_stage_lights(request):
                 'translate': xform_data['translate'],
                 'rotate': xform_data['rotate'],
             })
-    return {'lights': lights}
+    meters_per_unit = float(UsdGeom.GetStageMetersPerUnit(stage) or 1.0)
+    up_axis = str(UsdGeom.GetStageUpAxis(stage) or 'Y')
+    scene_bounds = None
+    try:
+        from viewport_bounds import compute_visible_geometry_bounds
+        bbox_range = compute_visible_geometry_bounds(stage, Usd.TimeCode.Default())
+        if bbox_range and not bbox_range.IsEmpty():
+            bmin = bbox_range.GetMin()
+            bmax = bbox_range.GetMax()
+            size = bmax - bmin
+            center = (bmin + bmax) * 0.5
+            radius = float(size.GetLength()) * 0.5
+            if radius > 1e-6:
+                scene_bounds = {
+                    'center': [float(center[0]), float(center[1]), float(center[2])],
+                    'size': [float(size[0]), float(size[1]), float(size[2])],
+                    'radius': radius,
+                }
+    except Exception:
+        pass
+    return {
+        'lights': lights,
+        'metersPerUnit': meters_per_unit,
+        'upAxis': up_axis,
+        'sceneBounds': scene_bounds,
+    }
 
 
 def reuse_handoff(request):
@@ -4579,6 +4843,8 @@ def apply_hdri(stage, hdri_cfg, files):
     cfg = hdri_cfg if isinstance(hdri_cfg, dict) else {}
     dome_path = Sdf.Path('/OrchFlowHDRI')
     dome = UsdLux.DomeLight.Define(stage, dome_path)
+    if hasattr(UsdLux, 'ShadowAPI'):
+        UsdLux.ShadowAPI.Apply(dome.GetPrim()).CreateShadowEnableAttr().Set(True)
     dome.CreateIntensityAttr().Set(float(cfg.get('intensity', 1.0)))
     dome.CreateExposureAttr().Set(float(cfg.get('exposure', 0.0)))
     col = cfg.get('color') or [1.0, 1.0, 1.0]

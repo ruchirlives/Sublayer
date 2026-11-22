@@ -6,6 +6,7 @@ mod dependency_search;
 mod desktop_bridge;
 mod project;
 mod runtime_setup;
+pub mod substance_painter;
 mod usd;
 use project::Project;
 
@@ -318,6 +319,80 @@ async fn export_blender_to_usd(
             std::path::Path::new(&usd_path),
             selected_objects.as_deref(),
             scene_name.as_deref(),
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn sp_bridge_status() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(substance_painter::bridge_status)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn install_sp_plugin(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    let config = catalog_path(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        substance_painter::install_sp_plugin(&application_profiles::load(&config)?)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn create_sp_project(
+    project: Project,
+    node_id: String,
+    path: String,
+    overwrite: Option<bool>,
+    app: tauri::AppHandle,
+) -> Result<serde_json::Value, String> {
+    let config = catalog_path(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        substance_painter::create_sp_project(
+            &project,
+            &node_id,
+            &path,
+            overwrite.unwrap_or(false),
+            &application_profiles::load(&config)?,
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn open_sp_project(path: String, app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    let config = catalog_path(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        substance_painter::open_sp_project(&path, &application_profiles::load(&config)?)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn sync_sp_materials(
+    project: Project,
+    node_id: String,
+    export_dir: Option<String>,
+    manifest_path: Option<String>,
+    app: tauri::AppHandle,
+    service: tauri::State<'_, std::sync::Arc<usd::UsdService>>,
+) -> Result<serde_json::Value, String> {
+    let config = catalog_path(&app)?;
+    let service = service.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        substance_painter::sync_sp_materials(
+            &project,
+            &node_id,
+            export_dir.as_deref(),
+            manifest_path.as_deref(),
+            &application_profiles::load(&config)?,
+            &service,
         )
     })
     .await
@@ -669,6 +744,11 @@ pub fn run() {
             load_application_profiles,
             save_application_profiles,
             create_blender_project,
+            sp_bridge_status,
+            install_sp_plugin,
+            create_sp_project,
+            open_sp_project,
+            sync_sp_materials,
             inspect_blender_file,
             export_blender_to_usd,
             create_handoff,

@@ -228,6 +228,7 @@ def apply_hair_simulation(stage, hair_cfg, query_matcher):
     )
     margin = max(0.0, float(cfg.get("collisionMargin", 0.005)))
     friction = max(0.0, min(1.0, float(cfg.get("friction", 0.25))))
+    sim_scale = max(1e-3, min(10000.0, float(cfg.get("simScale", 1.0) or 1.0)))
 
     fps = float(stage.GetTimeCodesPerSecond() or 24.0)
     if fps <= 0.0:
@@ -303,7 +304,7 @@ def apply_hair_simulation(stage, hair_cfg, query_matcher):
         curve_l2w = xform_start.GetLocalToWorldTransform(curve_prim)
         l2w_np = np.asarray(curve_l2w, dtype=np.float64)
         prim_scale = max(float(np.max(np.linalg.norm(l2w_np[:3, :3], axis=1))), 1e-6)
-        unit_scale = stage_unit_scale * prim_scale
+        unit_scale = stage_unit_scale * prim_scale * sim_scale
         if up_axis == UsdGeom.Tokens.z:
             grav_vec = wp.vec3(wind[0] * unit_scale, wind[1] * unit_scale, (wind[2] - gravity) * unit_scale)
         else:

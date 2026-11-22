@@ -79,6 +79,7 @@ type Frame = {
   cacheEditMasks?: Record<string, CacheEditMask>;
   cacheSimMs?: number;
   cameraSync?: { panX: number; panY: number; zoom: number } | null;
+  cameraTransform?: { translate: [number, number, number]; rotate: [number, number, number] } | null;
   sentCamera?: { panX: number; panY: number; zoom: number; frameFit: number; orbitPivotSeq?: number };
   presentedCamera?: ViewportCamera;
   pickId?: number;
@@ -105,6 +106,10 @@ export function NativeViewport({
   previewControls,
   graphModeRequest,
   selectedPrim,
+  isolatedPrim: isolatedPrimProp,
+  onIsolatedPrimChange,
+  hiddenPrims: hiddenPrimsProp,
+  onHiddenPrimsChange,
   selectedNodeId,
   cameraKey,
   comparison,
@@ -120,6 +125,7 @@ export function NativeViewport({
   onCommitHairGroom,
   onCommitCacheEdit,
   onTimeChange,
+  onCameraTransformChange,
   seekFrameRequest,
 }: {
   path: string;
@@ -129,6 +135,10 @@ export function NativeViewport({
   previewControls?: ReactNode;
   graphModeRequest?: number;
   selectedPrim?:string;
+  isolatedPrim?: string | null;
+  onIsolatedPrimChange?: (next: string | null) => void;
+  hiddenPrims?: string[];
+  onHiddenPrimsChange?: (next: string[]) => void;
   selectedNodeId?: string | null;
   cameraKey?:string;
   comparison?:string;
@@ -153,6 +163,7 @@ export function NativeViewport({
     deltas: Record<string, CacheEditDelta>,
     masks: Record<string, CacheEditMask>,
   ) => void;
+  onCameraTransformChange?: (transform: { translate: [number, number, number]; rotate: [number, number, number] }) => void;
   onTimeChange?: (frame: number) => void;
   seekFrameRequest?: { frame: number; seq: number } | null;
 }) {
@@ -183,8 +194,20 @@ export function NativeViewport({
     coords: [number, number];
     resolve: (result: PickResult | null) => void;
   } | null>(null);
-  const [isolatedPrim, setIsolatedPrim] = useState<string | null>(null);
-  const [hiddenPrims, setHiddenPrims] = useState<string[]>([]);
+  const [isolatedPrimState, setIsolatedPrimState] = useState<string | null>(null);
+  const [hiddenPrimsState, setHiddenPrimsState] = useState<string[]>([]);
+  const isolatedPrim = isolatedPrimProp !== undefined ? isolatedPrimProp : isolatedPrimState;
+  const hiddenPrims = hiddenPrimsProp !== undefined ? hiddenPrimsProp : hiddenPrimsState;
+  const setIsolatedPrim = useCallback((next: string | null | ((cur: string | null) => string | null)) => {
+    const resolved = typeof next === "function" ? next(isolatedPrim) : next;
+    if (onIsolatedPrimChange) onIsolatedPrimChange(resolved);
+    else setIsolatedPrimState(resolved);
+  }, [isolatedPrim, onIsolatedPrimChange]);
+  const setHiddenPrims = useCallback((next: string[] | ((cur: string[]) => string[])) => {
+    const resolved = typeof next === "function" ? next(hiddenPrims) : next;
+    if (onHiddenPrimsChange) onHiddenPrimsChange(resolved);
+    else setHiddenPrimsState(resolved);
+  }, [hiddenPrims, onHiddenPrimsChange]);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; prim: string | null; material?: string | null; point?: [number, number, number] | null; picking: boolean } | null>(null);
   const [upAxis, setUpAxis] = useState<"Y" | "Z">(viewportSettings?.upAxis || "Y");
   const [purpose, setPurpose] = useState<"render" | "proxy" | "both">("render");
@@ -570,6 +593,7 @@ export function NativeViewport({
         catch(error){
           if(!graph || !String(error).includes("Unknown render graph handle"))throw error;
           if (usedCommitHandle) committedRenderGraph = null;
+          else registeredGraphs.clear();
           usedCommitHandle = false;
           result=await render(true);
         }
@@ -681,6 +705,7 @@ export function NativeViewport({
           revokePreviousUrl("");
         }
         if (result.cameraAnchor) cameraAnchor.current = result.cameraAnchor;
+        if (result.cameraTransform) onCameraTransformChange?.(result.cameraTransform);
         if (result.cameraSync && result.sentCamera) {
           const sync = result.cameraSync;
           const sent = result.sentCamera;
@@ -809,18 +834,33 @@ export function NativeViewport({
     };
   }, [onRuntime, retry]);
   useEffect(() => {
+    let timer: number | null = null;
+    let hasInitial = false;
     const observer = new ResizeObserver((entries) => {
       const { width, height } = entries[0].contentRect;
       if (width < 1 || height < 1) return;
       // Retain full display size; interaction requests use a cheaper preview.
       const factor = Math.min(1, 1440 / width, 1080 / height);
-      setSize({
-        width: Math.max(64, Math.round(width * factor)),
-        height: Math.max(64, Math.round(height * factor)),
-      });
+      const nextW = Math.max(64, Math.round(width * factor));
+      const nextH = Math.max(64, Math.round(height * factor));
+      const apply = () =>
+        setSize((prev) => (prev.width === nextW && prev.height === nextH ? prev : { width: nextW, height: nextH }));
+      if (!hasInitial) {
+        hasInitial = true;
+        apply();
+        return;
+      }
+      if (timer !== null) window.clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        timer = null;
+        apply();
+      }, 150);
     });
     if (host.current) observer.observe(host.current);
-    return () => observer.disconnect();
+    return () => {
+      if (timer !== null) window.clearTimeout(timer);
+      observer.disconnect();
+    };
   }, []);
   useEffect(() => {
     setIsolatedPrim(null);
@@ -2344,7 +2384,6 @@ export function NativeViewport({
           </div>
         )}
       </div>
-      {previewControls}
       <div className="toolbar viewport-controls">
         <div className="mode-buttons">
           <button
@@ -3020,6 +3059,7 @@ export function NativeViewport({
             <option value="Z">Up: Z</option>
           </select>
         </div>
+        {previewControls}
       </div>
       <div className="viewport-caption">
         <span>

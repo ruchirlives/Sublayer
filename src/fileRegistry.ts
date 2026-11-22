@@ -159,19 +159,32 @@ export type TransformTargetRule = {
   pattern: string;
 };
 
+export type CameraWorldTransform = {
+  translate: [number, number, number];
+  rotate: [number, number, number];
+};
+
 export type LightOverride = {
   id: string;
   lightPath: string;
   lightType?: string;
+  mode?: "override" | "create";
   enabled: boolean;
   intensity?: number | null;
   exposure?: number | null;
   color?: [number, number, number] | null;
   enableColorTemperature?: boolean | null;
   colorTemperature?: number | null;
+  translate?: [number, number, number] | null;
+  rotate?: [number, number, number] | null;
+  scale?: [number, number, number] | null;
+  width?: number | null;
+  height?: number | null;
+  radius?: number | null;
+  angle?: number | null;
 };
 
-export type MaterialXRule={id:string;enabled:boolean;searchType:"simple"|"regex";query:string;material:MaterialXSettings};
+export type MaterialXRule={id:string;enabled:boolean;mode?:"replace"|"override";overrideParams?:string[];searchType:"simple"|"regex";query:string;material:MaterialXSettings};
 export function materialTextures(m?: MaterialXSettings | null): string[] {
   if (!m) return [];
   return [
@@ -287,6 +300,7 @@ export type HairSettings = {
   wind: [number, number, number];
   collisionMargin: number;
   friction: number;
+  simScale?: number;
   groomDeltas?: Record<string, HairGroomDelta>;
 };
 
@@ -311,6 +325,7 @@ export const defaultHairSettings: HairSettings = {
   wind: [0, 0, 0],
   collisionMargin: 0.005,
   friction: 0.25,
+  simScale: 1.0,
 };
 
 export type CacheEditDelta = {
@@ -1247,7 +1262,8 @@ export function recordManualBaseline(project:StoredProject,nodeId:string,result:
 
 export function recordLiveAdjustment(project:StoredProject,nodeId:string,edited:string,result:LiveAdjustmentResult):StoredProject {
  const node=project.nodes.find(n=>n.id===nodeId),baseline=node?.data.manualBaseline || node?.data.nativeImport;
- if(!node || !baseline || baseline.baselineDependencyId!==result.baselineDependencyId || baseline.handoffDependencyId!==result.handoffDependencyId || !sameJsonValue(node.data.publicationPolicy || baseline.policy,result.policy))throw new Error("Preparation or edit permissions changed; analyze again");
- const files=registerFiles(project.dependencies,[edited],/\.(obj|abc)$/i.test(edited)?"asset":"usd");
+ const isSpMaterialSync = typeof result.revision === "string" && result.revision.startsWith("sp-");
+ if(!node || (!isSpMaterialSync && (!baseline || baseline.baselineDependencyId!==result.baselineDependencyId || baseline.handoffDependencyId!==result.handoffDependencyId || !sameJsonValue(node.data.publicationPolicy || baseline.policy,result.policy))))throw new Error("Preparation or edit permissions changed; analyze again");
+ const files=registerFiles(project.dependencies,[edited],/\.(obj|abc|json)$/i.test(edited)?"asset":"usd");
  return {...project,dependencies:files.dependencies,nodes:project.nodes.map(n=>n.id!==nodeId?n:{...n,data:{...n.data,publishedDependencyId:null,publication:null,liveAdjustment:{correspondence:result.correspondence,revision:result.revision,layer:result.layer,guards:result.guards,fileRevisions:result.fileRevisions,report:result.report,policy:result.policy,conversion:result.conversion,baselineDependencyId:result.baselineDependencyId,handoffDependencyId:result.handoffDependencyId,editedDependencyId:files.ids[0]}}})};
 }

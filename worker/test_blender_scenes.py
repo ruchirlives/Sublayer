@@ -1,7 +1,9 @@
 """Scene routing/cache regressions; never launches Blender."""
 import os
 from pathlib import Path
+import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -126,6 +128,43 @@ class BlenderScenes(unittest.TestCase):
                 stage, alive, _ = usd_graph.compile_graph(graph)
                 self.assertEqual({c.kwargs['scene_name'] for c in mocked.call_args_list}, {'Cycles', 'Octane'})
                 self.assertEqual({p.GetName() for p in stage.Traverse() if p.IsA(UsdGeom.Mesh)}, {'Cycles', 'Octane'})
+
+    def test_blender_extract_script_forces_exit_after_success(self):
+        worker_src = Path(usd_graph.__file__).read_text(encoding='utf-8')
+        marker = "print('\\nORCHFLOW_BLENDER_EXPORT:SUCCESS', flush=True)"
+        idx = worker_src.index(marker)
+        tail = worker_src[idx:idx + 200]
+        self.assertIn('os._exit(0)', tail)
+
+    def test_blender_extract_process_completes_even_if_child_hangs_after_success(self):
+        script = (
+            "import sys, time\n"
+            "_ = sys.stdin.readline()\n"
+            "print('ORCHFLOW_BLENDER_META:{\"scene\":\"Scene\"}', flush=True)\n"
+            "print('ORCHFLOW_BLENDER_EXPORT:SUCCESS', flush=True)\n"
+            "time.sleep(30)\n"
+        )
+        started = time.monotonic()
+        rc, stdout, _ = usd_graph._run_blender_extract_process(
+            [sys.executable, '-u', '-c', script],
+            '{}',
+            timeout_seconds=10.0,
+        )
+        elapsed = time.monotonic() - started
+        self.assertEqual(rc, 0)
+        self.assertIn('ORCHFLOW_BLENDER_EXPORT:SUCCESS', stdout)
+        self.assertLess(elapsed, 6.0)
+
+    def test_blender_extract_process_times_out_cleanly_without_success(self):
+        script = "import sys, time\n_ = sys.stdin.readline()\ntime.sleep(30)\n"
+        started = time.monotonic()
+        with self.assertRaisesRegex(RuntimeError, 'timed out'):
+            usd_graph._run_blender_extract_process(
+                [sys.executable, '-u', '-c', script],
+                '{}',
+                timeout_seconds=0.5,
+            )
+        self.assertLess(time.monotonic() - started, 5.0)
 
 
 if __name__ == '__main__':

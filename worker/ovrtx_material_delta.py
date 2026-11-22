@@ -11,7 +11,7 @@ camera all stay alive and only the affected material resources are rebuilt.
 material-only (geometry, transforms, removed specs, stage metadata, ...), and
 the caller then performs the existing full rebuild.
 """
-from pxr import Sdf
+from pxr import Sdf, Vt
 
 MATERIAL_ROOT_TYPES = ("Material", "NodeGraph")
 MATERIAL_TYPES = ("Material", "NodeGraph", "Shader")
@@ -227,6 +227,6 @@ def plan(base, new):
         ensure(prim_path)
         prim_spec = delta.GetPrimAtPath(prim_path)
         if not prim_spec.properties.get("xformOpOrder"):
-            attr = Sdf.AttributeSpec(prim_spec, "xformOpOrder", Sdf.ValueTypeNames.TokenArray, False, Sdf.VariabilityUniform)
-            attr.default = Sdf.TokenArray([])
+            attr = Sdf.AttributeSpec(prim_spec, "xformOpOrder", Sdf.ValueTypeNames.TokenArray, Sdf.VariabilityUniform, False)
+            attr.default = Vt.TokenArray([])
     return delta
