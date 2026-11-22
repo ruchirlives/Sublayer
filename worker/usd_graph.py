@@ -2686,7 +2686,16 @@ def compile_graph(graph, reload=False, *, live_transforms=None, live_poses=None,
             results[id],alive=compose(branch,node['liveAdjustment'])
             keepalive.extend(alive);return
         if operation == 'application':
-            raise ValueError(f'Application node {id} has no saved live adjustment. Review edited USD, Apply reviewed edits, then save OrchFlow. Disk publications are not used.')
+            inputs = [(edge['id'], results[edge['source']]) for edge in incoming[id]]
+            if len(inputs) == 1:
+                results[id] = inputs[0][1]
+                return
+            if inputs:
+                stage, alive = combine_inputs(inputs)
+                results[id] = stage
+                keepalive.extend(alive)
+                return
+            raise ValueError(f'Application node {id} has no connected input or saved live adjustment.')
         inputs = [(edge['id'], results[edge['source']]) for edge in incoming[id]]
         if operation == 'source' and node.get('inputDependencyId'):
             instanced = node.get('instanced', True)
@@ -2742,7 +2751,7 @@ def compile_graph(graph, reload=False, *, live_transforms=None, live_poses=None,
                 inputs.insert(0, ('own-source', source_stage(usd_dep, instanced=instanced, node_scale=node.get('scale', 1.0))))
             elif not inputs:
                 raise ValueError(f'Blender node "{node.get("label", id)}" needs a linked .blend file.')
-        elif operation not in ('source', 'blender', 'transform', 'group', 'output', 'assetOverride', 'materialx', 'material_bind', 'light', 'hdri', 'hair', 'cache_edit', 'camera', 'delete', 'scatter', 'character', 'pose'):
+        elif operation not in ('source', 'blender', 'transform', 'group', 'output', 'assetOverride', 'materialx', 'material_bind', 'light', 'hdri', 'postfx', 'hair', 'cache_edit', 'camera', 'delete', 'scatter', 'character', 'pose'):
             raise ValueError(f'Unsupported USD graph operation: {operation}')
         if not inputs:
             raise ValueError(f'{operation.title()} node needs a linked USD file or incoming USD connection')
@@ -2783,7 +2792,7 @@ def compile_graph(graph, reload=False, *, live_transforms=None, live_poses=None,
             keepalive.extend([upstream, overlay, stage])
             results[id] = stage
             return
-        if operation == 'camera' and len(inputs) == 1:
+        if operation in ('camera', 'postfx') and len(inputs) == 1:
             results[id] = inputs[0][1]
             return
         if operation == 'hdri' and len(inputs)==1:
@@ -3535,6 +3544,18 @@ def export_handoff(request, prepared=None, tag_identity=True):
         for prim in list(stage.Traverse()):
             if prim.IsInstanceProxy():continue
             prim.CreateAttribute('userProperties:orchflowId',Sdf.ValueTypeNames.String,custom=True).Set(hashlib.sha256((round_trip+str(prim.GetPath())).encode()).hexdigest())
+    if str(request.get('app', '')).lower() == 'substance painter':
+        from pxr import UsdGeom
+        sample_tc = Usd.TimeCode(stage.GetStartTimeCode())
+        for prim in list(stage.Traverse()):
+            if prim.IsInstanceProxy() or not prim.IsA(UsdGeom.Mesh):
+                continue
+            for attr_name in ('points', 'faceVertexCounts', 'faceVertexIndices', 'normals', 'primvars:st', 'extent'):
+                attr = prim.GetAttribute(attr_name)
+                if attr and attr.GetNumTimeSamples() > 0 and attr.Get(Usd.TimeCode.Default()) is None:
+                    val = attr.Get(sample_tc)
+                    if val is not None:
+                        attr.Set(val, Usd.TimeCode.Default())
     write_single_file_snapshot(stage,destination,replacing)
     return {**report,'policy':request.get('policy'),'path':str(destination),'layerPaths':[],'fileSizeBytes':destination.stat().st_size}
 

@@ -202,5 +202,70 @@ class MaterialBindingAndLightTests(unittest.TestCase):
             self.assertIsNotNone(scaled_report['sceneBounds'])
             self.assertAlmostEqual(scaled_report['sceneBounds']['radius'], 100.0 * (3.0 ** 0.5), places=2)
 
+    def test_postfx_node_passthrough_and_rtx_render_product_attrs(self):
+        from pxr import UsdRender
+        import ovrtx_worker
+
+        sample = pathlib.Path(__file__).resolve().parents[1] / 'samples/layered.usda'
+        graph = {
+            'targetNodeId': 'pfx2',
+            'nodes': [
+                {'id': 'geo', 'operation': 'source', 'inputDependencyId': 'asset'},
+                {
+                    'id': 'pfx1',
+                    'operation': 'postfx',
+                    'postFx': {
+                        'tonemapOperator': 'hableUc2',
+                        'bloomEnabled': True,
+                        'bloomScale': 2.5,
+                        'vignetteEnabled': True,
+                        'vignetteStrength': 0.85,
+                    },
+                },
+                {
+                    'id': 'pfx2',
+                    'operation': 'postfx',
+                    'postFx': {
+                        'tonemapOperator': 'iray',
+                        'gradeEnabled': True,
+                        'gradeSaturation': [1.2, 1.2, 1.2],
+                        'chromabEnabled': True,
+                        'autoExposureEnabled': True,
+                    },
+                },
+            ],
+            'edges': [
+                {'id': 'e1', 'source': 'geo', 'target': 'pfx1'},
+                {'id': 'e2', 'source': 'pfx1', 'target': 'pfx2'},
+            ],
+            'dependencies': [{'id': 'asset', 'path': str(sample)}],
+        }
+        stage, alive, stats = compile_graph(graph)
+        self.assertTrue(stage)
+
+        resolved = ovrtx_worker.resolve_graph_postfx(graph)
+        self.assertIsNotNone(resolved)
+        self.assertEqual(resolved['tonemapOperator'], 'iray')
+        self.assertTrue(resolved['bloomEnabled'])
+        self.assertAlmostEqual(resolved['bloomScale'], 2.5, places=4)
+        self.assertTrue(resolved['gradeEnabled'])
+        self.assertTrue(resolved['chromabEnabled'])
+        self.assertTrue(resolved['autoExposureEnabled'])
+        self.assertTrue(resolved['vignetteEnabled'])
+
+        test_stage = Usd.Stage.CreateInMemory()
+        prod = UsdRender.Product.Define(test_stage, '/Render/RenderProduct_Viewport')
+        ovrtx_worker.apply_postfx_to_render_product(prod.GetPrim(), resolved)
+        prim = prod.GetPrim()
+        self.assertEqual(prim.GetAttribute('omni:rtx:post:tonemap:operator').Get(), 'iray')
+        self.assertIs(prim.GetAttribute('omni:rtx:post:bloom:enabled').Get(), True)
+        self.assertAlmostEqual(prim.GetAttribute('omni:rtx:post:bloom:scale').Get(), 2.5, places=4)
+        self.assertIs(prim.GetAttribute('omni:rtx:post:grade:enabled').Get(), True)
+        self.assertIs(prim.GetAttribute('omni:rtx:post:chromab:enabled').Get(), True)
+        self.assertIs(prim.GetAttribute('omni:rtx:autoExposure:enabled').Get(), True)
+        self.assertIs(prim.GetAttribute('omni:rtx:post:tvNoise:enabled').Get(), True)
+        self.assertIs(prim.GetAttribute('omni:rtx:post:tvNoise:vignetting:enabled').Get(), True)
+        self.assertIs(prim.GetAttribute('omni:rtx:post:tvNoise:filmGrain:enabled').Get(), False)
+
 if __name__ == '__main__':
     unittest.main()

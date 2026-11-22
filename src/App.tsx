@@ -1,6 +1,7 @@
 import type { PoseEditing } from "./PoseViewportEditor";
 import {InspectorHint} from "./InspectorHint";
 import {HdriInspector} from "./HdriInspector";
+import {PostFxInspector} from "./PostFxInspector";
 import {NumberInput} from "./NumberInput";
 import {OperationProgress} from "./OperationProgress";
 import {
@@ -33,6 +34,7 @@ import {
   defaultCharacterSettings,
   identityTransform,
   defaultScatter,
+  defaultPostFx,
   editNodeData,
   expandProject,
   storeProject,
@@ -325,7 +327,7 @@ const Card = memo(function Card({ id, data, selected }: NodeProps<StageNode>) {
       <div className="card-body">
         <strong>{data.label}</strong>
         <p>
-          {["delete", "scatter", "transform", "group", "output", "assetOverride", "materialx", "material_bind", "light", "hdri", "hair", "cache_edit", "pose", "character"].includes(data.operation)
+          {["delete", "scatter", "transform", "group", "output", "assetOverride", "materialx", "material_bind", "light", "hdri", "postfx", "hair", "cache_edit", "pose", "character"].includes(data.operation)
             ? "Combined USD inputs"
             : data.operation === "blender"
               ? (data.nativeProject?.split(/[\\/]/).pop() || "No .blend linked")
@@ -373,6 +375,19 @@ const Card = memo(function Card({ id, data, selected }: NodeProps<StageNode>) {
           ? `${(data.pose?.mappings || []).filter(r => r.enabled !== false && r.entryId).length} skeleton mappings`
           : data.operation === "character"
           ? `${(data.character?.animationOverrides || []).filter((r) => r.enabled).length} anim · ${(data.character?.skeletonBindings || []).filter((r) => r.enabled).length} skel · ${(data.character?.jointAttachments || []).filter((r) => r.enabled).length} joint`
+          : data.operation === "postfx"
+          ? (() => {
+              const fx = { ...defaultPostFx, ...(data.postFx || {}) };
+              const active = [
+                fx.gradeEnabled && "Grade",
+                fx.autoExposureEnabled && "AutoExp",
+                fx.bloomEnabled && "Bloom",
+                fx.chromabEnabled && "ChromAb",
+                fx.vignetteEnabled && "Vignette",
+                fx.filmGrainEnabled && "Grain",
+              ].filter(Boolean);
+              return active.length > 0 ? `${fx.tonemapOperator} · ${active.join(", ")}` : `${fx.tonemapOperator} · RTX PostFX`;
+            })()
           : data.operation === "output"
             ? "In-memory USD output"
             : `${data.axis} up · scale ${data.scale}`}
@@ -657,10 +672,10 @@ function Workspace() {
     const position=flowInstance.current?.screenToFlowPosition({x:event.clientX,y:event.clientY});
     if(!position)return;
     const id=crypto.randomUUID();
-    const label=operation === "materialx"?"MaterialX":operation === "material_bind"?"Material Bind":operation === "light"?"Light":operation === "hdri"?"HDRI":operation === "hair"?"Hair":operation === "cache_edit"?"Cache Sculptor":operation === "character"?"Character":operation === "camera"?"Camera":operation === "blender"?"Blender":operation === "assetOverride"?"Asset Override":operation === "source"?"Source stage":operation[0].toUpperCase()+operation.slice(1);
+    const label=operation === "materialx"?"MaterialX":operation === "material_bind"?"Material Bind":operation === "light"?"Light":operation === "hdri"?"HDRI":operation === "postfx"?"PostFX":operation === "hair"?"Hair":operation === "cache_edit"?"Cache Sculptor":operation === "character"?"Character":operation === "camera"?"Camera":operation === "blender"?"Blender":operation === "assetOverride"?"Asset Override":operation === "source"?"Source stage":operation[0].toUpperCase()+operation.slice(1);
     const defaultCamera = { yaw: 35, pitch: 20, zoom: 1, panX: 0, panY: 0, fov: 45, dofEnabled: false, focusDistance: 5, fStop: 5.6 };
     const initialCamera = { ...defaultCamera, ...(projectRef.current.viewport?.camera ?? {}) };
-    const added=storeProject([{...seed[0],id,position,data:{...seed[0].data,label,operation,transform:structuredClone(identityTransform),...(operation === "application" ? defaultApplicationFields() : {}),...(operation === "cache_edit" ? { cacheEdit: structuredClone(defaultCacheEditSettings) } : {}),...(operation === "character" ? { character: structuredClone(defaultCharacterSettings) } : {}),...(operation === "camera" ? { cameraViews: [{ id: crypto.randomUUID(), name: "Camera 1", camera: initialCamera }] } : {})}}],[],[]).nodes[0];
+    const added=storeProject([{...seed[0],id,position,data:{...seed[0].data,label,operation,transform:structuredClone(identityTransform),...(operation === "application" ? defaultApplicationFields() : {}),...(operation === "postfx" ? { postFx: structuredClone(defaultPostFx) } : {}),...(operation === "cache_edit" ? { cacheEdit: structuredClone(defaultCacheEditSettings) } : {}),...(operation === "character" ? { character: structuredClone(defaultCharacterSettings) } : {}),...(operation === "camera" ? { cameraViews: [{ id: crypto.randomUUID(), name: "Camera 1", camera: initialCamera }] } : {})}}],[],[]).nodes[0];
     try {
       const target=targetAt(event.target);
       applyProject(insertToolbarNode(projectRef.current,added,target),"Insert node");select(id);
@@ -679,7 +694,7 @@ function Workspace() {
         data: {
           ...seed[0].data,
           label:
-            operation === "materialx" ? "MaterialX" : operation === "material_bind" ? "Material Bind" : operation === "light" ? "Light" : operation === "hdri" ? "HDRI" : operation === "hair" ? "Hair" : operation === "cache_edit" ? "Cache Sculptor" : operation === "character" ? "Character" : operation === "camera" ? "Camera" : operation === "blender" ? "Blender" : operation === "source"
+            operation === "materialx" ? "MaterialX" : operation === "material_bind" ? "Material Bind" : operation === "light" ? "Light" : operation === "hdri" ? "HDRI" : operation === "postfx" ? "PostFX" : operation === "hair" ? "Hair" : operation === "cache_edit" ? "Cache Sculptor" : operation === "character" ? "Character" : operation === "camera" ? "Camera" : operation === "blender" ? "Blender" : operation === "source"
               ? "Source stage"
               : operation === "transform"
                 ? "Transform"
@@ -691,6 +706,7 @@ function Workspace() {
           operation,
           transform: structuredClone(identityTransform),
           ...(operation === "application" ? defaultApplicationFields() : {}),
+          ...(operation === "postfx" ? { postFx: structuredClone(defaultPostFx) } : {}),
           ...(operation === "cache_edit" ? { cacheEdit: structuredClone(defaultCacheEditSettings) } : {}),
           ...(operation === "camera"
             ? {
@@ -1001,6 +1017,7 @@ function Workspace() {
                 let settings: Record<string, unknown> | undefined;
                 if (op === "light") settings = { lightOverrides: d.lightOverrides ?? [] };
                 else if (op === "hdri") settings = { hdri: d.hdri ?? null };
+                else if (op === "postfx") settings = { postFx: d.postFx ?? null };
                 else if (op === "materialx") settings = d.materialXRules ? { materialXRules: d.materialXRules } : { materialX: d.materialX ?? null };
                 else if (op === "transform") settings = { transform: d.transform ?? null, transformTargets: d.transformTargets ?? null };
                 else if (op === "pose") settings = { pose: d.pose ?? null };
@@ -1162,7 +1179,7 @@ function Workspace() {
             onDragStart={e=>{setGraphModeRequest(n=>n+1);e.dataTransfer.setData("application/orchflow-node",operation);e.dataTransfer.effectAllowed="copy";}}
             onDragEnd={()=>setDropTarget(null)} onClick={()=>addNode(operation)}>
             <span className="drag-grip" aria-hidden="true" />
-            ＋ {operation === "materialx"?"MaterialX":operation === "material_bind"?"Material Bind":operation === "light"?"Light":operation === "hdri"?"HDRI":operation === "hair"?"Hair":operation === "cache_edit"?"Cache Sculptor":operation === "character"?"Character":operation === "camera"?"Camera":operation === "blender"?"Blender":operation === "assetOverride"?"Asset Override":operation[0].toUpperCase()+operation.slice(1)}
+            ＋ {operation === "materialx"?"MaterialX":operation === "material_bind"?"Material Bind":operation === "light"?"Light":operation === "hdri"?"HDRI":operation === "postfx"?"PostFX":operation === "hair"?"Hair":operation === "cache_edit"?"Cache Sculptor":operation === "character"?"Character":operation === "camera"?"Camera":operation === "blender"?"Blender":operation === "assetOverride"?"Asset Override":operation[0].toUpperCase()+operation.slice(1)}
           </button>)}
           <span className="nav-divider" aria-hidden="true" />
           <button className="nav-action nav-action-danger" disabled={busy || (!nodes.length && !dependencies.length)}
@@ -1497,6 +1514,7 @@ function Workspace() {
                 ["material_bind", "Material Bind"],
                 ["light", "Light"],
                 ["hdri", "HDRI"],
+                ["postfx", "PostFX"],
                 ["hair", "Hair"],
                 ["cache_edit", "Cache Sculptor"],
                 ["character", "Character"],
@@ -1820,6 +1838,13 @@ function Workspace() {
                       }
                     }}
                     onStatus={reportStatus}
+                  />
+                )}
+
+                {node.data.operation === "postfx" && (
+                  <PostFxInspector
+                    value={node.data.postFx}
+                    onChange={(postFx) => update({ postFx })}
                   />
                 )}
 

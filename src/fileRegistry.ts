@@ -27,10 +27,10 @@ export type ManualBaselineResult = {baselinePath:string;nativeDependencyId:strin
 export type NativeImport = {baselineDependencyId:string;policy:PolicySnapshot;nativeDependencyId:string|null;handoffDependencyId:string;conversion:CoordinateDraft;report:Record<string,unknown>};
 export type Correspondence={baselinePath:string;inputPath:string;editedPath:string;pointTransform?:number[][]};
 export type Reconciliation={inputDependencyId:string;layerDependencyIds:string[];graphRevision:string};
-export type LiveAdjustmentResult={correspondence?:Correspondence[];revision:string;layer:string;guards:Record<string,unknown>;fileRevisions:Record<string,unknown>[];report:Record<string,unknown>;policy:PolicySnapshot;conversion:CoordinateDraft;baselineDependencyId:string;handoffDependencyId:string};
+export type LiveAdjustmentResult={correspondence?:Correspondence[];revision:string;layer:string;guards:Record<string,unknown>;fileRevisions:Record<string,unknown>[];report:Record<string,unknown>;policy:PolicySnapshot;conversion?:CoordinateDraft|null;baselineDependencyId:string;handoffDependencyId:string};
 export type LiveAdjustment=LiveAdjustmentResult&{editedDependencyId:string};
-export type PublicationResult={publicationRevision?:string;replacesPublicationDependencyId?:string;reconciliation?:{inputPath:string;layerPaths:string[];graphRevision:string};baselineDependencyId:string;handoffDependencyId:string;policy:PolicySnapshot;conversion:CoordinateDraft;path:string;editLayerPath:string;report:Record<string,unknown>;sourceRevisions:Record<string,unknown>[];correspondence:Correspondence[]};
-export type Publication={revision?:string;reconciliation?:Reconciliation;dependencyId:string;editLayerDependencyId:string;editedDependencyId:string;baselineDependencyId:string;handoffDependencyId:string;policy:PolicySnapshot;conversion:CoordinateDraft;report:Record<string,unknown>;sourceRevisions:Record<string,unknown>[];correspondence:Correspondence[]};
+export type PublicationResult={publicationRevision?:string;replacesPublicationDependencyId?:string;reconciliation?:{inputPath:string;layerPaths:string[];graphRevision:string};baselineDependencyId:string;handoffDependencyId:string;policy:PolicySnapshot;conversion?:CoordinateDraft|null;path:string;editLayerPath:string;report:Record<string,unknown>;sourceRevisions:Record<string,unknown>[];correspondence:Correspondence[]};
+export type Publication={revision?:string;reconciliation?:Reconciliation;dependencyId:string;editLayerDependencyId:string;editedDependencyId:string;baselineDependencyId:string;handoffDependencyId:string;policy:PolicySnapshot;conversion?:CoordinateDraft|null;report:Record<string,unknown>;sourceRevisions:Record<string,unknown>[];correspondence:Correspondence[]};
 export type ProceduralNodeKind =
   | "uv"
   | "place2d"
@@ -544,6 +544,126 @@ export const defaultScatter: ScatterSettings = {
   prototypes: [],
 };
 
+export type PostFxSettings = {
+  tonemapOperator: "raw" | "none" | "reinhard" | "modifiedReinhard" | "hejiHableAlu" | "hableUc2" | "acesApproximation" | "iray";
+  tonemapColorMode: "sRGBLinear" | "ACEScg";
+  exposureKey: number;
+  whiteScale: number;
+  maxWhiteLuminance: number;
+  whitepoint: [number, number, number];
+  dither: number;
+  irayBurnHighlights: number;
+  irayCrushBlacks: number;
+  iraySaturation: number;
+
+  gradeEnabled: boolean;
+  gradeBlackPoint: [number, number, number];
+  gradeWhitePoint: [number, number, number];
+  gradeLift: [number, number, number];
+  gradeGain: [number, number, number];
+  gradeMultiply: [number, number, number];
+  gradeOffset: [number, number, number];
+  gradeGamma: [number, number, number];
+  gradeContrast: [number, number, number];
+  gradeSaturation: [number, number, number];
+
+  autoExposureEnabled: boolean;
+  autoExposureWhitePointScale: number;
+  autoExposureAdaptationSpeed: number;
+  autoExposureHistogramFilter: "median" | "average";
+  autoExposureMinLuminance: number;
+  autoExposureMaxLuminance: number;
+
+  bloomEnabled: boolean;
+  bloomScale: number;
+  bloomCutoff: number;
+  bloomCutoffFuzziness: number;
+  bloomEnergyConservingBlend: boolean;
+  bloomFStop: number;
+  bloomFocalLength: number;
+  bloomBlades: number;
+  bloomApertureCircular: boolean;
+  bloomApertureRotation: number;
+  bloomAnisoFlareWeight: number;
+  bloomHaloFlareWeight: number;
+  bloomIsotropicFlareWeight: number;
+
+  chromabEnabled: boolean;
+  chromabStrengthR: number;
+  chromabStrengthG: number;
+  chromabStrengthB: number;
+  chromabUseLanczos: boolean;
+
+  vignetteEnabled: boolean;
+  vignetteStrength: number;
+  vignetteSize: number;
+  filmGrainEnabled: boolean;
+  filmGrainAmount: number;
+  filmGrainSize: number;
+
+  sharpness: number;
+};
+
+export const defaultPostFx: PostFxSettings = {
+  tonemapOperator: "acesApproximation",
+  tonemapColorMode: "sRGBLinear",
+  exposureKey: 0.25,
+  whiteScale: 40.2,
+  maxWhiteLuminance: 10.0,
+  whitepoint: [1.0, 1.0, 1.0],
+  dither: 0.0,
+  irayBurnHighlights: 0.7,
+  irayCrushBlacks: 0.5,
+  iraySaturation: 1.0,
+
+  gradeEnabled: false,
+  gradeBlackPoint: [0.0, 0.0, 0.0],
+  gradeWhitePoint: [1.0, 1.0, 1.0],
+  gradeLift: [0.0, 0.0, 0.0],
+  gradeGain: [1.0, 1.0, 1.0],
+  gradeMultiply: [1.0, 1.0, 1.0],
+  gradeOffset: [0.0, 0.0, 0.0],
+  gradeGamma: [1.0, 1.0, 1.0],
+  gradeContrast: [1.0, 1.0, 1.0],
+  gradeSaturation: [1.0, 1.0, 1.0],
+
+  autoExposureEnabled: false,
+  autoExposureWhitePointScale: 10.0,
+  autoExposureAdaptationSpeed: 3.5,
+  autoExposureHistogramFilter: "median",
+  autoExposureMinLuminance: 50.0,
+  autoExposureMaxLuminance: 100000.0,
+
+  bloomEnabled: false,
+  bloomScale: 1.0,
+  bloomCutoff: 0.0,
+  bloomCutoffFuzziness: 0.5,
+  bloomEnergyConservingBlend: false,
+  bloomFStop: 5.0,
+  bloomFocalLength: 35.0,
+  bloomBlades: 5,
+  bloomApertureCircular: false,
+  bloomApertureRotation: 5.0,
+  bloomAnisoFlareWeight: 0.6,
+  bloomHaloFlareWeight: 0.01,
+  bloomIsotropicFlareWeight: 0.4,
+
+  chromabEnabled: false,
+  chromabStrengthR: -0.055,
+  chromabStrengthG: -0.075,
+  chromabStrengthB: 0.015,
+  chromabUseLanczos: false,
+
+  vignetteEnabled: false,
+  vignetteStrength: 0.7,
+  vignetteSize: 107.0,
+  filmGrainEnabled: false,
+  filmGrainAmount: 0.05,
+  filmGrainSize: 1.6,
+
+  sharpness: 0.5,
+};
+
 export type Data = {
   blenderSelections?: string[];
   blenderScene?: string | null;
@@ -557,6 +677,7 @@ export type Data = {
   transformTargets?: TransformTargetRule[];
   lightOverrides?: LightOverride[];
   hdri?: HdriSettings;
+  postFx?: PostFxSettings;
   hair?: HairSettings;
   cacheEdit?: CacheEditSettings;
   character?: CharacterSettings | null;
@@ -1080,6 +1201,7 @@ export function graphPreview(
       ...(n.data.operation==="material_bind" ? {materialBindings:n.data.materialBindings || []}:{}),
       ...(n.data.operation==="light" ? {lightOverrides:n.data.lightOverrides || []}:{}),
       ...(n.data.operation==="hdri" && n.data.hdri ? {hdri: n.data.hdri}:{}),
+      ...(n.data.operation==="postfx" ? {postFx: n.data.postFx || defaultPostFx}:{}),
       ...(n.data.operation==="hair" && n.data.hair ? {hair: n.data.hair}:{}),
       ...(n.data.operation==="cache_edit" ? {cacheEdit: n.data.cacheEdit || defaultCacheEditSettings}:{}),
       ...(n.data.operation==="pose" ? {pose: n.data.pose || {mappings:[],entries:[]}}:{}),

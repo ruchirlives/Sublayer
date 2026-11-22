@@ -294,6 +294,7 @@ export function SubstancePainterPanel({
       <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, cursor: "pointer" }}>
         <input
           type="checkbox"
+          style={{ width: "auto", margin: 0 }}
           checked={autoSync}
           disabled={!isTauri()}
           onChange={(e) => setAutoSync(e.target.checked)}

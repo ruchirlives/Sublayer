@@ -358,22 +358,23 @@ export function CoordinatePanel({
               a new handoff before importing these changes.
             </p>
           )}
-        {!data.nativeProject && (
-          <button
-            className="app-secondary"
-            disabled={busy || !isTauri() || !profile}
-            onClick={async () => {
-              setBusy(true);
+        </details>
+        <button
+          className="app-secondary"
+          disabled={busy || !isTauri() || !profile}
+          onClick={async () => {
+            setBusy(true);
+            try {
+              const { open } = await import("@tauri-apps/plugin-dialog");
+              const path = await open({
+                title: "Relink existing handoff USD",
+                multiple: false,
+                filters: [
+                  { name: "USD handoff", extensions: ["usd", "usdc", "usda"] },
+                ],
+              });
+              if (!path || Array.isArray(path)) return;
               try {
-                const { open } = await import("@tauri-apps/plugin-dialog");
-                const path = await open({
-                  title: "Reuse another node's handoff unchanged",
-                  multiple: false,
-                  filters: [
-                    { name: "USD handoff", extensions: ["usd", "usdc", "usda"] },
-                  ],
-                });
-                if (!path) return;
                 const reused = await invoke<HandoffResult>("reuse_handoff", {
                   project,
                   nodeId,
@@ -381,25 +382,63 @@ export function CoordinatePanel({
                 });
                 if (latest.current !== signature) {
                   setHandoffMessage(
-                    "Inputs changed; select the shared handoff again.",
+                    "Inputs changed; select the handoff again.",
                   );
                   return;
                 }
                 onHandoff(reused);
                 setHandoffMessage(
-                  "Shared handoff linked unchanged. Save OrchFlow to retain it.",
+                  "Existing handoff linked unchanged. Save Sublayer to retain it.",
                 );
-              } catch (error) {
-                setHandoffMessage(String(error));
-              } finally {
-                setBusy(false);
+              } catch {
+                // Previous-session handoff (no donor node in current project):
+                // link the existing USD file directly using the current preflight draft.
+                if (!profile) return;
+                const upAxis = data.axis === "preserve" ? profile.upAxis : data.axis;
+                const meters = data.applicationMetersPerUnit ?? profile.metersPerUnit;
+                let draft = result?.draft;
+                if (!draft && graph) {
+                  const checked = await invoke<Preflight>("usd_request", {
+                    request: {
+                      operation: "coordinate_preflight",
+                      graph: JSON.parse(graph),
+                      app: profile.app,
+                      upAxis,
+                      metersPerUnit: meters,
+                      scale: effectiveScale,
+                      selection: data.handoffSelection,
+                      measure: false,
+                    },
+                  });
+                  draft = checked.draft;
+                }
+                if (!draft) {
+                  throw new Error("Connect an upstream input before relinking a handoff.");
+                }
+                onHandoff({
+                  path,
+                  layerPaths: [],
+                  policy: {
+                    profile,
+                    editScope: data.editScope || {},
+                  } as HandoffResult["policy"],
+                  draft: draft as HandoffResult["draft"],
+                  selection: data.handoffSelection ?? null,
+                  inputEdges: {},
+                });
+                setHandoffMessage(
+                  "Previous-session handoff linked. Save Sublayer to retain it.",
+                );
               }
-            }}
-          >
-            Reuse existing handoff…
-          </button>
-        )}
-      </details>
+            } catch (error) {
+              setHandoffMessage(String(error));
+            } finally {
+              setBusy(false);
+            }
+          }}
+        >
+          Relink handoff…
+        </button>
     </div>
   );
 }

@@ -327,6 +327,11 @@ def _handle_project_create_start(payload: dict[str, Any]) -> None:
 
 
 def _handle_project_create_save(spp_path: str) -> dict[str, Any]:
+    if not sp_project.is_open():
+        raise RuntimeError(
+            "Substance Painter failed to load the handoff 3D scene (no project opened). "
+            "Check Substance Painter's Log window for mesh/UV import errors."
+        )
     os.makedirs(os.path.dirname(os.path.abspath(spp_path)), exist_ok=True)
     sp_project.save_as(spp_path)
     return {

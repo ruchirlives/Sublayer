@@ -1039,8 +1039,12 @@ def compose_live_adjustment(graph,adjustment):
     if preflight is None:
         from usd_graph import coordinate_preflight as preflight
     validate_revisions(adjustment.get('fileRevisions',[]))
-    conversion=adjustment['conversion']
-    _,current,alive=preflight({'graph':graph,'app':conversion['app'],'upAxis':conversion['upAxis'],'metersPerUnit':conversion['metersPerUnit'],'scale':conversion['scale'],'measure':False,'reload':False},include_stage=True)
+    conversion=adjustment.get('conversion')
+    if isinstance(conversion,dict):
+        _,current,alive=preflight({'graph':graph,'app':conversion['app'],'upAxis':conversion['upAxis'],'metersPerUnit':conversion['metersPerUnit'],'scale':conversion['scale'],'measure':False,'reload':False},include_stage=True)
+    else:
+        from usd_graph import compile_graph
+        current,alive,_=compile_graph(graph,reload=False)
     for path,guard in adjustment.get('guards',{}).items():
         prim=current.GetPrimAtPath(path)
         if not prim or mesh_topology_guard(prim)!=guard:raise ValueError('Input paths or topology changed. Recreate the handoff and review application edits using the current scene paths. The saved adjustment and external files were preserved: '+path)
@@ -1056,6 +1060,8 @@ def compose_live_adjustment(graph,adjustment):
     layer.subLayerPaths=[current.GetRootLayer().identifier]
     output=Usd.Stage.Open(layer)
     inherit_stage_metrics(output,current)
+    if not output.GetDefaultPrim() and current.GetDefaultPrim() and current.GetDefaultPrim().IsValid():
+        output.SetDefaultPrim(output.GetPrimAtPath(current.GetDefaultPrim().GetPath()))
     for prototype,source_path in dict(layer.customLayerData.get('orchflowPrototypeSources',{})).items():
         prim=output.GetPrimAtPath(prototype)
         if prim:prim.GetReferences().SetReferences([Sdf.Reference(current.GetRootLayer().identifier,Sdf.Path(source_path))])
@@ -1074,7 +1080,8 @@ def compose_live_adjustment(graph,adjustment):
     UsdGeom.SetStageUpAxis(root,'Y');UsdGeom.SetStageMetersPerUnit(root,1)
     for setter,getter in [('SetStartTimeCode','GetStartTimeCode'),('SetEndTimeCode','GetEndTimeCode'),('SetTimeCodesPerSecond','GetTimeCodesPerSecond'),('SetFramesPerSecond','GetFramesPerSecond')]:getattr(root,setter)(getattr(output,getter)())
     scene.GetPrim().GetReferences().AddReference(layer.identifier,output.GetDefaultPrim().GetPath())
-    prepend_root_transform(scene.GetPrim(),Gf.Matrix4d(*[v for row in conversion['inverse'] for v in row]),'returnCoordinates')
+    if isinstance(conversion,dict) and conversion.get('inverse'):
+        prepend_root_transform(scene.GetPrim(),Gf.Matrix4d(*[v for row in conversion['inverse'] for v in row]),'returnCoordinates')
     upstream_stage=alive[-2] if len(alive)>=2 and hasattr(alive[-2],'GetPseudoRoot') else None
     if upstream_stage is not None:
         default_path=upstream_stage.GetDefaultPrim().GetPath() if upstream_stage.GetDefaultPrim() else Sdf.Path('/Scene')

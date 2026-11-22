@@ -119,6 +119,199 @@ def _emit_popup_input(evt):
         pass
 
 
+_POSTFX_DEFAULTS = {
+    "tonemapOperator": "acesApproximation",
+    "tonemapColorMode": "sRGBLinear",
+    "exposureKey": 0.25,
+    "whiteScale": 40.2,
+    "maxWhiteLuminance": 10.0,
+    "whitepoint": [1.0, 1.0, 1.0],
+    "dither": 0.0,
+    "irayBurnHighlights": 0.7,
+    "irayCrushBlacks": 0.5,
+    "iraySaturation": 1.0,
+    "gradeEnabled": False,
+    "gradeBlackPoint": [0.0, 0.0, 0.0],
+    "gradeWhitePoint": [1.0, 1.0, 1.0],
+    "gradeLift": [0.0, 0.0, 0.0],
+    "gradeGain": [1.0, 1.0, 1.0],
+    "gradeMultiply": [1.0, 1.0, 1.0],
+    "gradeOffset": [0.0, 0.0, 0.0],
+    "gradeGamma": [1.0, 1.0, 1.0],
+    "gradeContrast": [1.0, 1.0, 1.0],
+    "gradeSaturation": [1.0, 1.0, 1.0],
+    "autoExposureEnabled": False,
+    "autoExposureWhitePointScale": 10.0,
+    "autoExposureAdaptationSpeed": 3.5,
+    "autoExposureHistogramFilter": "median",
+    "autoExposureMinLuminance": 50.0,
+    "autoExposureMaxLuminance": 100000.0,
+    "bloomEnabled": False,
+    "bloomScale": 1.0,
+    "bloomCutoff": 0.0,
+    "bloomCutoffFuzziness": 0.5,
+    "bloomEnergyConservingBlend": False,
+    "bloomFStop": 5.0,
+    "bloomFocalLength": 35.0,
+    "bloomBlades": 5,
+    "bloomApertureCircular": False,
+    "bloomApertureRotation": 5.0,
+    "bloomAnisoFlareWeight": 0.6,
+    "bloomHaloFlareWeight": 0.01,
+    "bloomIsotropicFlareWeight": 0.4,
+    "chromabEnabled": False,
+    "chromabStrengthR": -0.055,
+    "chromabStrengthG": -0.075,
+    "chromabStrengthB": 0.015,
+    "chromabUseLanczos": False,
+    "vignetteEnabled": False,
+    "vignetteStrength": 0.7,
+    "vignetteSize": 107.0,
+    "filmGrainEnabled": False,
+    "filmGrainAmount": 0.05,
+    "filmGrainSize": 1.6,
+    "sharpness": 0.5,
+}
+
+
+def resolve_graph_postfx(graph):
+    """Return merged PostFX settings for the active subgraph (downstream wins), or None."""
+    if not isinstance(graph, dict):
+        return None
+    target = graph.get("targetNodeId")
+    nodes = graph.get("nodes") or []
+    edges = graph.get("edges") or []
+    if not target or not nodes:
+        return None
+    nmap = {n.get("id"): n for n in nodes if isinstance(n, dict) and n.get("id")}
+    inc = {}
+    for e in edges:
+        if isinstance(e, dict) and e.get("source") and e.get("target"):
+            inc.setdefault(e["target"], []).append(e["source"])
+    visited = set()
+    order = []
+
+    def dfs(nid):
+        if nid in visited or nid not in nmap:
+            return
+        visited.add(nid)
+        for src in inc.get(nid, ()):
+            dfs(src)
+        order.append(nid)
+
+    dfs(target)
+    merged = None
+    for nid in order:
+        n = nmap[nid]
+        op = n.get("operation") or (n.get("data") or {}).get("operation")
+        if op == "postfx":
+            raw = n.get("postFx")
+            if raw is None and isinstance(n.get("data"), dict):
+                raw = n["data"].get("postFx")
+            if merged is None:
+                merged = dict(_POSTFX_DEFAULTS)
+            if isinstance(raw, dict):
+                merged.update(raw)
+    return merged
+
+
+def _postfx_vec3(val, default):
+    if isinstance(val, (list, tuple)) and len(val) == 3:
+        return (float(val[0]), float(val[1]), float(val[2]))
+    return (float(default[0]), float(default[1]), float(default[2]))
+
+
+def build_postfx_attr_specs(cfg):
+    """Return list of (attr_name, kind, value) for omni:rtx:post:* & autoExposure:*."""
+    c = dict(_POSTFX_DEFAULTS)
+    if isinstance(cfg, dict):
+        c.update(cfg)
+    cutoff = float(c["bloomCutoff"])
+    vignette_on = bool(c["vignetteEnabled"])
+    grain_on = bool(c["filmGrainEnabled"])
+    return [
+        # Tone mapping
+        ("omni:rtx:post:tonemap:operator", "token", str(c["tonemapOperator"])),
+        ("omni:rtx:post:tonemap:colorMode", "token", str(c["tonemapColorMode"])),
+        ("omni:rtx:post:tonemap:exposureKey", "float", float(c["exposureKey"])),
+        ("omni:rtx:post:tonemap:whiteScale", "float", float(c["whiteScale"])),
+        ("omni:rtx:post:tonemap:maxWhiteLuminance", "float", float(c["maxWhiteLuminance"])),
+        ("omni:rtx:post:tonemap:whitepoint", "color3f", _postfx_vec3(c["whitepoint"], (1.0, 1.0, 1.0))),
+        ("omni:rtx:post:tonemap:dither", "float", float(c["dither"])),
+        ("omni:rtx:post:tonemap:irayReinhard:burnHighlights", "float", float(c["irayBurnHighlights"])),
+        ("omni:rtx:post:tonemap:irayReinhard:crushBlacks", "float", float(c["irayCrushBlacks"])),
+        ("omni:rtx:post:tonemap:irayReinhard:saturation", "float", float(c["iraySaturation"])),
+        # Color grading
+        ("omni:rtx:post:grade:enabled", "bool", bool(c["gradeEnabled"])),
+        ("omni:rtx:post:grade:blackPoint", "color3f", _postfx_vec3(c["gradeBlackPoint"], (0.0, 0.0, 0.0))),
+        ("omni:rtx:post:grade:whitePoint", "color3f", _postfx_vec3(c["gradeWhitePoint"], (1.0, 1.0, 1.0))),
+        ("omni:rtx:post:grade:lift", "color3f", _postfx_vec3(c["gradeLift"], (0.0, 0.0, 0.0))),
+        ("omni:rtx:post:grade:gain", "color3f", _postfx_vec3(c["gradeGain"], (1.0, 1.0, 1.0))),
+        ("omni:rtx:post:grade:multiply", "color3f", _postfx_vec3(c["gradeMultiply"], (1.0, 1.0, 1.0))),
+        ("omni:rtx:post:grade:offset", "color3f", _postfx_vec3(c["gradeOffset"], (0.0, 0.0, 0.0))),
+        ("omni:rtx:post:grade:gamma", "color3f", _postfx_vec3(c["gradeGamma"], (1.0, 1.0, 1.0))),
+        ("omni:rtx:post:grade:contrast", "color3f", _postfx_vec3(c["gradeContrast"], (1.0, 1.0, 1.0))),
+        ("omni:rtx:post:grade:saturation", "color3f", _postfx_vec3(c["gradeSaturation"], (1.0, 1.0, 1.0))),
+        # Auto exposure
+        ("omni:rtx:autoExposure:enabled", "bool", bool(c["autoExposureEnabled"])),
+        ("omni:rtx:autoExposure:whitePointScale", "float", float(c["autoExposureWhitePointScale"])),
+        ("omni:rtx:autoExposure:adaptationSpeed", "float", float(c["autoExposureAdaptationSpeed"])),
+        ("omni:rtx:autoExposure:histogramFilter", "token", str(c["autoExposureHistogramFilter"])),
+        ("omni:rtx:autoExposure:histogramClamping:minLuminance", "float", float(c["autoExposureMinLuminance"])),
+        ("omni:rtx:autoExposure:histogramClamping:maxLuminance", "float", float(c["autoExposureMaxLuminance"])),
+        # Bloom & lens flares
+        ("omni:rtx:post:bloom:enabled", "bool", bool(c["bloomEnabled"])),
+        ("omni:rtx:post:bloom:scale", "float", float(c["bloomScale"])),
+        ("omni:rtx:post:bloom:cutoff", "float3", (cutoff, cutoff, cutoff)),
+        ("omni:rtx:post:bloom:cutoffFuzziness", "float", float(c["bloomCutoffFuzziness"])),
+        ("omni:rtx:post:bloom:energyConservingBlend", "bool", bool(c["bloomEnergyConservingBlend"])),
+        ("omni:rtx:post:bloom:fStop", "float", float(c["bloomFStop"])),
+        ("omni:rtx:post:bloom:focalLength", "float", float(c["bloomFocalLength"])),
+        ("omni:rtx:post:bloom:aperture:blades", "int", int(c["bloomBlades"])),
+        ("omni:rtx:post:bloom:apertureShapeCircular", "bool", bool(c["bloomApertureCircular"])),
+        ("omni:rtx:post:bloom:aperture:rotation", "float", float(c["bloomApertureRotation"])),
+        ("omni:rtx:post:lensFlares:anisoFlareWeight", "float", float(c["bloomAnisoFlareWeight"])),
+        ("omni:rtx:post:lensFlares:haloFlareWeight", "float", float(c["bloomHaloFlareWeight"])),
+        ("omni:rtx:post:lensFlares:isotropicFlareWeight", "float", float(c["bloomIsotropicFlareWeight"])),
+        # Chromatic aberration
+        ("omni:rtx:post:chromab:enabled", "bool", bool(c["chromabEnabled"])),
+        ("omni:rtx:post:chromab:strengthR", "float", float(c["chromabStrengthR"])),
+        ("omni:rtx:post:chromab:strengthG", "float", float(c["chromabStrengthG"])),
+        ("omni:rtx:post:chromab:strengthB", "float", float(c["chromabStrengthB"])),
+        ("omni:rtx:post:chromab:useLanczosSampler", "bool", bool(c["chromabUseLanczos"])),
+        # Vignette & film grain (tvNoise)
+        ("omni:rtx:post:tvNoise:enabled", "bool", bool(vignette_on or grain_on)),
+        ("omni:rtx:post:tvNoise:vignetting:enabled", "bool", vignette_on),
+        ("omni:rtx:post:tvNoise:vignetting:strength", "float", float(c["vignetteStrength"])),
+        ("omni:rtx:post:tvNoise:vignetting:size", "float", float(c["vignetteSize"])),
+        ("omni:rtx:post:tvNoise:filmGrain:enabled", "bool", grain_on),
+        ("omni:rtx:post:tvNoise:filmGrain:amount", "float", float(c["filmGrainAmount"])),
+        ("omni:rtx:post:tvNoise:filmGrain:size", "float", float(c["filmGrainSize"])),
+        # Sharpening
+        ("omni:rtx:post:aa:sharpness", "float", float(c["sharpness"])),
+    ]
+
+
+def apply_postfx_to_render_product(product_prim, cfg):
+    """Author PostFX attributes onto a UsdRender.Product prim."""
+    if cfg is None:
+        return
+    from pxr import Gf, Sdf
+    type_map = {
+        "token": Sdf.ValueTypeNames.Token,
+        "bool": Sdf.ValueTypeNames.Bool,
+        "int": Sdf.ValueTypeNames.Int,
+        "float": Sdf.ValueTypeNames.Float,
+        "float3": Sdf.ValueTypeNames.Float3,
+        "color3f": Sdf.ValueTypeNames.Color3f,
+    }
+    for attr_name, kind, val in build_postfx_attr_specs(cfg):
+        sdf_type = type_map[kind]
+        if kind in ("float3", "color3f"):
+            val = Gf.Vec3f(val[0], val[1], val[2])
+        product_prim.CreateAttribute(attr_name, sdf_type, custom=False).Set(val)
+
+
 def phase(name, timeout=60, report=True):
     global _phase
     _phase = (name, time.monotonic(), timeout)
@@ -1282,6 +1475,93 @@ class OvrtxViewport:
             sys.stderr.write(f"Ovrtx incremental pose update failed; rebuilding scene: {error}\n")
             return False
 
+    def _write_postfx_to_ovstage(self, old_cfg, new_cfg):
+        """Write changed non-token PostFX attributes directly to /Render/RenderProduct_Viewport.
+        Returns True if all differences were written in-place, False if a token changed or write failed.
+        """
+        if self.stage is None:
+            return False
+        old_specs = {name: (kind, val) for name, kind, val in build_postfx_attr_specs(old_cfg)}
+        new_specs = build_postfx_attr_specs(new_cfg)
+        changed_specs = []
+        for name, kind, val in new_specs:
+            if old_specs.get(name) != (kind, val):
+                if kind == "token":
+                    return False
+                changed_specs.append((name, kind, val))
+        if not changed_specs:
+            return True
+        try:
+            self.ordinal += 1
+            with ovstage.PathDictionary(self.stage) as paths:
+                prod_plist = paths.create_path_list_from_strings(["/Render/RenderProduct_Viewport"])
+                try:
+                    prod_query = self.stage.query_from_path_list(prod_plist)
+                    for name, kind, val in changed_specs:
+                        if kind == "bool":
+                            arr = np.asarray([bool(val)], dtype=np.bool_)
+                            sem = 0
+                        elif kind == "int":
+                            arr = np.asarray([int(val)], dtype=np.int32)
+                            sem = 0
+                        elif kind == "float":
+                            arr = np.asarray([float(val)], dtype=np.float32)
+                            sem = 0
+                        elif kind == "float3":
+                            arr = np.asarray([[val[0], val[1], val[2]]], dtype=np.float32)
+                            sem = 0
+                        elif kind == "color3f":
+                            arr = np.asarray([[val[0], val[1], val[2]]], dtype=np.float32)
+                            sem = ovstage.AttributeSemantic.COLOR
+                        else:
+                            return False
+                        self.stage.write_attribute(prod_query, name, self.ordinal, arr, is_array=False, semantic=sem).wait()
+                finally:
+                    paths.destroy_path_list(prod_plist)
+            self.stage.advance_write_floor(self.ordinal).wait()
+            return True
+        except Exception as err:
+            sys.stderr.write(f"Ovrtx fast PostFX update failed; rebuilding scene: {err}\n")
+            return False
+
+    def _try_fast_postfx_delta(self, prev_graph, new_graph):
+        """Write PostFX-only scalar/bool/color updates directly to /Render/RenderProduct_Viewport in ovstage."""
+        if not prev_graph or not new_graph or self.stage is None:
+            return False
+        if (
+            prev_graph.get("targetNodeId") != new_graph.get("targetNodeId")
+            or prev_graph.get("edges") != new_graph.get("edges")
+            or prev_graph.get("dependencies") != new_graph.get("dependencies")
+            or prev_graph.get("proceduralGraph") != new_graph.get("proceduralGraph")
+        ):
+            return False
+        prev_nodes = prev_graph.get("nodes") or []
+        new_nodes = new_graph.get("nodes") or []
+        if len(prev_nodes) != len(new_nodes):
+            return False
+        changed_postfx = False
+        for pn, nn in zip(prev_nodes, new_nodes):
+            if pn.get("id") != nn.get("id") or pn.get("operation") != nn.get("operation"):
+                return False
+            if pn.get("operation") != "postfx":
+                if pn != nn:
+                    return False
+                continue
+            if pn != nn:
+                p_clean = {k: v for k, v in pn.items() if k != "postFx"}
+                n_clean = {k: v for k, v in nn.items() if k != "postFx"}
+                if p_clean != n_clean:
+                    return False
+                changed_postfx = True
+        if not changed_postfx:
+            return False
+        old_cfg = resolve_graph_postfx(prev_graph)
+        new_cfg = resolve_graph_postfx(new_graph)
+        if self._write_postfx_to_ovstage(old_cfg, new_cfg):
+            self._last_postfx_cfg = new_cfg
+            return True
+        return False
+
     def _try_fast_materialx_delta(self, prev_graph, new_graph):
         """Author MaterialX-only parameter updates directly into a sparse delta layer.
 
@@ -1664,25 +1944,29 @@ class OvrtxViewport:
                 camera_changed = True
         elif scene_changed and not self.live_groom_modified and editable_hair_id is None and graph_hash in self.stage_pool:
             cached = self.stage_pool[graph_hash]
-            if cached["delta_path"] != self.overlay_path:
-                self._apply_material_delta_path(cached["delta_path"])
-            self.current_usd_stage = cached["current_usd_stage"]
-            self.last_outline_key = outline_key
-            self.material_diagnostics = cached["material_diagnostics"]
-            self.material_fallbacks = cached["material_fallbacks"]
-            self.material_keepalive = cached["material_keepalive"]
-            self.graph_stages = cached["graph_stages"]
-            self.graph_stats = cached["graph_stats"]
-            self.mx_rule_selections = cached.get("mx_rule_selections", {})
-            self.live_poses = cached.get("live_poses", {})
-            self._ovrtx_skel_bindings = cached.get("ovrtx_skel_bindings")
-            self._ovrtx_skel_cache = cached.get("ovrtx_skel_cache")
-            self.last_graph_hash = graph_hash
-            self.last_static_scene_key = static_scene_key
-            self.last_graph = graph
-            self.prepared_hair_node_id = None
-            self.last_update_kind = "cache-hit"
-            scene_changed = False
+            target_postfx = resolve_graph_postfx(graph)
+            prev_postfx = getattr(self, "_last_postfx_cfg", None)
+            if prev_postfx == target_postfx or self._write_postfx_to_ovstage(prev_postfx, target_postfx):
+                if cached["delta_path"] != self.overlay_path:
+                    self._apply_material_delta_path(cached["delta_path"])
+                self._last_postfx_cfg = target_postfx
+                self.current_usd_stage = cached["current_usd_stage"]
+                self.last_outline_key = outline_key
+                self.material_diagnostics = cached["material_diagnostics"]
+                self.material_fallbacks = cached["material_fallbacks"]
+                self.material_keepalive = cached["material_keepalive"]
+                self.graph_stages = cached["graph_stages"]
+                self.graph_stats = cached["graph_stats"]
+                self.mx_rule_selections = cached.get("mx_rule_selections", {})
+                self.live_poses = cached.get("live_poses", {})
+                self._ovrtx_skel_bindings = cached.get("ovrtx_skel_bindings")
+                self._ovrtx_skel_cache = cached.get("ovrtx_skel_cache")
+                self.last_graph_hash = graph_hash
+                self.last_static_scene_key = static_scene_key
+                self.last_graph = graph
+                self.prepared_hair_node_id = None
+                self.last_update_kind = "cache-hit"
+                scene_changed = False
         elif (
             scene_changed
             and not needs_hair_session
@@ -1739,6 +2023,17 @@ class OvrtxViewport:
                 self.last_update_kind = "pose-delta"
                 scene_changed = False
                 camera_changed = True
+            elif self._try_fast_postfx_delta(self.last_graph, graph):
+                self.last_outline_key = outline_key
+                self.last_graph_hash = graph_hash
+                self.last_static_scene_key = static_scene_key
+                self.last_graph = graph
+                self.last_update_kind = "postfx-delta"
+                scene_changed = False
+        if size_changed and not scene_changed and self.last_width is not None and (
+            self.overlay_path or not self.temp_usd_path or not os.path.isfile(self.temp_usd_path)
+        ):
+            scene_changed = True
         if scene_changed or not self.temp_usd_path:
             phase("compiling USD graph", timeout=300)
             compiled_mx_selections = {}
@@ -1819,8 +2114,8 @@ class OvrtxViewport:
                 for prim in stage.Traverse(Usd.TraverseInstanceProxies())
             )
             if not has_lighting_node and not has_scene_lights:
-                if not stage.GetPrimAtPath('/Render/DefaultLights'):
-                    UsdGeom.Scope.Define(stage, '/Render/DefaultLights')
+                def_scope = UsdGeom.Scope.Define(stage, '/Render/DefaultLights')
+                def_scope.GetPrim().SetActive(True)
                 if not stage.GetPrimAtPath('/Render/DefaultLights/DomeLight'):
                     dome = UsdLux.DomeLight.Define(stage, "/Render/DefaultLights/DomeLight")
                     if hasattr(UsdLux, 'ShadowAPI'):
@@ -1834,6 +2129,10 @@ class OvrtxViewport:
                     key.CreateIntensityAttr().Set(3000.0)
                     key.CreateColorAttr().Set(Gf.Vec3f(1.0, 0.98, 0.95))
                     key.AddRotateXYZOp().Set(Gf.Vec3f(-45.0, 45.0, 0.0))
+            else:
+                def_prim = stage.GetPrimAtPath('/Render/DefaultLights')
+                if def_prim and def_prim.IsValid():
+                    stage.OverridePrim(Sdf.Path('/Render/DefaultLights')).SetActive(False)
 
             # Define / update Camera
             cam = UsdGeom.Camera.Define(stage, "/Render/Camera")
@@ -1869,6 +2168,11 @@ class OvrtxViewport:
                 product_prim.CreateAttribute("omni:rtx:pt:samplesPerIteration", Sdf.ValueTypeNames.Int, custom=False).Set(spp_per_iter)
                 product_prim.CreateAttribute("omni:rtx:pt:samplesPerPixel", Sdf.ValueTypeNames.UInt, custom=False).Set(1)
                 self._pt_max_bounces = 8
+
+            postfx_cfg = resolve_graph_postfx(graph)
+            # Always author PostFX attributes (defaults when no PostFX node) so live
+            # ovstage updates work immediately when adding/editing/removing a PostFX node.
+            apply_postfx_to_render_product(product_prim, postfx_cfg if postfx_cfg is not None else {})
 
             var = UsdRender.Var.Define(stage, "/Render/RenderVar_LdrColor")
             var.CreateSourceNameAttr().Set("LdrColor")
@@ -1933,13 +2237,23 @@ class OvrtxViewport:
                         pass
             incremental = False
             delta_path = None
+            prev_postfx_cfg = getattr(self, "_last_postfx_cfg", None)
+            postfx_tokens_same = (
+                dict(_POSTFX_DEFAULTS, **(prev_postfx_cfg or {})).get("tonemapOperator") == dict(_POSTFX_DEFAULTS, **(postfx_cfg or {})).get("tonemapOperator")
+                and dict(_POSTFX_DEFAULTS, **(prev_postfx_cfg or {})).get("tonemapColorMode") == dict(_POSTFX_DEFAULTS, **(postfx_cfg or {})).get("tonemapColorMode")
+                and dict(_POSTFX_DEFAULTS, **(prev_postfx_cfg or {})).get("autoExposureHistogramFilter") == dict(_POSTFX_DEFAULTS, **(postfx_cfg or {})).get("autoExposureHistogramFilter")
+            )
             if (not self.live_groom_modified and self.base_layer is not None and self.last_suffix == scene_suffix and previous_path
-                    and self.current_usd_stage is not None and not request.get("reload")):
+                    and self.current_usd_stage is not None and not request.get("reload") and postfx_tokens_same):
                 phase("diffing material changes")
                 delta = ovrtx_material_delta.plan(self.base_layer, flat)
                 if delta is not None:
                     try:
                         delta_path = self._apply_material_delta(delta)
+                        if prev_postfx_cfg != postfx_cfg:
+                            if not self._write_postfx_to_ovstage(prev_postfx_cfg, postfx_cfg):
+                                raise RuntimeError("PostFX live attribute sync failed")
+                        self._last_postfx_cfg = postfx_cfg
                         incremental = True
                     except Exception as error:
                         sys.stderr.write(f"Ovrtx incremental material update failed; rebuilding scene: {error}\n")
@@ -2038,6 +2352,7 @@ class OvrtxViewport:
                 self._cache_mask_overlay_active = False
                 self._pre_mask_overlay_path = None
                 self.base_layer = flat
+                self._last_postfx_cfg = postfx_cfg
                 self.mx_rule_selections = compiled_mx_selections
                 self.last_suffix = scene_suffix
                 self.current_usd_stage = stage
@@ -2166,6 +2481,55 @@ class OvrtxViewport:
             and self.last_brush_frame is not None
             and self.last_brush_frame[0] == usd_graph.groom_frame_view(request)
         )
+        if size_changed and not scene_changed and self.last_width is not None and self.temp_usd_path and os.path.isfile(self.temp_usd_path):
+            phase("resizing NVIDIA viewport", timeout=120)
+            # Recreating the ovrtx renderer on resize avoids omni.rtx GPU pagefaults
+            # triggered by mutating RenderProduct.resolution on a live ovstage.
+            temp_layer = Sdf.Layer.FindOrOpen(self.temp_usd_path)
+            if temp_layer is not None:
+                rp = temp_layer.GetPrimAtPath("/Render/RenderProduct_Viewport")
+                if rp and "resolution" in rp.properties:
+                    rp.properties["resolution"].default = Gf.Vec2i(width, height)
+                if rp and render_mode == "pathTracing" and target_spp > 1 and "omni:rtx:pt:samplesPerPixel" in rp.properties:
+                    rp.properties["omni:rtx:pt:samplesPerPixel"].default = 1
+                temp_layer.Save()
+                del temp_layer
+            if self.stage is not None:
+                try:
+                    self.stage.destroy()
+                except Exception:
+                    pass
+                self.stage = None
+            if self.renderer is not None:
+                try:
+                    self.renderer.destroy()
+                except Exception:
+                    pass
+                self.renderer = None
+            self._ensure_initialized()
+            self.ordinal = 1
+            ovstage.population.open_usd(
+                self.stage,
+                self.temp_usd_path,
+                ordinal=self.ordinal,
+                time=float(request.get("frame", 0)) / (self.current_usd_stage.GetTimeCodesPerSecond() if self.current_usd_stage else 24.0),
+            )
+            self.stage.compute_hierarchy(
+                self.ordinal,
+                self.ordinal,
+                model=ovstage.HierarchyComputationModel.CPU_INCREMENTAL,
+            )
+            self.stage.advance_write_floor(self.ordinal).wait()
+            self._pt_spp_at_one = (render_mode == "pathTracing" and target_spp > 1)
+            self._pt_max_bounces = 8
+            self._pt_stall_count = 0
+            camera_changed = True
+            # Keep size_changed=False for RenderProduct, but update Camera aperture below.
+            size_changed = False
+            update_cam_aperture = True
+        else:
+            update_cam_aperture = size_changed
+
         if (
             not scene_changed
             or self.last_update_kind in ("material-delta", "material-delta-fast", "cache-hit")
@@ -2201,7 +2565,7 @@ class OvrtxViewport:
                     self.stage.write_attribute(cam_query, "fStop", self.ordinal,
                         np.asarray([cam_params["f_stop"]], dtype=np.float32),
                         is_array=False, semantic=0).wait()
-                    if size_changed:
+                    if update_cam_aperture:
                         self.stage.write_attribute(cam_query, "horizontalAperture", self.ordinal,
                             np.asarray([cam_params["horizontal_aperture"]], dtype=np.float32),
                             is_array=False, semantic=0).wait()

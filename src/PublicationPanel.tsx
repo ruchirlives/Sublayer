@@ -253,7 +253,7 @@ export function PublicationPanel({
       [];
     const previous = node?.data.liveAdjustment || node?.data.publication;
     const inherited =
-      previous?.conversion.graphRevision === native?.conversion.graphRevision
+      previous?.conversion?.graphRevision === native?.conversion?.graphRevision
         ? previous?.correspondence || []
         : [];
     const seeded = new Map(baselineMappings.map((m) => [m.baselinePath, m]));

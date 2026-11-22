@@ -334,6 +334,8 @@ pub struct NodeData {
     pub last_extraction_seconds: Option<f64>,
     #[serde(default)]
     pub hdri: Option<HdriSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_fx: Option<PostFxSettings>,
     #[serde(default)]
     pub hair: Option<HairSettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -881,6 +883,200 @@ fn default_hdri_format() -> String {
     "latlong".into()
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PostFxSettings {
+    #[serde(default = "default_postfx_tonemap_operator")]
+    pub tonemap_operator: String,
+    #[serde(default = "default_postfx_tonemap_color_mode")]
+    pub tonemap_color_mode: String,
+    #[serde(default = "default_postfx_exposure_key")]
+    pub exposure_key: f64,
+    #[serde(default = "default_postfx_white_scale")]
+    pub white_scale: f64,
+    #[serde(default = "default_postfx_max_white_luminance")]
+    pub max_white_luminance: f64,
+    #[serde(default = "default_rgb_one")]
+    pub whitepoint: [f64; 3],
+    #[serde(default)]
+    pub dither: f64,
+    #[serde(default = "default_postfx_iray_burn")]
+    pub iray_burn_highlights: f64,
+    #[serde(default = "default_postfx_iray_crush")]
+    pub iray_crush_blacks: f64,
+    #[serde(default = "default_one")]
+    pub iray_saturation: f64,
+
+    #[serde(default)]
+    pub grade_enabled: bool,
+    #[serde(default)]
+    pub grade_black_point: [f64; 3],
+    #[serde(default = "default_rgb_one")]
+    pub grade_white_point: [f64; 3],
+    #[serde(default)]
+    pub grade_lift: [f64; 3],
+    #[serde(default = "default_rgb_one")]
+    pub grade_gain: [f64; 3],
+    #[serde(default = "default_rgb_one")]
+    pub grade_multiply: [f64; 3],
+    #[serde(default)]
+    pub grade_offset: [f64; 3],
+    #[serde(default = "default_rgb_one")]
+    pub grade_gamma: [f64; 3],
+    #[serde(default = "default_rgb_one")]
+    pub grade_contrast: [f64; 3],
+    #[serde(default = "default_rgb_one")]
+    pub grade_saturation: [f64; 3],
+
+    #[serde(default)]
+    pub auto_exposure_enabled: bool,
+    #[serde(default = "default_postfx_auto_exp_white_point")]
+    pub auto_exposure_white_point_scale: f64,
+    #[serde(default = "default_postfx_auto_exp_speed")]
+    pub auto_exposure_adaptation_speed: f64,
+    #[serde(default = "default_postfx_auto_exp_filter")]
+    pub auto_exposure_histogram_filter: String,
+    #[serde(default = "default_postfx_auto_exp_min_lum")]
+    pub auto_exposure_min_luminance: f64,
+    #[serde(default = "default_postfx_auto_exp_max_lum")]
+    pub auto_exposure_max_luminance: f64,
+
+    #[serde(default)]
+    pub bloom_enabled: bool,
+    #[serde(default = "default_one")]
+    pub bloom_scale: f64,
+    #[serde(default)]
+    pub bloom_cutoff: f64,
+    #[serde(default = "default_half")]
+    pub bloom_cutoff_fuzziness: f64,
+    #[serde(default)]
+    pub bloom_energy_conserving_blend: bool,
+    #[serde(default = "default_postfx_bloom_fstop")]
+    pub bloom_f_stop: f64,
+    #[serde(default = "default_postfx_bloom_focal")]
+    pub bloom_focal_length: f64,
+    #[serde(default = "default_postfx_bloom_blades")]
+    pub bloom_blades: i32,
+    #[serde(default)]
+    pub bloom_aperture_circular: bool,
+    #[serde(default = "default_postfx_bloom_fstop")]
+    pub bloom_aperture_rotation: f64,
+    #[serde(default = "default_postfx_bloom_aniso")]
+    pub bloom_aniso_flare_weight: f64,
+    #[serde(default = "default_postfx_bloom_halo")]
+    pub bloom_halo_flare_weight: f64,
+    #[serde(default = "default_postfx_bloom_iso")]
+    pub bloom_isotropic_flare_weight: f64,
+
+    #[serde(default)]
+    pub chromab_enabled: bool,
+    #[serde(default = "default_postfx_chromab_r")]
+    pub chromab_strength_r: f64,
+    #[serde(default = "default_postfx_chromab_g")]
+    pub chromab_strength_g: f64,
+    #[serde(default = "default_postfx_chromab_b")]
+    pub chromab_strength_b: f64,
+    #[serde(default)]
+    pub chromab_use_lanczos: bool,
+
+    #[serde(default)]
+    pub vignette_enabled: bool,
+    #[serde(default = "default_postfx_vignette_strength")]
+    pub vignette_strength: f64,
+    #[serde(default = "default_postfx_vignette_size")]
+    pub vignette_size: f64,
+    #[serde(default)]
+    pub film_grain_enabled: bool,
+    #[serde(default = "default_postfx_grain_amount")]
+    pub film_grain_amount: f64,
+    #[serde(default = "default_postfx_grain_size")]
+    pub film_grain_size: f64,
+
+    #[serde(default = "default_half")]
+    pub sharpness: f64,
+}
+fn default_postfx_tonemap_operator() -> String {
+    "acesApproximation".into()
+}
+fn default_postfx_tonemap_color_mode() -> String {
+    "sRGBLinear".into()
+}
+fn default_postfx_exposure_key() -> f64 {
+    0.25
+}
+fn default_postfx_white_scale() -> f64 {
+    40.2
+}
+fn default_postfx_max_white_luminance() -> f64 {
+    10.0
+}
+fn default_rgb_one() -> [f64; 3] {
+    [1.0, 1.0, 1.0]
+}
+fn default_half() -> f64 {
+    0.5
+}
+fn default_postfx_iray_burn() -> f64 {
+    0.7
+}
+fn default_postfx_iray_crush() -> f64 {
+    0.5
+}
+fn default_postfx_auto_exp_white_point() -> f64 {
+    10.0
+}
+fn default_postfx_auto_exp_speed() -> f64 {
+    3.5
+}
+fn default_postfx_auto_exp_filter() -> String {
+    "median".into()
+}
+fn default_postfx_auto_exp_min_lum() -> f64 {
+    50.0
+}
+fn default_postfx_auto_exp_max_lum() -> f64 {
+    100000.0
+}
+fn default_postfx_bloom_fstop() -> f64 {
+    5.0
+}
+fn default_postfx_bloom_focal() -> f64 {
+    35.0
+}
+fn default_postfx_bloom_blades() -> i32 {
+    5
+}
+fn default_postfx_bloom_aniso() -> f64 {
+    0.6
+}
+fn default_postfx_bloom_halo() -> f64 {
+    0.01
+}
+fn default_postfx_bloom_iso() -> f64 {
+    0.4
+}
+fn default_postfx_chromab_r() -> f64 {
+    -0.055
+}
+fn default_postfx_chromab_g() -> f64 {
+    -0.075
+}
+fn default_postfx_chromab_b() -> f64 {
+    0.015
+}
+fn default_postfx_vignette_strength() -> f64 {
+    0.7
+}
+fn default_postfx_vignette_size() -> f64 {
+    107.0
+}
+fn default_postfx_grain_amount() -> f64 {
+    0.05
+}
+fn default_postfx_grain_size() -> f64 {
+    1.6
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MaterialXRule {
@@ -1137,7 +1333,8 @@ pub struct LiveAdjustment {
     pub baseline_dependency_id: String,
     pub handoff_dependency_id: String,
     pub policy: crate::application_profiles::PolicySnapshot,
-    pub conversion: CoordinateDraft,
+    #[serde(default)]
+    pub conversion: Option<CoordinateDraft>,
     pub report: serde_json::Value,
     pub guards: serde_json::Value,
     pub file_revisions: Vec<serde_json::Value>,
@@ -1155,7 +1352,8 @@ pub struct Publication {
     pub baseline_dependency_id: String,
     pub handoff_dependency_id: String,
     pub policy: crate::application_profiles::PolicySnapshot,
-    pub conversion: CoordinateDraft,
+    #[serde(default)]
+    pub conversion: Option<CoordinateDraft>,
     pub report: serde_json::Value,
     pub source_revisions: Vec<serde_json::Value>,
     pub correspondence: Vec<serde_json::Value>,
@@ -1441,6 +1639,7 @@ impl Project {
                     "material_bind",
                     "light",
                     "hdri",
+                    "postfx",
                     "hair",
                     "cache_edit",
                     "camera",
@@ -1540,15 +1739,17 @@ impl Project {
                 {
                     return Err("Invalid live adjustment".into());
                 }
-                for id in [
-                    &live.edited_dependency_id,
-                    &live.baseline_dependency_id,
-                    &live.handoff_dependency_id,
-                ] {
-                    check(id, &DependencyKind::Usd)?;
+                let is_sp = live.revision.starts_with("sp-");
+                check(&live.edited_dependency_id, &DependencyKind::Usd)?;
+                for id in [&live.baseline_dependency_id, &live.handoff_dependency_id] {
+                    if !is_sp || !id.is_empty() {
+                        check(id, &DependencyKind::Usd)?;
+                    }
                 }
                 live.policy.validate()?;
-                validate_draft(&live.conversion)?;
+                if let Some(conv) = &live.conversion {
+                    validate_draft(conv)?;
+                }
             }
             if let Some(publication) = &n.data.publication {
                 if let Some(reconciliation) = &publication.reconciliation {
@@ -1566,7 +1767,9 @@ impl Project {
                     }
                 }
                 publication.policy.validate()?;
-                validate_draft(&publication.conversion)?;
+                if let Some(conv) = &publication.conversion {
+                    validate_draft(conv)?;
+                }
                 for id in [
                     &publication.dependency_id,
                     &publication.edit_layer_dependency_id,
@@ -1826,6 +2029,74 @@ impl Project {
                             .contains(&h.texture_format.as_str())
                     {
                         return Err("Invalid HDRI settings".into());
+                    }
+                }
+            }
+            if n.data.operation == "postfx" {
+                if let Some(p) = &n.data.post_fx {
+                    let valid_ops = [
+                        "raw",
+                        "none",
+                        "reinhard",
+                        "modifiedReinhard",
+                        "hejiHableAlu",
+                        "hableUc2",
+                        "acesApproximation",
+                        "iray",
+                    ];
+                    let valid_color_modes = ["sRGBLinear", "ACEScg"];
+                    let valid_filters = ["median", "average"];
+                    let scalars = [
+                        p.exposure_key,
+                        p.white_scale,
+                        p.max_white_luminance,
+                        p.dither,
+                        p.iray_burn_highlights,
+                        p.iray_crush_blacks,
+                        p.iray_saturation,
+                        p.auto_exposure_white_point_scale,
+                        p.auto_exposure_adaptation_speed,
+                        p.auto_exposure_min_luminance,
+                        p.auto_exposure_max_luminance,
+                        p.bloom_scale,
+                        p.bloom_cutoff,
+                        p.bloom_cutoff_fuzziness,
+                        p.bloom_f_stop,
+                        p.bloom_focal_length,
+                        p.bloom_aperture_rotation,
+                        p.bloom_aniso_flare_weight,
+                        p.bloom_halo_flare_weight,
+                        p.bloom_isotropic_flare_weight,
+                        p.chromab_strength_r,
+                        p.chromab_strength_g,
+                        p.chromab_strength_b,
+                        p.vignette_strength,
+                        p.vignette_size,
+                        p.film_grain_amount,
+                        p.film_grain_size,
+                        p.sharpness,
+                    ];
+                    let vectors = [
+                        &p.whitepoint,
+                        &p.grade_black_point,
+                        &p.grade_white_point,
+                        &p.grade_lift,
+                        &p.grade_gain,
+                        &p.grade_multiply,
+                        &p.grade_offset,
+                        &p.grade_gamma,
+                        &p.grade_contrast,
+                        &p.grade_saturation,
+                    ];
+                    if !valid_ops.contains(&p.tonemap_operator.as_str())
+                        || !valid_color_modes.contains(&p.tonemap_color_mode.as_str())
+                        || !valid_filters.contains(&p.auto_exposure_histogram_filter.as_str())
+                        || scalars.iter().any(|v| !v.is_finite())
+                        || vectors.iter().any(|vec| vec.iter().any(|v| !v.is_finite()))
+                        || p.bloom_blades < 3
+                        || p.bloom_blades > 16
+                    {
+                        return Err("Invalid PostFX settings".into());
                     }
                 }
             }

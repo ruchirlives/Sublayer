@@ -60,7 +60,7 @@ hr{background:#2b3b40;border:0;height:1px;margin:22px 0}
 .card[data-node-type="delete"]{--node-accent:#fca5a5}
 .card[data-node-type="materialx"],.card[data-node-type="material_bind"],.card[data-node-type="hair"]{--node-accent:#c4b5fd}
 .card[data-node-type="light"],.card[data-node-type="hdri"]{--node-accent:#fbbf24}
-.card[data-node-type="camera"]{--node-accent:#fb7185}
+.card[data-node-type="camera"],.card[data-node-type="postfx"]{--node-accent:#fb7185}
 .card[data-node-type="output"]{--node-accent:var(--accent,#9fe2b6)}
 .card-header{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 11px;border-radius:9px 9px 0 0;background:linear-gradient(90deg,color-mix(in srgb,var(--node-accent) 16%,transparent),color-mix(in srgb,var(--node-accent) 4%,transparent));border-bottom:1px solid color-mix(in srgb,var(--node-accent) 22%,var(--border-subtle,#2b383c))}
 .card-kind{display:inline-flex;align-items:center;gap:6px;letter-spacing:1.4px;color:var(--node-accent);font-size:9px;font-weight:700}
