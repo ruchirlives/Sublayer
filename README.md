@@ -1,6 +1,6 @@
 # Sublayer
 
-![Screenshot](file:///C:/Users/Ruchirlives/.gemini/antigravity/brain/6e37e09b-21d2-4f89-8834-1750ffd7af99/.user_uploaded/media_1795803250260_465ca322.jpg)
+![Screenshot](media_1795803588430_130602fc.png)
 
 Sublayer is a Windows desktop application built with **Tauri 2**, **React / TypeScript (React Flow)**, **Rust**, and **OpenUSD** for non-destructive USD scene composition, lookdev, simulation, DCC round‑tripping, and real‑time Hydra viewport rendering.
 
