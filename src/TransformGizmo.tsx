@@ -107,6 +107,9 @@ export function TransformGizmo({
   interactive,
   onChange,
   onCommit,
+  onCancel,
+  translationLocks,
+  worldOnly = false,
   onInteractingChange,
 }: {
   transform: Transform;
@@ -120,6 +123,9 @@ export function TransformGizmo({
   interactive: boolean;
   onChange: (next: Transform) => void;
   onCommit?: () => void;
+  onCancel?: () => void;
+  translationLocks?: [boolean, boolean, boolean];
+  worldOnly?: boolean;
   onInteractingChange?: (interacting: boolean) => void;
 }) {
   const [mode, setMode] = useState<GizmoMode>("all");
@@ -169,27 +175,30 @@ export function TransformGizmo({
       ) {
         return;
       }
+      if (e.key === "Escape" && dragRef.current && onCancel) {
+        dragRef.current = null; setActiveAxis(null); setActiveKind(null); onInteractingChange?.(false); onCancel(); return;
+      }
       if (e.ctrlKey || e.metaKey || e.altKey) return;
       const key = e.key.toLowerCase();
       if (key === "q") setMode("all");
       else if (key === "w") setMode("translate");
       else if (key === "e") setMode("rotate");
       else if (key === "r") setMode("scale");
-      else if (key === "x") setSpace((s) => (s === "world" ? "local" : "world"));
+      else if (key === "x" && !worldOnly) setSpace((s) => (s === "world" ? "local" : "world"));
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [interactive]);
+  }, [interactive, onCancel, onInteractingChange, worldOnly]);
 
   const basis = useMemo(() => {
     const w = Math.max(1, width);
     const h = Math.max(1, height);
     const yaw = (camera.yaw * Math.PI) / 180;
-    const pitch = (camera.pitch * Math.PI) / 180;
+    const pitch = (Math.max(-90, Math.min(90, camera.pitch)) * Math.PI) / 180;
+    const isOrtho = camera.projection === "orthographic";
     const fov = Math.max(5, Math.min(170, camera.fov ?? 45));
     const aspect = w / h;
 
-    const up: Vec3 = upAxis === "Z" ? [0, 0, 1] : [0, 1, 0];
     const forward: Vec3 =
       upAxis === "Z"
         ? [
@@ -202,7 +211,10 @@ export function TransformGizmo({
             Math.sin(pitch),
             Math.cos(yaw) * Math.cos(pitch),
           ];
-    const right = normalize(cross(up, forward));
+    const right: Vec3 =
+      upAxis === "Z"
+        ? [Math.cos(yaw), Math.sin(yaw), 0]
+        : [Math.cos(yaw), 0, -Math.sin(yaw)];
     const cameraUp = normalize(cross(forward, right));
 
     const safeRadius = Math.max(0.001, radius || 1);
@@ -211,8 +223,9 @@ export function TransformGizmo({
       (safeRadius / Math.sin(Math.atan(Math.tan(halfFov) * Math.min(aspect, 1)))) *
       1.15;
     const distance = fitDistance * Math.max(0.002, camera.zoom || 1);
+    const orthoHalfHeight = Math.max(1e-5, distance * Math.tan(halfFov));
     const tanHalf = Math.tan(((fov * Math.PI) / 180) * 0.5);
-    const worldUnitsPerPx = (distance * tanHalf) / (h * 0.5);
+    const worldUnitsPerPx = (isOrtho ? orthoHalfHeight : distance * tanHalf) / (h * 0.5);
     const axisWorldLen = worldUnitsPerPx * 82;
 
     // The displayed frame can lag behind both pointer release and the next drag.
@@ -234,9 +247,16 @@ export function TransformGizmo({
       ];
       const vx = dot(worldOffset, right) + panOffsetX;
       const vy = dot(worldOffset, cameraUp) + panOffsetY;
-      const vz = Math.max(1e-4, distance - dot(worldOffset, forward));
-      const ndcX = vx / (vz * tanHalf * aspect);
-      const ndcY = vy / (vz * tanHalf);
+      let ndcX: number;
+      let ndcY: number;
+      if (isOrtho) {
+        ndcX = vx / (orthoHalfHeight * aspect);
+        ndcY = vy / orthoHalfHeight;
+      } else {
+        const vz = Math.max(1e-4, distance - dot(worldOffset, forward));
+        ndcX = vx / (vz * tanHalf * aspect);
+        ndcY = vy / (vz * tanHalf);
+      }
       return [(ndcX * 0.5 + 0.5) * w, (0.5 - ndcY * 0.5) * h];
     };
 
@@ -313,7 +333,7 @@ export function TransformGizmo({
   }, [basis, mode, spaceAxes]);
 
   function startAxisDrag(e: PointerEvent<SVGElement>, axis: AxisIdx | "all", dragMode: DragMode) {
-    if (!interactive || e.button !== 0) return;
+    if (!interactive || e.button !== 0 || (dragMode === "translate" && axis !== "all" && space === "world" && translationLocks?.[axis])) return;
     e.stopPropagation();
     e.preventDefault();
     (e.currentTarget as Element).setPointerCapture(e.pointerId);
@@ -408,6 +428,7 @@ export function TransformGizmo({
       }
     }
 
+    if (d.mode === "translate" && translationLocks) next.translation = next.translation.map((v,i) => translationLocks[i] ? d.startTransform.translation[i] : v) as Vec3;
     onChange(next);
   }
 
@@ -492,7 +513,8 @@ export function TransformGizmo({
           <button
             key={s}
             type="button"
-            title="Toggle gizmo alignment (X)"
+            disabled={worldOnly && s === "local"}
+            title={worldOnly ? "Instance placement uses world axes" : "Toggle gizmo alignment (X)"}
             onClick={() => setSpace(s)}
             style={{
               padding: "3px 8px",
@@ -555,7 +577,7 @@ export function TransformGizmo({
                   onPointerDown={(e) => startAxisDrag(e, ring.idx, "rotate")}
                   onPointerMove={moveAxisDrag}
                   onPointerUp={endAxisDrag}
-                  onPointerCancel={endAxisDrag}
+                  onPointerCancel={(e) => { if (onCancel) { dragRef.current=null;setActiveAxis(null);setActiveKind(null);onInteractingChange?.(false);onCancel(); } else endAxisDrag(e); }}
                   onLostPointerCapture={endAxisDrag}
                   onDoubleClick={(e) => e.stopPropagation()}
                 />
@@ -565,6 +587,7 @@ export function TransformGizmo({
 
         {(showTranslate || showScale) &&
           axisTips.map((a) => {
+            if (a.lenPx < 6 || (showTranslate && !showScale && space === "world" && translationLocks?.[a.idx])) return null;
             const axisKind: DragMode = showScale ? "scale" : "translate";
             const highlighted =
               (activeAxis === a.idx && activeKind === axisKind) ||
@@ -627,7 +650,7 @@ export function TransformGizmo({
                   onPointerDown={(e) => startAxisDrag(e, a.idx, axisKind)}
                   onPointerMove={moveAxisDrag}
                   onPointerUp={endAxisDrag}
-                  onPointerCancel={endAxisDrag}
+                  onPointerCancel={(e) => { if (onCancel) { dragRef.current=null;setActiveAxis(null);setActiveKind(null);onInteractingChange?.(false);onCancel(); } else endAxisDrag(e); }}
                   onLostPointerCapture={endAxisDrag}
                   onDoubleClick={(e) => e.stopPropagation()}
                 />
@@ -657,7 +680,7 @@ export function TransformGizmo({
             onPointerDown={(e) => startAxisDrag(e, "all", "scale")}
             onPointerMove={moveAxisDrag}
             onPointerUp={endAxisDrag}
-            onPointerCancel={endAxisDrag}
+            onPointerCancel={(e) => { if (onCancel) { dragRef.current=null;setActiveAxis(null);setActiveKind(null);onInteractingChange?.(false);onCancel(); } else endAxisDrag(e); }}
             onLostPointerCapture={endAxisDrag}
             onDoubleClick={(e) => e.stopPropagation()}
           />
@@ -686,7 +709,7 @@ export function TransformGizmo({
             onPointerDown={(e) => showTranslate && startAxisDrag(e, "all", "translate")}
             onPointerMove={moveAxisDrag}
             onPointerUp={endAxisDrag}
-            onPointerCancel={endAxisDrag}
+            onPointerCancel={(e) => { if (onCancel) { dragRef.current=null;setActiveAxis(null);setActiveKind(null);onInteractingChange?.(false);onCancel(); } else endAxisDrag(e); }}
             onLostPointerCapture={endAxisDrag}
             onDoubleClick={(e) => e.stopPropagation()}
           />

@@ -2078,8 +2078,17 @@ def _ray_from_screen(nx: float, ny: float, cam_basis: dict):
     fwd = np.asarray(cam_basis["forward"], dtype=np.float32)
     right = np.asarray(cam_basis["right"], dtype=np.float32)
     up = np.asarray(cam_basis["up"], dtype=np.float32)
-    tan_hf = float(cam_basis["tan_half_fov"])
     aspect = float(cam_basis["aspect"])
+    if cam_basis.get("orthographic"):
+        ortho_hh = float(cam_basis.get("ortho_half_height", 1.0))
+        ox = (nx * 2.0 - 1.0) * aspect * ortho_hh
+        oy = (1.0 - ny * 2.0) * ortho_hh
+        d = fwd
+        dl = float(np.linalg.norm(d))
+        if dl > 1.0e-8:
+            d = d / dl
+        return origin + right * ox + up * oy, d
+    tan_hf = float(cam_basis["tan_half_fov"])
     sx = (nx * 2.0 - 1.0) * aspect * tan_hf
     sy = (1.0 - ny * 2.0) * tan_hf
     d = fwd + right * sx + up * sy
@@ -2506,8 +2515,11 @@ class CacheMeshSession:
         cam_fwd = np.asarray(cam_basis["forward"], dtype=np.float32)
 
         def _world_radius_at_depth(depth: float) -> float:
-            if screen_rad_frac is not None and depth > 1.0e-5:
-                return max(1.0e-4, depth * tan_hf * screen_rad_frac)
+            if screen_rad_frac is not None:
+                if cam_basis.get("orthographic"):
+                    return max(1.0e-4, float(cam_basis.get("ortho_half_height", 1.0)) * screen_rad_frac)
+                if depth > 1.0e-5:
+                    return max(1.0e-4, depth * tan_hf * screen_rad_frac)
             return fallback_radius
 
         def _pick_surface(ray_o: np.ndarray, ray_d: np.ndarray):

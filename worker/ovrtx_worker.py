@@ -17,6 +17,7 @@ import faulthandler
 faulthandler.enable(file=sys.stderr)
 
 import base64
+import copy
 import hashlib
 import io
 import json
@@ -63,6 +64,7 @@ _RENDER_MODES = {
     "pathTracing": "PathTracing",
     "pathtracing": "PathTracing",
 }
+_VIEWPORT_PRODUCTS = ("/Render/RenderProduct_Viewport", "/Render/RenderProduct_ViewportOrtho")
 
 
 _STDOUT_LOCK = threading.Lock()
@@ -453,6 +455,8 @@ class OvrtxViewport:
         self.mx_rule_selections = {}
         self.last_suffix = None
         self.last_graph = None
+        self.live_transforms = {}
+        self._transform_overlay_layer = None
         self.pending_groom_graph = None
         self.pending_groom_frame = None
         self.last_brush_upload = None
@@ -678,20 +682,26 @@ class OvrtxViewport:
                     ):
                         self.camera_anchor_translation = translation
             self.camera_fit_key = fit_key
-        yaw, pitch = math.radians(float(request.get("yaw", 35))), math.radians(float(request.get("pitch", 20)))
+        projection = str(request.get("projection") or "perspective")
+        if projection not in ("perspective", "orthographic"):
+            raise ValueError("Camera projection must be perspective or orthographic")
+        is_ortho = projection == "orthographic"
+        yaw = math.radians(float(request.get("yaw", 35)))
+        pitch = math.radians(max(-90.0, min(90.0, float(request.get("pitch", 20)))))
         up_axis = str(request.get("upAxis", "Y")).upper()
         if up_axis == "Z":
-            up = Gf.Vec3d(0, 0, 1)
             forward = Gf.Vec3d(math.sin(yaw)*math.cos(pitch), -math.cos(yaw)*math.cos(pitch), math.sin(pitch))
+            right = Gf.Vec3d(math.cos(yaw), math.sin(yaw), 0.0)
         else:
-            up = Gf.Vec3d(0, 1, 0)
             forward = Gf.Vec3d(math.sin(yaw)*math.cos(pitch), math.sin(pitch), math.cos(yaw)*math.cos(pitch))
-        right = Gf.Cross(up, forward).GetNormalized()
+            right = Gf.Vec3d(math.cos(yaw), 0.0, -math.sin(yaw))
         camera_up = Gf.Cross(forward, right).GetNormalized()
         req_pan_x = float(request.get("panX", 0))
         req_pan_y = float(request.get("panY", 0))
-        req_zoom = float(request.get("zoom", 1))
-        sin_k = math.sin(math.atan(math.tan(math.radians(22.5))*min(width/height, 1)))
+        req_zoom = max(0.001, float(request.get("zoom", 1)))
+        aspect = float(width) / float(max(height, 1))
+        fit_half_fov = math.radians(22.5)
+        sin_k = math.sin(math.atan(math.tan(fit_half_fov) * min(aspect, 1.0)))
         orbit_seq = request.get("orbitPivotSeq")
         if self.current_usd_stage and hasattr(self, "camera_anchor"):
             old_center, old_radius = Gf.Vec3d(self.camera_anchor[0]), self.camera_anchor[1]
@@ -721,48 +731,69 @@ class OvrtxViewport:
                 self.camera_anchor_translation = cur_trans
             if new_center is not None:
                 old_pivot = old_center + right * req_pan_x * old_radius + camera_up * req_pan_y * old_radius
-                old_dist = old_radius / sin_k * 1.15 * req_zoom
-                old_eye = old_pivot + forward * old_dist
-                delta = old_eye - new_center
-                new_dist = max(1e-4, float(Gf.Dot(delta, forward)))
-                req_pan_x = float(Gf.Dot(delta, right)) / old_radius
-                req_pan_y = float(Gf.Dot(delta, camera_up)) / old_radius
-                req_zoom = new_dist / (old_radius / sin_k * 1.15)
+                if is_ortho:
+                    delta = old_pivot - new_center
+                    req_pan_x = float(Gf.Dot(delta, right)) / old_radius
+                    req_pan_y = float(Gf.Dot(delta, camera_up)) / old_radius
+                else:
+                    old_dist = old_radius / sin_k * 1.15 * req_zoom
+                    old_eye = old_pivot + forward * old_dist
+                    delta = old_eye - new_center
+                    new_dist = max(1e-4, float(Gf.Dot(delta, forward)))
+                    req_pan_x = float(Gf.Dot(delta, right)) / old_radius
+                    req_pan_y = float(Gf.Dot(delta, camera_up)) / old_radius
+                    req_zoom = new_dist / (old_radius / sin_k * 1.15)
                 self.camera_anchor = (new_center, old_radius)
                 self._pending_camera_sync = {"panX": req_pan_x, "panY": req_pan_y, "zoom": req_zoom}
         center, radius = Gf.Vec3d(self.camera_anchor[0]), self.camera_anchor[1]
         center += right * req_pan_x * radius + camera_up * req_pan_y * radius
         fov = max(5.0, min(170.0, float(request.get("fov") or 45.0)))
         half_fov = math.radians(fov * 0.5)
-        dof_enabled = bool(request.get("dofEnabled", False))
+        dof_enabled = bool(request.get("dofEnabled", False)) and not is_ortho
         focus_distance = max(0.01, float(request.get("focusDistance") or 5.0))
         f_stop = max(0.1, float(request.get("fStop") or 5.6))
         distance = radius / sin_k * 1.15 * req_zoom
-        eye = center + forward * distance
+        ortho_half_height = max(1e-5, distance * math.tan(fit_half_fov))
+        ortho_half_width = ortho_half_height * aspect
+        scene_radius = self.scene_camera_anchor[1] if hasattr(self, "scene_camera_anchor") else radius
+        clip_radius = max(radius, scene_radius)
+        trans_reach = Gf.Vec3d(*cur_trans).GetLength() if cur_trans else 0.0
+        eye_distance = max(distance, clip_radius * 4.0 + trans_reach * 2.0, 1.0) if is_ortho else distance
+        eye = center + forward * eye_distance
         self.last_camera_basis = {
             "origin": (float(eye[0]), float(eye[1]), float(eye[2])),
             "forward": (float(-forward[0]), float(-forward[1]), float(-forward[2])),
             "right": (float(right[0]), float(right[1]), float(right[2])),
             "up": (float(camera_up[0]), float(camera_up[1]), float(camera_up[2])),
             "tan_half_fov": float(math.tan(half_fov)),
-            "aspect": float(width) / float(max(height, 1)),
+            "aspect": aspect,
+            "orthographic": is_ortho,
+            "ortho_half_height": float(ortho_half_height),
         }
-        matrix = Gf.Matrix4d().SetLookAt(eye, center, up).GetInverse()
+        matrix = Gf.Matrix4d().SetLookAt(eye, center, camera_up).GetInverse()
         self._last_camera_transform = usd_graph.decompose_camera_transform(
             matrix, self.current_usd_stage, Usd.TimeCode(float(request.get("frame", 0)))
         )
-        horizontal_aperture = 36.0 * width / height
-        vertical_aperture = 36.0
+        persp_h_aperture = 36.0 * aspect
+        persp_v_aperture = 36.0
         focal_length = 36.0 / (2 * math.tan(half_fov))
+        ortho_h_aperture = 20.0 * ortho_half_width
+        ortho_v_aperture = 20.0 * ortho_half_height
+        horizontal_aperture = ortho_h_aperture if is_ortho else persp_h_aperture
+        vertical_aperture = ortho_v_aperture if is_ortho else persp_v_aperture
         effective_f_stop = f_stop if dof_enabled else 0.0
-        scene_radius = self.scene_camera_anchor[1] if hasattr(self, "scene_camera_anchor") else radius
-        clip_radius = max(radius, scene_radius)
-        near_clip = max(1e-4, min(clip_radius * 0.001, distance * 0.001))
-        far_clip = max(distance * 100.0, clip_radius * 100.0, near_clip * 1000.0)
+        near_clip = max(1e-4, min(clip_radius * 0.001, eye_distance * 0.001))
+        far_clip = max(eye_distance * 100.0, clip_radius * 100.0, trans_reach * 10.0, near_clip * 1000.0)
         return {
+            "projection": projection,
+            "is_ortho": is_ortho,
             "matrix": matrix,
             "horizontal_aperture": horizontal_aperture,
             "vertical_aperture": vertical_aperture,
+            "persp_horizontal_aperture": persp_h_aperture,
+            "persp_vertical_aperture": persp_v_aperture,
+            "ortho_horizontal_aperture": ortho_h_aperture,
+            "ortho_vertical_aperture": ortho_v_aperture,
             "focal_length": focal_length,
             "focus_distance": focus_distance,
             "f_stop": effective_f_stop,
@@ -773,17 +804,33 @@ class OvrtxViewport:
     def _update_camera(self, stage, request, width, height):
         cam_params = self._compute_camera_params(request, width, height)
         camera = UsdGeom.Camera.Define(stage, "/Render/Camera")
+        camera.CreateProjectionAttr().Set(UsdGeom.Tokens.perspective)
         camera.MakeMatrixXform().Set(cam_params["matrix"])
-        camera.CreateHorizontalApertureAttr().Set(cam_params["horizontal_aperture"])
-        camera.CreateVerticalApertureAttr().Set(cam_params["vertical_aperture"])
+        camera.CreateHorizontalApertureAttr().Set(cam_params["persp_horizontal_aperture"])
+        camera.CreateVerticalApertureAttr().Set(cam_params["persp_vertical_aperture"])
         camera.CreateFocalLengthAttr().Set(cam_params["focal_length"])
         camera.CreateFocusDistanceAttr().Set(cam_params["focus_distance"])
         camera.CreateFStopAttr().Set(cam_params["f_stop"])
+        camera.CreateClippingRangeAttr().Set(cam_params["clipping_range"])
+
+        ortho_cam = UsdGeom.Camera.Define(stage, "/Render/OrthoCamera")
+        ortho_cam.CreateProjectionAttr().Set(UsdGeom.Tokens.orthographic)
+        ortho_cam.MakeMatrixXform().Set(cam_params["matrix"])
+        ortho_cam.CreateHorizontalApertureAttr().Set(cam_params["ortho_horizontal_aperture"])
+        ortho_cam.CreateVerticalApertureAttr().Set(cam_params["ortho_vertical_aperture"])
+        ortho_cam.CreateFocalLengthAttr().Set(cam_params["focal_length"])
+        ortho_cam.CreateFocusDistanceAttr().Set(cam_params["focus_distance"])
+        ortho_cam.CreateFStopAttr().Set(0.0)
+        ortho_cam.CreateClippingRangeAttr().Set(cam_params["clipping_range"])
+
         product_prim = stage.GetPrimAtPath("/Render/RenderProduct_Viewport")
         if product_prim and product_prim.IsValid():
             product_prim.CreateAttribute("omni:rtx:post:dof:enabled", Sdf.ValueTypeNames.Bool, custom=False).Set(cam_params["dof_enabled"])
             product_prim.CreateAttribute("omni:rtx:post:dof:overrideEnabled", Sdf.ValueTypeNames.Bool, custom=False).Set(cam_params["dof_enabled"])
-        camera.CreateClippingRangeAttr().Set(cam_params["clipping_range"])
+        ortho_product = stage.GetPrimAtPath("/Render/RenderProduct_ViewportOrtho")
+        if ortho_product and ortho_product.IsValid():
+            ortho_product.CreateAttribute("omni:rtx:post:dof:enabled", Sdf.ValueTypeNames.Bool, custom=False).Set(False)
+            ortho_product.CreateAttribute("omni:rtx:post:dof:overrideEnabled", Sdf.ValueTypeNames.Bool, custom=False).Set(False)
 
     def _read_pick_hit(self, frame):
         render_vars = frame.render_vars
@@ -828,10 +875,11 @@ class OvrtxViewport:
         if self.overlay_handle is not None:
             ovstage.population.remove_usd(self.stage, self.overlay_handle)
             self.overlay_handle = None
-        if new_path:
-            self.overlay_handle = ovstage.population.add_usd_reference(self.stage, new_path, "/")
         self.ordinal += 1
-        ovstage.population.apply_usd_changes(self.stage, ordinal=self.ordinal)
+        wrapper = Sdf.Layer.CreateAnonymous("viewport-composed-overlay.usda")
+        wrapper.subLayerPaths = ([new_path] if new_path else []) + [self.temp_usd_path]
+        ovstage.population.open_usd_from_string(self.stage, wrapper.ExportToString(), ordinal=self.ordinal,
+            time=getattr(self, "_population_sample", 0.0) / max(1e-5, self.current_usd_stage.GetTimeCodesPerSecond()))
         self.stage.compute_hierarchy(self.ordinal, self.ordinal,
             model=ovstage.HierarchyComputationModel.CPU_INCREMENTAL)
         self.stage.advance_write_floor(self.ordinal).wait()
@@ -845,19 +893,20 @@ class OvrtxViewport:
     def _write_pt_samples_per_pixel(self, target_spp):
         self.ordinal += 1
         with ovstage.PathDictionary(self.stage) as paths:
-            prod_plist = paths.create_path_list_from_strings(["/Render/RenderProduct_Viewport"])
-            try:
-                prod_query = self.stage.query_from_path_list(prod_plist)
-                self.stage.write_attribute(
-                    prod_query,
-                    "omni:rtx:pt:samplesPerPixel",
-                    self.ordinal,
-                    np.asarray([target_spp], dtype=np.uint32),
-                    is_array=False,
-                    semantic=0,
-                ).wait()
-            finally:
-                paths.destroy_path_list(prod_plist)
+            for prod_path in _VIEWPORT_PRODUCTS:
+                prod_plist = paths.create_path_list_from_strings([prod_path])
+                try:
+                    prod_query = self.stage.query_from_path_list(prod_plist)
+                    self.stage.write_attribute(
+                        prod_query,
+                        "omni:rtx:pt:samplesPerPixel",
+                        self.ordinal,
+                        np.asarray([target_spp], dtype=np.uint32),
+                        is_array=False,
+                        semantic=0,
+                    ).wait()
+                finally:
+                    paths.destroy_path_list(prod_plist)
         self.stage.compute_hierarchy(
             self.ordinal,
             self.ordinal,
@@ -1098,6 +1147,8 @@ class OvrtxViewport:
             up = np.asarray(basis["up"], dtype=np.float32)
             tan_hf = max(1.0e-5, float(basis["tan_half_fov"]))
             aspect = max(1.0e-5, float(basis["aspect"]))
+            is_ortho_mask = bool(basis.get("orthographic"))
+            ortho_hh = max(1.0e-5, float(basis.get("ortho_half_height", 1.0)))
 
             mask_buf = None
             for prim in prims:
@@ -1132,8 +1183,12 @@ class OvrtxViewport:
                 rel = rel[in_front]
                 z = z[in_front]
                 sw = sw[in_front]
-                nx = (rel @ right) / (z * tan_hf * aspect)
-                ny = (rel @ up) / (z * tan_hf)
+                if is_ortho_mask:
+                    nx = (rel @ right) / (ortho_hh * aspect)
+                    ny = (rel @ up) / ortho_hh
+                else:
+                    nx = (rel @ right) / (z * tan_hf * aspect)
+                    ny = (rel @ up) / (z * tan_hf)
                 in_view = (nx >= -1.02) & (nx <= 1.02) & (ny >= -1.02) & (ny <= 1.02)
                 if not np.any(in_view):
                     continue
@@ -1521,6 +1576,47 @@ class OvrtxViewport:
             self._swap_pose_overlay(updates, apply_changes=True)
         return True
 
+    def _try_fast_transform_overlay(self, previous, graph, frame):
+        live = self.live_transforms
+        changed = usd_graph.transform_only_node(previous, graph, live)
+        if changed is None or not live.get(changed["id"]) or self.current_usd_stage is None:
+            return False
+        attrs = [self.current_usd_stage.GetAttributeAtPath(attr.GetPath()) for attr in live[changed["id"]]]
+        if any(not attr for attr in attrs):
+            return False
+        matrix = usd_graph._build_transform_matrix(changed.get("transform"))
+        # CPU opinions are private. Only these recorded node ops and their orders
+        # change; no geometry, namespace, references or material bindings are copied.
+        overlay = Sdf.Layer.CreateAnonymous("viewport-transform.usda")
+        if self.overlay_path:
+            overlay.TransferContent(Sdf.Layer.FindOrOpen(self.overlay_path))
+        for attr in attrs:
+            with Usd.EditContext(self.current_usd_stage, self.current_usd_stage.GetSessionLayer()):
+                attr.Set(matrix)
+            prim = attr.GetPrim()
+            spec = Sdf.CreatePrimInLayer(overlay, prim.GetPath())
+            spec.specifier = Sdf.SpecifierOver
+            value = Sdf.AttributeSpec(spec, attr.GetName(), Sdf.ValueTypeNames.Matrix4d)
+            value.default = matrix
+            from pxr import Vt
+            order = Sdf.AttributeSpec(spec, "xformOpOrder", Sdf.ValueTypeNames.TokenArray, Sdf.VariabilityUniform)
+            order.default = Vt.TokenArray(UsdGeom.Xformable(prim).GetXformOpOrderAttr().Get())
+        overlay.subLayerPaths = [self.temp_usd_path]
+        self.ordinal += 1
+        ovstage.population.open_usd_from_string(
+            self.stage, overlay.ExportToString(), ordinal=self.ordinal,
+            time=frame / max(1e-5, self.current_usd_stage.GetTimeCodesPerSecond()),
+        )
+        self.stage.compute_hierarchy(self.ordinal, self.ordinal,
+            model=ovstage.HierarchyComputationModel.CPU_INCREMENTAL)
+        self.stage.advance_write_floor(self.ordinal).wait()
+        self._flush_stage_pool()
+        self._transform_overlay_layer = overlay
+        self._pt_spp_at_one = True
+        self._pt_max_bounces = 8
+        self._pt_stall_count = 0
+        return True
+
     def _try_fast_pose_delta(self, prev_graph, new_graph, sample_frame):
         try:
             live_poses = getattr(self, "live_poses", None)
@@ -1566,8 +1662,9 @@ class OvrtxViewport:
                     if prev_overlay is not None:
                         overlay.TransferContent(prev_overlay)
                 tmp_stage = Usd.Stage.Open(overlay)
-                prod = UsdRender.Product.Define(tmp_stage, "/Render/RenderProduct_Viewport")
-                apply_postfx_to_render_product(prod.GetPrim(), new_cfg if new_cfg is not None else {})
+                for prod_path in _VIEWPORT_PRODUCTS:
+                    prod = UsdRender.Product.Define(tmp_stage, prod_path)
+                    apply_postfx_to_render_product(prod.GetPrim(), new_cfg if new_cfg is not None else {})
                 self._apply_material_delta(overlay)
                 return True
             except Exception as err:
@@ -1576,30 +1673,31 @@ class OvrtxViewport:
         try:
             self.ordinal += 1
             with ovstage.PathDictionary(self.stage) as paths:
-                prod_plist = paths.create_path_list_from_strings(["/Render/RenderProduct_Viewport"])
-                try:
-                    prod_query = self.stage.query_from_path_list(prod_plist)
-                    for name, kind, val in changed_specs:
-                        if kind == "bool":
-                            arr = np.asarray([bool(val)], dtype=np.bool_)
-                            sem = 0
-                        elif kind == "int":
-                            arr = np.asarray([int(val)], dtype=np.int32)
-                            sem = 0
-                        elif kind == "float":
-                            arr = np.asarray([float(val)], dtype=np.float32)
-                            sem = 0
-                        elif kind == "float3":
-                            arr = np.asarray([[val[0], val[1], val[2]]], dtype=np.float32)
-                            sem = 0
-                        elif kind == "color3f":
-                            arr = np.asarray([[val[0], val[1], val[2]]], dtype=np.float32)
-                            sem = ovstage.AttributeSemantic.COLOR
-                        else:
-                            return False
-                        self.stage.write_attribute(prod_query, name, self.ordinal, arr, is_array=False, semantic=sem).wait()
-                finally:
-                    paths.destroy_path_list(prod_plist)
+                for prod_path in _VIEWPORT_PRODUCTS:
+                    prod_plist = paths.create_path_list_from_strings([prod_path])
+                    try:
+                        prod_query = self.stage.query_from_path_list(prod_plist)
+                        for name, kind, val in changed_specs:
+                            if kind == "bool":
+                                arr = np.asarray([bool(val)], dtype=np.bool_)
+                                sem = 0
+                            elif kind == "int":
+                                arr = np.asarray([int(val)], dtype=np.int32)
+                                sem = 0
+                            elif kind == "float":
+                                arr = np.asarray([float(val)], dtype=np.float32)
+                                sem = 0
+                            elif kind == "float3":
+                                arr = np.asarray([[val[0], val[1], val[2]]], dtype=np.float32)
+                                sem = 0
+                            elif kind == "color3f":
+                                arr = np.asarray([[val[0], val[1], val[2]]], dtype=np.float32)
+                                sem = ovstage.AttributeSemantic.COLOR
+                            else:
+                                return False
+                            self.stage.write_attribute(prod_query, name, self.ordinal, arr, is_array=False, semantic=sem).wait()
+                    finally:
+                        paths.destroy_path_list(prod_plist)
             self.stage.advance_write_floor(self.ordinal).wait()
             return True
         except Exception as err:
@@ -1686,6 +1784,10 @@ class OvrtxViewport:
         Returns None to fall back to the full path whenever anything structural differs.
         """
         if not prev_graph or not new_graph or self.base_layer is None:
+            return None
+        # Instancer prototypes reference private upstream material snapshots. Recompile
+        # them before planning the ordinary full-stage material delta.
+        if any(n.get("operation") == "instancer" for n in new_graph.get("nodes", [])):
             return None
         if prev_graph.get("edges") != new_graph.get("edges"):
             return None
@@ -1903,6 +2005,7 @@ class OvrtxViewport:
             except Exception as hover_err:
                 sys.stderr.write(f"Native CUDA pop-up hover reblit failed: {hover_err}\n")
 
+        self._population_sample = float(request.get("frame", 0))
         t_scene_start = time.perf_counter()
         # 1. Compile or obtain the USD stage
         graph = request.get("graph")
@@ -1940,7 +2043,13 @@ class OvrtxViewport:
         editable_hair_id = usd_graph.editable_hair_node_id(graph, request.get("activeHairNodeId"))
         needs_hair_session = editable_hair_id is not None and editable_hair_id != self.prepared_hair_node_id
         scene_changed = switched_scene or self.temp_usd_path is None or needs_hair_session
-        camera_key = tuple(request.get(key) for key in ("yaw", "pitch", "zoom", "panX", "panY", "fov", "dofEnabled", "focusDistance", "fStop", "cameraSession", "frameFit", "frame", "frameTarget", "orbitPivotSeq", "upAxis", "transformGizmoNodeId"))
+        projection = str(request.get("projection") or "perspective")
+        if projection not in ("perspective", "orthographic"):
+            raise ValueError("Camera projection must be perspective or orthographic")
+        is_ortho = projection == "orthographic"
+        active_product = "/Render/RenderProduct_ViewportOrtho" if is_ortho else "/Render/RenderProduct_Viewport"
+        active_cam_path = "/Render/OrthoCamera" if is_ortho else "/Render/Camera"
+        camera_key = tuple(request.get(key) for key in ("yaw", "pitch", "zoom", "panX", "panY", "projection", "fov", "dofEnabled", "focusDistance", "fStop", "cameraSession", "frameFit", "frame", "frameTarget", "orbitPivotSeq", "upAxis", "transformGizmoNodeId"))
         camera_changed = camera_key != self.last_camera_key
         settled_from_interactive = (not interactive) and bool(getattr(self, "_last_interactive", False))
         size_changed = (width != self.last_width) or (height != self.last_height)
@@ -1992,6 +2101,7 @@ class OvrtxViewport:
             and not request.get("clearScene")
             and not needs_hair_session
             and not self.live_groom_modified
+            and self._transform_overlay_layer is None
             and self.current_usd_stage is not None
             and self.stage is not None
             and self.temp_usd_path
@@ -2075,6 +2185,18 @@ class OvrtxViewport:
                 self._pt_stall_count = 0
                 scene_changed = switched_scene = False
                 camera_changed = True
+        elif (
+            scene_changed and not needs_hair_session and not request.get("reload")
+            and not request.get("clearScene") and self.last_suffix == scene_suffix
+            and self._try_fast_transform_overlay(self.last_graph, graph, float(request.get("frame", 0)))
+        ):
+            self.last_outline_key = outline_key
+            self.last_graph_hash = graph_hash
+            self.last_static_scene_key = static_scene_key
+            self.last_graph = copy.deepcopy(graph)
+            self.last_update_kind = "transform-overlay"
+            scene_changed = False
+            camera_changed = True
         elif scene_changed and not self.live_groom_modified and editable_hair_id is None and graph_hash in self.stage_pool:
             cached = self.stage_pool[graph_hash]
             target_postfx = resolve_graph_postfx(graph)
@@ -2103,12 +2225,14 @@ class OvrtxViewport:
                 self.last_static_scene_key = static_scene_key
                 self.last_graph = graph
                 self.prepared_hair_node_id = None
+                self.live_transforms = {}
                 self.last_update_kind = "cache-hit"
                 scene_changed = False
         elif (
             scene_changed
             and not needs_hair_session
             and self.base_layer is not None
+            and self._transform_overlay_layer is None
             and self.last_suffix == scene_suffix
             and self.temp_usd_path
             and self.current_usd_stage is not None
@@ -2192,7 +2316,7 @@ class OvrtxViewport:
                 }
                 scene_changed = False
         if size_changed and not scene_changed and self.last_width is not None and (
-            self.overlay_path or not self.temp_usd_path or not os.path.isfile(self.temp_usd_path)
+            self._transform_overlay_layer is not None or self.overlay_path or not self.temp_usd_path or not os.path.isfile(self.temp_usd_path)
         ):
             scene_changed = True
         if scene_changed or not self.temp_usd_path:
@@ -2200,10 +2324,13 @@ class OvrtxViewport:
             compiled_mx_selections = {}
             self.live_poses = {}
             self.live_grooms = {}
+            self.live_transforms = {}
+            self._transform_overlay_layer = None
             self._ovrtx_skel_bindings = None
             if graph:
                 stage, self.graph_stages, self.graph_stats = usd_graph.compile_graph(
                     graph, request.get("reload", False), live_poses=self.live_poses, live_grooms=self.live_grooms,
+                    live_transforms=self.live_transforms,
                     mx_selections_out=compiled_mx_selections,
                     interactive_hair=editable_hair_id is not None,
                 )
@@ -2217,6 +2344,44 @@ class OvrtxViewport:
                 wrap_layer = Sdf.Layer.CreateAnonymous("ovrtx_source_wrap.usda")
                 wrap_layer.subLayerPaths.append(os.path.abspath(stage_path))
                 stage = Usd.Stage.Open(wrap_layer)
+                display_mat = Gf.Matrix4d(1)
+                comp = request.get("comparison")
+                if isinstance(comp, str):
+                    try:
+                        comp = json.loads(comp)
+                    except Exception:
+                        comp = None
+                used_comparison = False
+                if isinstance(comp, dict) and comp.get("handoff"):
+                    mat = comp.get("inverse")
+                    if (
+                        isinstance(mat, list)
+                        and len(mat) == 4
+                        and all(isinstance(r, list) and len(r) == 4 for r in mat)
+                    ):
+                        cand = Gf.Matrix4d(*[float(v) for r in mat for v in r])
+                        if abs(cand.GetDeterminant()) >= 1e-100:
+                            display_mat = cand
+                            used_comparison = True
+                if not used_comparison:
+                    rot = Gf.Matrix4d(1)
+                    if UsdGeom.GetStageUpAxis(source) == UsdGeom.Tokens.z:
+                        rot.SetRotate(Gf.Rotation(Gf.Vec3d(1, 0, 0), -90))
+                    mpu = float(UsdGeom.GetStageMetersPerUnit(source) or 1.0)
+                    if mpu <= 0.0:
+                        mpu = 1.0
+                    display_mat = Gf.Matrix4d().SetScale(mpu) * rot
+                if display_mat != Gf.Matrix4d(1):
+                    stage.SetEditTarget(wrap_layer)
+                    UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.y)
+                    UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+                    for root_child in stage.GetPseudoRoot().GetChildren():
+                        if root_child.IsA(UsdGeom.Xformable):
+                            xf = UsdGeom.Xformable(root_child)
+                            existing_ops = list(xf.GetOrderedXformOps())
+                            conv_op = xf.AddTransformOp(opSuffix="displayConvert")
+                            conv_op.Set(display_mat)
+                            xf.SetXformOpOrder([conv_op] + existing_ops)
                 self.graph_stages = [source, wrap_layer]
                 self.graph_stats = None
             else:
@@ -2297,50 +2462,58 @@ class OvrtxViewport:
                 if def_prim and def_prim.IsValid():
                     stage.OverridePrim(Sdf.Path('/Render/DefaultLights')).SetActive(False)
 
-            # Define / update Camera
+            # Define / update Cameras (perspective + orthographic)
             cam = UsdGeom.Camera.Define(stage, "/Render/Camera")
+            cam.CreateProjectionAttr().Set(UsdGeom.Tokens.perspective)
             cam.CreateClippingRangeAttr().Set((0.1, 100000.0))
-
-            # Define / update RenderProduct & RenderVar
-            product = UsdRender.Product.Define(stage, "/Render/RenderProduct_Viewport")
-            product.CreateResolutionAttr().Set(Gf.Vec2i(width, height))
-            product.CreatePixelAspectRatioAttr().Set(1.0)
-            product.CreateAspectRatioConformPolicyAttr().Set("adjustApertureHeight")
-            product.CreateCameraRel().SetTargets(["/Render/Camera"])
-            product_prim = product.GetPrim()
-            product_prim.CreateAttribute("omni:rtx:rendermode", Sdf.ValueTypeNames.Token, custom=False).Set(_RENDER_MODES[render_mode])
-            dof_enabled = bool(request.get("dofEnabled", False))
-            product_prim.CreateAttribute("omni:rtx:post:dof:enabled", Sdf.ValueTypeNames.Bool, custom=False).Set(dof_enabled)
-            product_prim.CreateAttribute("omni:rtx:post:dof:overrideEnabled", Sdf.ValueTypeNames.Bool, custom=False).Set(dof_enabled)
-            if render_mode == "realtime":
-                self._pt_spp_at_one = False
-                product_prim.CreateAttribute("omni:rtx:post:aa:op", Sdf.ValueTypeNames.Token, custom=False).Set("dlss")
-                product_prim.CreateAttribute("omni:rtx:post:dlss:execMode", Sdf.ValueTypeNames.Token, custom=False).Set("quality")
-                product_prim.CreateAttribute("omni:rtx:rt:sss:enabled", Sdf.ValueTypeNames.Bool, custom=False).Set(True)
-                product_prim.CreateAttribute("omni:rtx:translucency:enabled", Sdf.ValueTypeNames.Bool, custom=False).Set(True)
-                product_prim.CreateAttribute("omni:rtx:translucency:maxRefractionBounces", Sdf.ValueTypeNames.Int, custom=False).Set(8)
-                product_prim.CreateAttribute("omni:rtx:raytracing:fractionalCutoutOpacity", Sdf.ValueTypeNames.Bool, custom=False).Set(True)
-            else:
-                spp_per_iter = max(1, int(request.get("samples", 1)))
-                self._pt_spp_at_one = target_spp > 1
-                product_prim.CreateAttribute("omni:rtx:post:aa:op", Sdf.ValueTypeNames.Token, custom=False).Set("none")
-                product_prim.CreateAttribute("omni:rtx:pt:dlss:enabled", Sdf.ValueTypeNames.Bool, custom=False).Set(False)
-                product_prim.CreateAttribute("omni:rtx:pt:denoising:enabled", Sdf.ValueTypeNames.Bool, custom=False).Set(True)
-                product_prim.CreateAttribute("omni:rtx:pt:denoising:optix:temporal", Sdf.ValueTypeNames.Bool, custom=False).Set(False)
-                product_prim.CreateAttribute("omni:rtx:pt:limits:maxBounces", Sdf.ValueTypeNames.UInt, custom=False).Set(8)
-                product_prim.CreateAttribute("omni:rtx:pt:samplesPerIteration", Sdf.ValueTypeNames.Int, custom=False).Set(spp_per_iter)
-                product_prim.CreateAttribute("omni:rtx:pt:samplesPerPixel", Sdf.ValueTypeNames.UInt, custom=False).Set(1)
-                self._pt_max_bounces = 8
-
-            postfx_cfg = resolve_graph_postfx(graph)
-            # Always author PostFX attributes (defaults when no PostFX node) so live
-            # ovstage updates work immediately when adding/editing/removing a PostFX node.
-            apply_postfx_to_render_product(product_prim, postfx_cfg if postfx_cfg is not None else {})
+            ortho_cam = UsdGeom.Camera.Define(stage, "/Render/OrthoCamera")
+            ortho_cam.CreateProjectionAttr().Set(UsdGeom.Tokens.orthographic)
+            ortho_cam.CreateClippingRangeAttr().Set((0.1, 100000.0))
 
             var = UsdRender.Var.Define(stage, "/Render/RenderVar_LdrColor")
             var.CreateSourceNameAttr().Set("LdrColor")
             var.CreateDataTypeAttr().Set("color4f")
-            product.CreateOrderedVarsRel().SetTargets(["/Render/RenderVar_LdrColor"])
+
+            postfx_cfg = resolve_graph_postfx(graph)
+            dof_enabled = bool(request.get("dofEnabled", False))
+            if render_mode == "realtime":
+                self._pt_spp_at_one = False
+            else:
+                spp_per_iter = max(1, int(request.get("samples", 1)))
+                self._pt_spp_at_one = target_spp > 1
+                self._pt_max_bounces = 8
+
+            # Define / update RenderProducts for both projections so toggling Persp/Ortho is instant
+            for prod_path, cam_target, prod_dof in (
+                ("/Render/RenderProduct_Viewport", "/Render/Camera", dof_enabled),
+                ("/Render/RenderProduct_ViewportOrtho", "/Render/OrthoCamera", False),
+            ):
+                product = UsdRender.Product.Define(stage, prod_path)
+                product.CreateResolutionAttr().Set(Gf.Vec2i(width, height))
+                product.CreatePixelAspectRatioAttr().Set(1.0)
+                product.CreateAspectRatioConformPolicyAttr().Set("adjustApertureHeight")
+                product.CreateCameraRel().SetTargets([cam_target])
+                product_prim = product.GetPrim()
+                product_prim.CreateAttribute("omni:rtx:rendermode", Sdf.ValueTypeNames.Token, custom=False).Set(_RENDER_MODES[render_mode])
+                product_prim.CreateAttribute("omni:rtx:post:dof:enabled", Sdf.ValueTypeNames.Bool, custom=False).Set(prod_dof)
+                product_prim.CreateAttribute("omni:rtx:post:dof:overrideEnabled", Sdf.ValueTypeNames.Bool, custom=False).Set(prod_dof)
+                if render_mode == "realtime":
+                    product_prim.CreateAttribute("omni:rtx:post:aa:op", Sdf.ValueTypeNames.Token, custom=False).Set("dlss")
+                    product_prim.CreateAttribute("omni:rtx:post:dlss:execMode", Sdf.ValueTypeNames.Token, custom=False).Set("quality")
+                    product_prim.CreateAttribute("omni:rtx:rt:sss:enabled", Sdf.ValueTypeNames.Bool, custom=False).Set(True)
+                    product_prim.CreateAttribute("omni:rtx:translucency:enabled", Sdf.ValueTypeNames.Bool, custom=False).Set(True)
+                    product_prim.CreateAttribute("omni:rtx:translucency:maxRefractionBounces", Sdf.ValueTypeNames.Int, custom=False).Set(8)
+                    product_prim.CreateAttribute("omni:rtx:raytracing:fractionalCutoutOpacity", Sdf.ValueTypeNames.Bool, custom=False).Set(True)
+                else:
+                    product_prim.CreateAttribute("omni:rtx:post:aa:op", Sdf.ValueTypeNames.Token, custom=False).Set("none")
+                    product_prim.CreateAttribute("omni:rtx:pt:dlss:enabled", Sdf.ValueTypeNames.Bool, custom=False).Set(False)
+                    product_prim.CreateAttribute("omni:rtx:pt:denoising:enabled", Sdf.ValueTypeNames.Bool, custom=False).Set(True)
+                    product_prim.CreateAttribute("omni:rtx:pt:denoising:optix:temporal", Sdf.ValueTypeNames.Bool, custom=False).Set(False)
+                    product_prim.CreateAttribute("omni:rtx:pt:limits:maxBounces", Sdf.ValueTypeNames.UInt, custom=False).Set(8)
+                    product_prim.CreateAttribute("omni:rtx:pt:samplesPerIteration", Sdf.ValueTypeNames.Int, custom=False).Set(spp_per_iter)
+                    product_prim.CreateAttribute("omni:rtx:pt:samplesPerPixel", Sdf.ValueTypeNames.UInt, custom=False).Set(1)
+                apply_postfx_to_render_product(product_prim, postfx_cfg if postfx_cfg is not None else {})
+                product.CreateOrderedVarsRel().SetTargets(["/Render/RenderVar_LdrColor"])
 
             previous_path = self.temp_usd_path
             # Incremental path: when only material networks/bindings differ from what ovstage
@@ -2674,17 +2847,19 @@ class OvrtxViewport:
             old_resized_path = self.temp_usd_path
             temp_layer = Sdf.Layer.FindOrOpen(self.temp_usd_path)
             if temp_layer is not None:
-                rp = temp_layer.GetPrimAtPath("/Render/RenderProduct_Viewport")
-                if rp and "resolution" in rp.properties:
-                    rp.properties["resolution"].default = Gf.Vec2i(width, height)
-                if rp and render_mode == "pathTracing" and target_spp > 1 and "omni:rtx:pt:samplesPerPixel" in rp.properties:
-                    rp.properties["omni:rtx:pt:samplesPerPixel"].default = 1
+                for prod_path in _VIEWPORT_PRODUCTS:
+                    rp = temp_layer.GetPrimAtPath(prod_path)
+                    if rp and "resolution" in rp.properties:
+                        rp.properties["resolution"].default = Gf.Vec2i(width, height)
+                    if rp and render_mode == "pathTracing" and target_spp > 1 and "omni:rtx:pt:samplesPerPixel" in rp.properties:
+                        rp.properties["omni:rtx:pt:samplesPerPixel"].default = 1
                 new_resized_path = export_preview_snapshot(temp_layer)
                 self.temp_usd_path = new_resized_path
                 if self.base_layer is not None:
-                    rp_b = self.base_layer.GetPrimAtPath("/Render/RenderProduct_Viewport")
-                    if rp_b and "resolution" in rp_b.properties:
-                        rp_b.properties["resolution"].default = Gf.Vec2i(width, height)
+                    for prod_path in _VIEWPORT_PRODUCTS:
+                        rp_b = self.base_layer.GetPrimAtPath(prod_path)
+                        if rp_b and "resolution" in rp_b.properties:
+                            rp_b.properties["resolution"].default = Gf.Vec2i(width, height)
                 del temp_layer
                 if old_resized_path and old_resized_path != new_resized_path and os.path.isfile(old_resized_path):
                     try:
@@ -2750,7 +2925,7 @@ class OvrtxViewport:
             size_changed = False
             update_cam_aperture = True
         else:
-            update_cam_aperture = size_changed
+            update_cam_aperture = size_changed or is_ortho or (projection != getattr(self, "_last_projection", None))
 
         if (
             not scene_changed
@@ -2767,7 +2942,7 @@ class OvrtxViewport:
             # Never replace the retained USD population source with a camera-only
             # document: future hierarchy updates must still see the full scene.
             with ovstage.PathDictionary(self.stage) as paths:
-                cam_plist = paths.create_path_list_from_strings(["/Render/Camera"])
+                cam_plist = paths.create_path_list_from_strings([active_cam_path])
                 try:
                     cam_query = self.stage.query_from_path_list(cam_plist)
                     self.stage.write_attribute(cam_query, "omni:xform", self.ordinal,
@@ -2796,23 +2971,25 @@ class OvrtxViewport:
                             is_array=False, semantic=0).wait()
                 finally:
                     paths.destroy_path_list(cam_plist)
-                prod_plist = paths.create_path_list_from_strings(["/Render/RenderProduct_Viewport"])
-                try:
-                    prod_query = self.stage.query_from_path_list(prod_plist)
-                    if size_changed:
-                        self.stage.write_attribute(prod_query, "resolution", self.ordinal,
-                            np.asarray([[width, height]], dtype=np.int32), is_array=False, semantic=0).wait()
-                        if render_mode == "pathTracing" and target_spp > 1 and not getattr(self, "_pt_spp_at_one", False):
-                            self.stage.write_attribute(prod_query, "omni:rtx:pt:samplesPerPixel", self.ordinal,
-                                np.asarray([1], dtype=np.uint32), is_array=False, semantic=0).wait()
-                            self._pt_spp_at_one = True
-                    dof_enabled = cam_params["dof_enabled"]
-                    self.stage.write_attribute(prod_query, "omni:rtx:post:dof:enabled", self.ordinal,
-                        np.asarray([dof_enabled], dtype=np.bool_), is_array=False, semantic=0).wait()
-                    self.stage.write_attribute(prod_query, "omni:rtx:post:dof:overrideEnabled", self.ordinal,
-                        np.asarray([dof_enabled], dtype=np.bool_), is_array=False, semantic=0).wait()
-                finally:
-                    paths.destroy_path_list(prod_plist)
+                for prod_path in _VIEWPORT_PRODUCTS:
+                    prod_plist = paths.create_path_list_from_strings([prod_path])
+                    try:
+                        prod_query = self.stage.query_from_path_list(prod_plist)
+                        if size_changed:
+                            self.stage.write_attribute(prod_query, "resolution", self.ordinal,
+                                np.asarray([[width, height]], dtype=np.int32), is_array=False, semantic=0).wait()
+                            if render_mode == "pathTracing" and target_spp > 1 and not getattr(self, "_pt_spp_at_one", False):
+                                self.stage.write_attribute(prod_query, "omni:rtx:pt:samplesPerPixel", self.ordinal,
+                                    np.asarray([1], dtype=np.uint32), is_array=False, semantic=0).wait()
+                        prod_dof = cam_params["dof_enabled"] if prod_path == "/Render/RenderProduct_Viewport" else False
+                        self.stage.write_attribute(prod_query, "omni:rtx:post:dof:enabled", self.ordinal,
+                            np.asarray([prod_dof], dtype=np.bool_), is_array=False, semantic=0).wait()
+                        self.stage.write_attribute(prod_query, "omni:rtx:post:dof:overrideEnabled", self.ordinal,
+                            np.asarray([prod_dof], dtype=np.bool_), is_array=False, semantic=0).wait()
+                    finally:
+                        paths.destroy_path_list(prod_plist)
+                if size_changed and render_mode == "pathTracing" and target_spp > 1:
+                    self._pt_spp_at_one = True
             phase("computing transform hierarchy", timeout=60, report=False)
             self.stage.compute_hierarchy(
                 self.ordinal,
@@ -2821,6 +2998,7 @@ class OvrtxViewport:
             )
             self.stage.advance_write_floor(self.ordinal).wait()
         self.last_camera_key = camera_key
+        self._last_projection = projection
         self.last_width, self.last_height = width, height
 
         # 2. Update selection outline if requested
@@ -2882,7 +3060,7 @@ class OvrtxViewport:
         scene_ms = (time.perf_counter() - t_scene_start) * 1000
         t_step_start = time.perf_counter()
         # 3. Step the Omniverse RTX renderer
-        products = {"/Render/RenderProduct_Viewport"}
+        products = {active_product}
 
         # Enqueue pick query if requested (e.g. Ctrl+click on viewport)
         pick_coord = request.get("pick")
@@ -2895,7 +3073,7 @@ class OvrtxViewport:
                 t = max(0.0, min(0.999, v - half_h))
                 r = max(0.001, min(1.0, u + half_w))
                 b = max(0.001, min(1.0, v + half_h))
-                self.renderer.enqueue_pick_query("/Render/RenderProduct_Viewport", l, t, r, b)
+                self.renderer.enqueue_pick_query(active_product, l, t, r, b)
             except Exception as e:
                 sys.stderr.write(f"Ovrtx enqueue pick query error: {e}\n")
 
@@ -3062,9 +3240,10 @@ class OvrtxViewport:
                             if w_val is not None:
                                 dc.CreateWidthsAttr().Set(w_val)
                     if self.base_layer is not None:
-                        rp_b = self.base_layer.GetPrimAtPath("/Render/RenderProduct_Viewport")
-                        if rp_b and "resolution" in rp_b.properties:
-                            rp_b.properties["resolution"].default = _Gf_t.Vec2i(width, height)
+                        for prod_path in _VIEWPORT_PRODUCTS:
+                            rp_b = self.base_layer.GetPrimAtPath(prod_path)
+                            if rp_b and "resolution" in rp_b.properties:
+                                rp_b.properties["resolution"].default = _Gf_t.Vec2i(width, height)
                     target_stage = base_stage if base_stage is not None else self.current_usd_stage
                     self._update_camera(target_stage, request, width, height)
                     flat = self.base_layer if self.base_layer is not None else target_stage.Flatten()
@@ -3298,19 +3477,20 @@ class OvrtxViewport:
         if render_mode == "pathTracing" and self.stage is not None and getattr(self, "_pt_max_bounces", 4) != desired_bounces:
             self.ordinal += 1
             with ovstage.PathDictionary(self.stage) as paths:
-                prod_plist = paths.create_path_list_from_strings(["/Render/RenderProduct_Viewport"])
-                try:
-                    prod_query = self.stage.query_from_path_list(prod_plist)
-                    self.stage.write_attribute(
-                        prod_query,
-                        "omni:rtx:pt:limits:maxBounces",
-                        self.ordinal,
-                        np.asarray([desired_bounces], dtype=np.uint32),
-                        is_array=False,
-                        semantic=0,
-                    ).wait()
-                finally:
-                    paths.destroy_path_list(prod_plist)
+                for prod_path in _VIEWPORT_PRODUCTS:
+                    prod_plist = paths.create_path_list_from_strings([prod_path])
+                    try:
+                        prod_query = self.stage.query_from_path_list(prod_plist)
+                        self.stage.write_attribute(
+                            prod_query,
+                            "omni:rtx:pt:limits:maxBounces",
+                            self.ordinal,
+                            np.asarray([desired_bounces], dtype=np.uint32),
+                            is_array=False,
+                            semantic=0,
+                        ).wait()
+                    finally:
+                        paths.destroy_path_list(prod_plist)
             self.stage.compute_hierarchy(
                 self.ordinal,
                 self.ordinal,
@@ -3336,23 +3516,32 @@ class OvrtxViewport:
             if pick_pending:
                 # Pick hits are attached only to the step immediately after the
                 # query was enqueued; read them before further steps replace it.
-                picked_prim = self._read_pick_hit(result["/Render/RenderProduct_Viewport"].frames[0])
+                picked_prim = self._read_pick_hit(result[active_product].frames[0])
                 hit_mesh_path = None
                 hit_face_index = None
                 if picked_prim and self.current_usd_stage and hasattr(self, "last_camera_basis") and isinstance(pick_coord, (list, tuple)) and len(pick_coord) == 2:
                     cb = self.last_camera_basis
                     u_p = float(pick_coord[0])
                     v_p = float(pick_coord[1])
-                    sx = (u_p * 2.0 - 1.0) * float(cb["tan_half_fov"]) * float(cb["aspect"])
-                    sy = (1.0 - v_p * 2.0) * float(cb["tan_half_fov"])
                     fwd = cb["forward"]
                     rgt = cb["right"]
                     upv = cb["up"]
-                    rdir = (fwd[0] + rgt[0] * sx + upv[0] * sy, fwd[1] + rgt[1] * sx + upv[1] * sy, fwd[2] + rgt[2] * sx + upv[2] * sy)
+                    if cb.get("orthographic"):
+                        ortho_hh = float(cb.get("ortho_half_height", 1.0))
+                        ox = (u_p * 2.0 - 1.0) * ortho_hh * float(cb["aspect"])
+                        oy = (1.0 - v_p * 2.0) * ortho_hh
+                        orig = cb["origin"]
+                        rorig = (orig[0] + rgt[0] * ox + upv[0] * oy, orig[1] + rgt[1] * ox + upv[1] * oy, orig[2] + rgt[2] * ox + upv[2] * oy)
+                        rdir = fwd
+                    else:
+                        sx = (u_p * 2.0 - 1.0) * float(cb["tan_half_fov"]) * float(cb["aspect"])
+                        sy = (1.0 - v_p * 2.0) * float(cb["tan_half_fov"])
+                        rorig = cb["origin"]
+                        rdir = (fwd[0] + rgt[0] * sx + upv[0] * sy, fwd[1] + rgt[1] * sx + upv[1] * sy, fwd[2] + rgt[2] * sx + upv[2] * sy)
                     hit = raycast_prim_hit(
                         self.current_usd_stage,
                         picked_prim,
-                        cb["origin"],
+                        rorig,
                         rdir,
                         float(request.get("frame", 0)),
                     )
@@ -3368,7 +3557,7 @@ class OvrtxViewport:
                         face_index=hit_face_index,
                     )
                 pick_pending = False
-            if render_mode == "pathTracing" and bool(result["/Render/RenderProduct_Viewport"].frames[0].converged):
+            if render_mode == "pathTracing" and bool(result[active_product].frames[0].converged):
                 break
             if not (switched_scene and self.last_update_kind in ("material-delta", "material-delta-fast")) and (time.perf_counter() - t_step_start) >= 1.5:
                 break
@@ -3382,7 +3571,7 @@ class OvrtxViewport:
         step_ms = (time.perf_counter() - t_step_start) * 1000
         t_capture_start = time.perf_counter()
         # 4. Extract pixel tensor and read back to CPU
-        frame = result["/Render/RenderProduct_Viewport"].frames[0]
+        frame = result[active_product].frames[0]
 
         render_var = frame.render_vars["/Render/RenderVar_LdrColor"]
         current_samples = int(frame.progression)
@@ -3574,6 +3763,7 @@ class OvrtxViewport:
             self._flush_stage_pool()
         pose_camera_params = self._compute_camera_params(request, width, height)
         pose_camera = Gf.Camera()
+        pose_camera.projection = Gf.Camera.Orthographic if pose_camera_params["is_ortho"] else Gf.Camera.Perspective
         pose_camera.transform = pose_camera_params["matrix"]
         pose_camera.horizontalAperture = pose_camera_params["horizontal_aperture"]
         pose_camera.verticalAperture = pose_camera_params["vertical_aperture"]
@@ -3582,6 +3772,7 @@ class OvrtxViewport:
         pose_vp = pose_camera.frustum.ComputeViewMatrix() * pose_camera.frustum.ComputeProjectionMatrix()
         response = {
             "width": width,
+            "projection": projection,
             "viewProjection": [list(row) for row in pose_vp],
             "poseBones": live_pose_bones,
             "height": height,
@@ -3592,6 +3783,8 @@ class OvrtxViewport:
             "updateKind": self.last_update_kind,
             "gpu": "NVIDIA RTX",
             "converged": converged,
+            "instancerHandles": usd_graph.instancer_handles(self.current_usd_stage, request.get("frame", 0)) if graph and any(n.get('operation') == 'instancer' for n in graph.get('nodes', [])) else [],
+            "pickedObject": usd_graph.instancer_pick_target(self.current_usd_stage, picked_prim, request.get("frame", 0)) if picked_prim and graph and any(n.get('operation') == 'instancer' for n in graph.get('nodes', [])) else None,
             "pickedPrim": picked_prim,
             "pickedMaterial": picked_material,
             "pickedPoint": picked_point,

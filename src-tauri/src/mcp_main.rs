@@ -4,6 +4,7 @@ mod application;
 mod application_profiles;
 mod dependency_search;
 mod desktop_bridge;
+mod megascans;
 mod project;
 mod runtime_setup;
 mod usd;
@@ -113,6 +114,7 @@ fn definitions() -> Vec<Value> {
                 "width":{"type":"integer"},"height":{"type":"integer"},
                 "yaw":{"type":"number"},"pitch":{"type":"number"},
                 "panX":{"type":"number"},"panY":{"type":"number"},"zoom":{"type":"number"},
+                "projection":s,"fov":{"type":"number"},"upAxis":s,
                 "cameraSession":s,"frameFit":{"type":"integer"},
                 "interactive":{"type":"boolean"},"transformGizmoNodeId":s,
                 "pick":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2},

@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { viewportGraphContext } from "../src/viewportGraph.ts";
 import { LatestRenderQueue, previewSize } from "../src/renderQueue.ts";
 const settled = () => new Promise((resolve) => setImmediate(resolve));
 function fixture() {
@@ -167,4 +168,40 @@ test("interactive resolution preserves aspect and release restores display resol
     height: 1080,
   });
   assert.deepEqual(previewSize(400, 200, true), { width: 400, height: 200 });
+});
+
+
+test("continuous graph transform updates present moving frames before pointer release", async () => {
+  const f = fixture();
+  const graph = x => JSON.stringify({targetNodeId:"out", nodes:[
+    {id:"move", operation:"transform", transform:{translation:[x,0,0]}, transformTargets:[{pattern:"/Scene/Box"}]},
+    {id:"out",operation:"output"}], edges:[{id:"edge",source:"move",target:"out"}]});
+  const enqueue = (x, interactive) => f.queue.enqueue(viewportGraphContext(graph(x)), {graph:graph(x),interactive});
+  enqueue(1, true);
+  f.tick();
+  for (let x=2; x<=50; x++) enqueue(x,true);
+  f.renders[0].resolve("prim at 1 while dragging");
+  await settled();
+  assert.deepEqual(f.frames,["prim at 1 while dragging"]);
+  f.tick();
+  assert.equal(JSON.parse(f.renders[1].request.graph).nodes[0].transform.translation[0],50);
+  enqueue(51,false);
+  f.renders[1].resolve("prim at 50 while dragging");
+  await settled();
+  f.tick();
+  assert.equal(f.renders[2].request.interactive,false);
+  f.renders[2].resolve("prim at 51 after release");
+  await settled();
+  assert.deepEqual(f.frames,["prim at 1 while dragging","prim at 50 while dragging","prim at 51 after release"]);
+});
+
+test("changing transform target paths invalidates in-flight images", async () => {
+  const f = fixture();
+  const graph = pattern => JSON.stringify({nodes:[{id:"move",operation:"transform",transformTargets:[{pattern}]}]});
+  f.queue.enqueue(viewportGraphContext(graph("/Scene/A")),1);
+  f.tick();
+  f.queue.enqueue(viewportGraphContext(graph("/Scene/B")),2);
+  f.renders[0].resolve("wrong target");
+  await settled();
+  assert.deepEqual(f.frames,[]);
 });

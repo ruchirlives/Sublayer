@@ -57,3 +57,11 @@ test("new node scopes default to supported capabilities only, without mutating e
  assert.deepEqual(defaultEditScope(profile),["points","materials"]);assert.deepEqual(defaultEditScope(undefined),[]);
  const existing={editScope:[],nativeImport:{policy:{editScope:[]}}};defaultEditScope(profile);assert.deepEqual(existing.editScope,[]);assert.deepEqual(existing.nativeImport.policy.editScope,[]);
 });
+
+test("library settings preserve multiple folders and reject invalid ports",()=>{
+ const catalog=defaults();
+ catalog.megascansLibrary={libraryRoot:"I:/EpicGames/Megascans",downloadsDirs:["M:/Desktop/Downloads","I:/Downloads"],socketEnabled:false,socketPort:24981};
+ assert.deepEqual(parseApplicationCatalog(JSON.stringify(catalog)).megascansLibrary,catalog.megascansLibrary);
+ catalog.megascansLibrary.socketPort=65536;
+ assert.throws(()=>parseApplicationCatalog(JSON.stringify(catalog)),/library settings/);
+});

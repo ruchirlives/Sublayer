@@ -996,34 +996,58 @@ def step_hair_brush(
 
     tan_half_fov = float(cam_basis.get("tan_half_fov", 0.4142))
     aspect = float(cam_basis.get("aspect", 1.3333))
+    is_ortho_cam = bool(cam_basis.get("orthographic"))
+    ortho_hh = float(cam_basis.get("ortho_half_height", 1.0))
     eye = cam_basis["origin"]
     fwd = cam_basis["forward"]
     right = cam_basis["right"]
     up = cam_basis["up"]
 
     # Ray through current cursor (nx, ny in [0, 1] top-left origin) and previous cursor for stroke start
-    sx = (nx * 2.0 - 1.0) * tan_half_fov * aspect
-    sy = (1.0 - ny * 2.0) * tan_half_fov
-    rx = fwd[0] + right[0] * sx + up[0] * sy
-    ry = fwd[1] + right[1] * sx + up[1] * sy
-    rz = fwd[2] + right[2] * sx + up[2] * sy
-    rlen = max((rx * rx + ry * ry + rz * rz) ** 0.5, 1e-8)
+    if is_ortho_cam:
+        ox = (nx * 2.0 - 1.0) * ortho_hh * aspect
+        oy = (1.0 - ny * 2.0) * ortho_hh
+        pox = (prev_nx * 2.0 - 1.0) * ortho_hh * aspect
+        poy = (1.0 - prev_ny * 2.0) * ortho_hh
+        flen = max((fwd[0] * fwd[0] + fwd[1] * fwd[1] + fwd[2] * fwd[2]) ** 0.5, 1e-8)
+        fdir = (fwd[0] / flen, fwd[1] / flen, fwd[2] / flen)
+        base_ray_origin = wp.vec3(
+            float(eye[0] + right[0] * ox + up[0] * oy),
+            float(eye[1] + right[1] * ox + up[1] * oy),
+            float(eye[2] + right[2] * ox + up[2] * oy),
+        )
+        base_prev_ray_origin = wp.vec3(
+            float(eye[0] + right[0] * pox + up[0] * poy),
+            float(eye[1] + right[1] * pox + up[1] * poy),
+            float(eye[2] + right[2] * pox + up[2] * poy),
+        )
+        base_ray_dir = wp.vec3(float(fdir[0]), float(fdir[1]), float(fdir[2]))
+        base_prev_ray_dir = base_ray_dir
+    else:
+        sx = (nx * 2.0 - 1.0) * tan_half_fov * aspect
+        sy = (1.0 - ny * 2.0) * tan_half_fov
+        rx = fwd[0] + right[0] * sx + up[0] * sy
+        ry = fwd[1] + right[1] * sx + up[1] * sy
+        rz = fwd[2] + right[2] * sx + up[2] * sy
+        rlen = max((rx * rx + ry * ry + rz * rz) ** 0.5, 1e-8)
 
-    psx = (prev_nx * 2.0 - 1.0) * tan_half_fov * aspect
-    psy = (1.0 - prev_ny * 2.0) * tan_half_fov
-    prx = fwd[0] + right[0] * psx + up[0] * psy
-    pry = fwd[1] + right[1] * psx + up[1] * psy
-    prz = fwd[2] + right[2] * psx + up[2] * psy
-    prlen = max((prx * prx + pry * pry + prz * prz) ** 0.5, 1e-8)
+        psx = (prev_nx * 2.0 - 1.0) * tan_half_fov * aspect
+        psy = (1.0 - prev_ny * 2.0) * tan_half_fov
+        prx = fwd[0] + right[0] * psx + up[0] * psy
+        pry = fwd[1] + right[1] * psx + up[1] * psy
+        prz = fwd[2] + right[2] * psx + up[2] * psy
+        prlen = max((prx * prx + pry * pry + prz * prz) ** 0.5, 1e-8)
+
+        base_ray_origin = wp.vec3(float(eye[0]), float(eye[1]), float(eye[2]))
+        base_prev_ray_origin = base_ray_origin
+        base_ray_dir = wp.vec3(rx / rlen, ry / rlen, rz / rlen)
+        base_prev_ray_dir = wp.vec3(prx / prlen, pry / prlen, prz / prlen)
 
     base_eye = eye
     base_fwd = fwd
     base_right = right
     base_up = up
     base_cam_basis = cam_basis
-    base_ray_origin = wp.vec3(float(eye[0]), float(eye[1]), float(eye[2]))
-    base_ray_dir = wp.vec3(rx / rlen, ry / rlen, rz / rlen)
-    base_prev_ray_dir = wp.vec3(prx / prlen, pry / prlen, prz / prlen)
 
     radius_m = max(0.01, float(brush.get("radius", 0.15)))
     strength = max(0.0, min(5.0, float(brush.get("strength", 1.0))))
@@ -1066,6 +1090,7 @@ def step_hair_brush(
         right = base_right
         up = base_up
         ray_origin = base_ray_origin
+        prev_ray_origin = base_prev_ray_origin
         ray_dir = base_ray_dir
         prev_ray_dir = base_prev_ray_dir
         cam_basis = base_cam_basis
@@ -1076,16 +1101,20 @@ def step_hair_brush(
             if pinned_l2w != hair_l2w:
                 m_p2h = pinned_l2w.GetInverse() * hair_l2w
                 pe = m_p2h.Transform(Gf.Vec3d(float(base_eye[0]), float(base_eye[1]), float(base_eye[2])))
+                pro = m_p2h.Transform(Gf.Vec3d(float(base_ray_origin[0]), float(base_ray_origin[1]), float(base_ray_origin[2])))
+                ppro = m_p2h.Transform(Gf.Vec3d(float(base_prev_ray_origin[0]), float(base_prev_ray_origin[1]), float(base_prev_ray_origin[2])))
                 pf = m_p2h.TransformDir(Gf.Vec3d(float(base_fwd[0]), float(base_fwd[1]), float(base_fwd[2]))).GetNormalized()
                 pr = m_p2h.TransformDir(Gf.Vec3d(float(base_right[0]), float(base_right[1]), float(base_right[2]))).GetNormalized()
                 pu = m_p2h.TransformDir(Gf.Vec3d(float(base_up[0]), float(base_up[1]), float(base_up[2]))).GetNormalized()
                 prd = m_p2h.TransformDir(Gf.Vec3d(float(base_ray_dir[0]), float(base_ray_dir[1]), float(base_ray_dir[2]))).GetNormalized()
                 pprd = m_p2h.TransformDir(Gf.Vec3d(float(base_prev_ray_dir[0]), float(base_prev_ray_dir[1]), float(base_prev_ray_dir[2]))).GetNormalized()
+                p_ortho_hh = float(m_p2h.TransformDir(Gf.Vec3d(float(base_up[0]), float(base_up[1]), float(base_up[2])) * ortho_hh).GetLength())
                 eye = (float(pe[0]), float(pe[1]), float(pe[2]))
                 fwd = (float(pf[0]), float(pf[1]), float(pf[2]))
                 right = (float(pr[0]), float(pr[1]), float(pr[2]))
                 up = (float(pu[0]), float(pu[1]), float(pu[2]))
-                ray_origin = wp.vec3(eye[0], eye[1], eye[2])
+                ray_origin = wp.vec3(float(pro[0]), float(pro[1]), float(pro[2]))
+                prev_ray_origin = wp.vec3(float(ppro[0]), float(ppro[1]), float(ppro[2]))
                 ray_dir = wp.vec3(float(prd[0]), float(prd[1]), float(prd[2]))
                 prev_ray_dir = wp.vec3(float(pprd[0]), float(pprd[1]), float(pprd[2]))
                 cam_basis = {
@@ -1095,6 +1124,8 @@ def step_hair_brush(
                     "up": up,
                     "tan_half_fov": tan_half_fov,
                     "aspect": aspect,
+                    "orthographic": is_ortho_cam,
+                    "ortho_half_height": p_ortho_hh,
                 }
 
         def _resolve_brush_collider():
@@ -1244,6 +1275,7 @@ def step_hair_brush(
                         device=device,
                     )
             direct_sweep_tool = tool in ("lengthen", "shorten", "cut", "add", "delete", "drawlock")
+            sweep_ray_origin = ray_origin if direct_sweep_tool else prev_ray_origin
             sweep_ray_dir = ray_dir if direct_sweep_tool else prev_ray_dir
             direct_edit_done = False
             if brush.get("livePhysics"):
@@ -1311,7 +1343,7 @@ def step_hair_brush(
                         dim=total_verts,
                         inputs=[
                             pos_wp, inv_mass_wp, strand_ids_wp, backfacing_wp, mask_backfaces,
-                            ray_origin, sweep_ray_dir, scaled_radius, min_depth_wp,
+                            sweep_ray_origin, sweep_ray_dir, scaled_radius, min_depth_wp,
                         ],
                         device=device,
                     )
@@ -1319,7 +1351,7 @@ def step_hair_brush(
                 if d_min_val >= 1e8 and tool in ("add", "delete", "lengthen", "shorten"):
                     wp_coll = sess.get("wp_collider")
                     if wp_coll is not None:
-                        ro_arr = wp.array([ray_origin], dtype=wp.vec3, device=device)
+                        ro_arr = wp.array([sweep_ray_origin], dtype=wp.vec3, device=device)
                         rd_arr = wp.array([sweep_ray_dir], dtype=wp.vec3, device=device)
                         out_t = wp.full(1, 1e9, dtype=float, device=device)
                         wp.launch(ray_mesh_hit_kernel, dim=1, inputs=[wp_coll.id, ro_arr, rd_arr, float(sess["max_query_dist"]) * 100.0, out_t], device=device)
@@ -1330,17 +1362,17 @@ def step_hair_brush(
                         if total_verts > 0:
                             mean_pt = np.mean(pos_wp.numpy(), axis=0)
                             d_min_val = max(0.1, float(
-                                (mean_pt[0] - ray_origin[0]) * sweep_ray_dir[0]
-                                + (mean_pt[1] - ray_origin[1]) * sweep_ray_dir[1]
-                                + (mean_pt[2] - ray_origin[2]) * sweep_ray_dir[2]
+                                (mean_pt[0] - sweep_ray_origin[0]) * sweep_ray_dir[0]
+                                + (mean_pt[1] - sweep_ray_origin[1]) * sweep_ray_dir[1]
+                                + (mean_pt[2] - sweep_ray_origin[2]) * sweep_ray_dir[2]
                             ))
                         else:
                             d_min_val = 2.0 * float(sess["unit_scale"])
                 if d_min_val < 1e8:
                     hero_pos0_vec = wp.vec3(
-                        ray_origin[0] + sweep_ray_dir[0] * d_min_val,
-                        ray_origin[1] + sweep_ray_dir[1] * d_min_val,
-                        ray_origin[2] + sweep_ray_dir[2] * d_min_val,
+                        sweep_ray_origin[0] + sweep_ray_dir[0] * d_min_val,
+                        sweep_ray_origin[1] + sweep_ray_dir[1] * d_min_val,
+                        sweep_ray_origin[2] + sweep_ray_dir[2] * d_min_val,
                     )
                     sess["grab_center"] = hero_pos0_vec
                     sess["prev_cursor_target"] = hero_pos0_vec
@@ -1356,7 +1388,7 @@ def step_hair_brush(
                                 strand_ids_wp,
                                 backfacing_wp,
                                 mask_backfaces,
-                                ray_origin,
+                                prev_ray_origin,
                                 prev_ray_dir,
                                 scaled_radius,
                                 min_depth_wp,

@@ -1,6 +1,9 @@
 //! Application-wide defaults/capabilities. Projects store node choices and historical snapshots only.
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::Path};
+fn catalog_revision() -> u32 {
+    1
+}
 pub const SCOPES: [&str; 8] = [
     "transforms",
     "points",
@@ -15,7 +18,11 @@ pub const SCOPES: [&str; 8] = [
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Catalog {
     pub version: u32,
+    #[serde(default = "catalog_revision")]
+    pub revision: u32,
     pub applications: Vec<Profile>,
+    #[serde(default)]
+    pub megascans_library: crate::megascans::MegascansConfig,
 }
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -47,13 +54,16 @@ pub struct PolicySnapshot {
 }
 impl Catalog {
     pub fn defaults() -> Self {
-        serde_json::from_str(include_str!("../application-defaults.json"))
-            .expect("valid bundled application catalog")
+        let mut catalog: Self = serde_json::from_str(include_str!("../application-defaults.json"))
+            .expect("valid bundled application catalog");
+        catalog.megascans_library = Default::default();
+        catalog
     }
     pub fn validate(&self) -> Result<(), String> {
-        if self.version != 1 || self.applications.len() > 100 {
+        if self.revision == 0 || self.version != 1 || self.applications.len() > 100 {
             return Err("Invalid application catalog version or count".into());
         }
+        self.megascans_library.validate()?;
         let mut ids = std::collections::HashSet::new();
         for p in &self.applications {
             if p.id.trim().is_empty()
@@ -128,13 +138,17 @@ impl Catalog {
 }
 pub fn load(path: &Path) -> Result<Catalog, String> {
     if !path.exists() {
-        return Ok(Catalog::defaults());
+        let mut catalog = Catalog::defaults();
+        catalog.megascans_library = crate::megascans::load_config(path)?;
+        return Ok(catalog);
     }
     if std::fs::metadata(path).map_err(|e| e.to_string())?.len() > 1024 * 1024 {
         return Err("Application catalog exceeds 1 MB".into());
     }
     let result: Catalog = serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?)
         .map_err(|e| format!("Invalid application catalog: {e}"))?;
+    let mut result = result;
+    result.megascans_library = crate::megascans::load_config(path)?;
     result.validate()?;
     Ok(result)
 }
@@ -142,8 +156,13 @@ pub fn save(path: &Path, catalog: &Catalog) -> Result<(), String> {
     catalog.validate()?;
     let old = load(path).unwrap_or(Catalog {
         version: 1,
+        revision: 1,
         applications: vec![],
+        megascans_library: Default::default(),
     });
+    if catalog.megascans_library != old.megascans_library && catalog.revision <= old.revision {
+        return Err("Increase catalog revision when changing library settings".into());
+    }
     for p in &catalog.applications {
         if let Some(previous) = old.applications.iter().find(|x| x.id == p.id) {
             if p != previous && p.revision <= previous.revision {
@@ -202,7 +221,9 @@ impl PolicySnapshot {
     pub fn validate(&self) -> Result<(), String> {
         Catalog {
             version: 1,
+            revision: 1,
             applications: vec![self.profile.clone()],
+            megascans_library: Default::default(),
         }
         .validate()?;
         let mut seen = std::collections::HashSet::new();

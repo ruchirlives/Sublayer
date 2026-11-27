@@ -12,3 +12,9 @@ test("bone overlay projects USD row-vector matrices with top-left screen coordin
  const behind=structuredClone(matrix);behind[3][3]=-1;
  assert.equal(projectPosePoint([0,0,0],behind,800,600),null);
 });
+test("bone overlay projects orthographic viewProjection matrices without perspective divide distortion",()=>{
+ // Orthographic frustum mapping x in [-2, 2], y in [-1, 1], z in [-10, 10] -> clip w = 1
+ const ortho=[[0.5,0,0,0],[0,1,0,0],[0,0,-0.1,0],[0,0,0,1]];
+ assert.deepEqual(projectPosePoint([1,0.5,-3],ortho,800,400),[600,100]);
+ assert.deepEqual(projectPosePoint([1,0.5,3],ortho,800,400),[600,100]);
+});

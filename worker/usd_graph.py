@@ -54,6 +54,7 @@ def _disk_cache_dirs():
         os.path.join(tmp, 'sublayer_alembic_cache'),
         os.path.join(tmp, 'sublayer_blender_cache'),
         os.path.join(tmp, 'sublayer_project_cache'),
+        os.path.join(tmp, 'sublayer_gltf_cache'),
     )
 
 
@@ -270,6 +271,41 @@ def _build_transform_matrix(transform):
     form.SetScale(Gf.Vec3f(*values['scale']))
     prim = temporary.GetDefaultPrim() if temporary.GetDefaultPrim() else temporary.GetPrimAtPath('/Transform')
     return UsdGeom.Xformable(prim).GetLocalTransformation()
+
+
+def transform_only_node(prev_graph, next_graph, live_transforms):
+    if not isinstance(prev_graph, dict) or not isinstance(next_graph, dict):
+        return None
+    target_id = next_graph.get('targetNodeId')
+    if not target_id or prev_graph.get('targetNodeId') != target_id:
+        return None
+    if any(
+        prev_graph.get(k) != next_graph.get(k)
+        for k in set(prev_graph.keys()) | set(next_graph.keys())
+        if k != 'nodes'
+    ):
+        return None
+    prev_nodes = prev_graph.get('nodes')
+    next_nodes = next_graph.get('nodes')
+    if not isinstance(prev_nodes, list) or not isinstance(next_nodes, list) or len(prev_nodes) != len(next_nodes):
+        return None
+    changed_node = None
+    for pn, nn in zip(prev_nodes, next_nodes):
+        if pn == nn:
+            continue
+        if (
+            not isinstance(pn, dict)
+            or not isinstance(nn, dict)
+            or pn.get('id') != nn.get('id')
+            or nn.get('id') not in live_transforms
+            or nn.get('operation') != 'transform'
+        ):
+            return None
+        if {k: v for k, v in pn.items() if k != 'transform'} != {k: v for k, v in nn.items() if k != 'transform'}:
+            return None
+        changed_node = nn
+    return changed_node
+
 
 
 def apply_transform(stage, node, default_target=None, live_ops=None):
@@ -2515,10 +2551,11 @@ def compile_graph(graph, reload=False, *, live_transforms=None, live_poses=None,
     override_cache = {}
     live_hair_nodes = {nid for nid in needed if interactive_hair and is_live_hair_node(lookup[nid])}
     can_disk_cache = (
-        not live_hair_nodes
+        live_node_id is None
+        and not live_hair_nodes
         and all(lookup[nid].get('loadPayloads', True) is not False for nid in needed)
         and not any(lookup[nid].get('useAsPayload') for nid in needed)
-        and not any(lookup[nid].get('operation') in ('blender', 'metahuman') for nid in needed)
+        and not any(lookup[nid].get('operation') in ('blender', 'metahuman', 'instancer') for nid in needed)
         and not any(lookup[nid].get('operation') == 'application' and lookup[nid].get('liveAdjustment') for nid in needed)
     )
     graph_cache_paths = _compiled_graph_cache_paths(graph, needed, lookup, files, target) if can_disk_cache else None
@@ -2639,7 +2676,18 @@ def compile_graph(graph, reload=False, *, live_transforms=None, live_poses=None,
         mark_reference_instanceable(prim, source, enable=instanced)
         return stage
 
-    def source_stage(dependency_id, instanced=True, axis='preserve', front_axis='preserve', node_scale=1.0, load_payloads=True, use_as_payload=False):
+    def source_stage(
+        dependency_id,
+        instanced=True,
+        axis='preserve',
+        front_axis='preserve',
+        node_scale=1.0,
+        load_payloads=True,
+        use_as_payload=False,
+        megascans_lod=0,
+        megascans_resolution='auto',
+        megascans_normal_convention='opengl',
+    ):
         if not dependency_id or dependency_id not in files:
             raise ValueError('Source USD or published USD file link is missing')
         path = files[dependency_id]
@@ -2651,11 +2699,25 @@ def compile_graph(graph, reload=False, *, live_transforms=None, live_poses=None,
             mtime = os.path.getmtime(norm_path) if os.path.exists(norm_path) else 0.0
         load_flag = bool(load_payloads)
         payload_flag = bool(use_as_payload)
-        key = (norm_path, bool(instanced), str(axis or 'preserve'), str(front_axis or 'preserve'), float(node_scale), load_flag, payload_flag)
+        ms_opts = (
+            (int(megascans_lod or 0), str(megascans_resolution or 'auto'), str(megascans_normal_convention or 'opengl'))
+            if ext == '.json'
+            else None
+        )
+        key = (
+            norm_path,
+            bool(instanced),
+            str(axis or 'preserve'),
+            str(front_axis or 'preserve'),
+            float(node_scale),
+            load_flag,
+            payload_flag,
+            ms_opts,
+        )
         if key in assets:
             return assets[key]
 
-        cache_key = (norm_path, load_flag)
+        cache_key = (norm_path, load_flag, ms_opts) if ms_opts is not None else (norm_path, load_flag)
         source = None
         if reload:
             _SOURCE_STAGE_CACHE.pop(cache_key, None)
@@ -2666,13 +2728,27 @@ def compile_graph(graph, reload=False, *, live_transforms=None, live_poses=None,
                 source = cached_source
 
         if source is None:
-            source = _open_source_stage(path, reload=reload, load_payloads=load_flag)
+            source = _open_source_stage(
+                path,
+                reload=reload,
+                load_payloads=load_flag,
+                megascans_lod=megascans_lod,
+                megascans_resolution=megascans_resolution,
+                megascans_normal_convention=megascans_normal_convention,
+            )
             while len(_SOURCE_STAGE_CACHE) >= _MAX_SOURCE_STAGE_CACHE:
                 _SOURCE_STAGE_CACHE.pop(next(iter(_SOURCE_STAGE_CACHE)), None)
             _SOURCE_STAGE_CACHE[cache_key] = (mtime, source)
         elif reload:
-            if ext in ('.abc', '.obj', '.vdb', '.goz', '.sublayer', '.orchflow'):
-                source = _open_source_stage(path, reload=True, load_payloads=load_flag)
+            if ext in ('.abc', '.obj', '.vdb', '.goz', '.fbx', '.gltf', '.glb', '.json', '.sublayer', '.orchflow'):
+                source = _open_source_stage(
+                    path,
+                    reload=True,
+                    load_payloads=load_flag,
+                    megascans_lod=megascans_lod,
+                    megascans_resolution=megascans_resolution,
+                    megascans_normal_convention=megascans_normal_convention,
+                )
                 _SOURCE_STAGE_CACHE[cache_key] = (mtime, source)
             else:
                 source.Reload()
@@ -2744,6 +2820,8 @@ def compile_graph(graph, reload=False, *, live_transforms=None, live_poses=None,
                 overlay.subLayerPaths = [upstream.GetRootLayer().identifier]
                 stage = Usd.Stage.Open(overlay)
                 inherit_stage_metrics(stage, upstream)
+                stage.SetStartTimeCode(min(upstream.GetStartTimeCode(), garment_stage.GetStartTimeCode()))
+                stage.SetEndTimeCode(max(upstream.GetEndTimeCode(), garment_stage.GetEndTimeCode()))
                 default_prim = upstream.GetDefaultPrim()
                 if default_prim and default_prim.IsValid():
                     stage.SetDefaultPrim(stage.GetPrimAtPath(default_prim.GetPath()))
@@ -2797,6 +2875,9 @@ def compile_graph(graph, reload=False, *, live_transforms=None, live_poses=None,
                         node_scale=node.get('scale', 1.0),
                         load_payloads=load_payloads,
                         use_as_payload=use_as_payload,
+                        megascans_lod=node.get('megascansLod', 0),
+                        megascans_resolution=node.get('megascansResolution', 'auto'),
+                        megascans_normal_convention=node.get('megascansNormalConvention', 'opengl'),
                     ),
                 ),
             )
@@ -2859,7 +2940,7 @@ def compile_graph(graph, reload=False, *, live_transforms=None, live_poses=None,
                 inputs.insert(0, ('own-source', source_stage(usd_dep, instanced=instanced, node_scale=node.get('scale', 1.0))))
             elif not inputs:
                 raise ValueError(f'Blender node "{node.get("label", id)}" needs a linked .blend file.')
-        elif operation not in ('source', 'blender', 'transform', 'group', 'output', 'assetOverride', 'materialx', 'material_bind', 'light', 'hdri', 'postfx', 'hair', 'cache_edit', 'camera', 'delete', 'scatter', 'character', 'pose'):
+        elif operation not in ('source', 'blender', 'transform', 'group', 'output', 'assetOverride', 'materialx', 'material_bind', 'light', 'hdri', 'postfx', 'hair', 'cache_edit', 'camera', 'delete', 'scatter', 'instancer', 'character', 'pose'):
             raise ValueError(f'Unsupported USD graph operation: {operation}')
         if not inputs:
             raise ValueError(f'{operation.title()} node needs a linked USD file or incoming USD connection')
@@ -2993,6 +3074,26 @@ def compile_graph(graph, reload=False, *, live_transforms=None, live_poses=None,
             apply_transform(stage, node, group_xform.GetPrim(), live_transforms[id] if id == live_node_id else None)
             keepalive.append(stage)
             keepalive.extend(u for _, u in inputs)
+            results[id] = stage
+            return
+        if operation == 'instancer':
+            if len(inputs) == 1:
+                upstream = inputs[0][1]
+            else:
+                upstream, root = empty_stage()
+                for edge_id, value in inputs:
+                    prim = upstream.OverridePrim('/Scene/Branch_' + hashlib.sha256(edge_id.encode()).hexdigest()[:16])
+                    prim.GetReferences().AddReference(value.GetRootLayer().identifier, value.GetDefaultPrim().GetPath())
+                upstream.SetStartTimeCode(min(value.GetStartTimeCode() for _, value in inputs))
+                upstream.SetEndTimeCode(max(value.GetEndTimeCode() for _, value in inputs))
+                keepalive.append(upstream)
+            overlay = Sdf.Layer.CreateAnonymous('instancer.usda')
+            overlay.subLayerPaths = [upstream.GetRootLayer().identifier]
+            stage = Usd.Stage.Open(overlay)
+            inherit_stage_metrics(stage, upstream)
+            stage.SetDefaultPrim(stage.GetPrimAtPath(upstream.GetDefaultPrim().GetPath()))
+            apply_instancer(stage, upstream, node, keepalive)
+            keepalive.extend([upstream, overlay, stage])
             results[id] = stage
             return
         if operation == 'scatter':
@@ -6864,6 +6965,30 @@ def _safe_bridge_slug(name, fallback='scene'):
     return cleaned or fallback
 
 
+def _interp_mat4(m0, m1, t):
+    from pxr import Gf
+    if t <= 0.0:
+        return Gf.Matrix4d(m0)
+    if t >= 1.0:
+        return Gf.Matrix4d(m1)
+    xf0 = Gf.Transform(m0)
+    xf1 = Gf.Transform(m1)
+    tr0, tr1 = xf0.GetTranslation(), xf1.GetTranslation()
+    sc0, sc1 = xf0.GetScale(), xf1.GetScale()
+    q0 = xf0.GetRotation().GetQuat()
+    q1 = xf1.GetRotation().GetQuat()
+    if Gf.Dot(q0, q1) < 0.0:
+        q1 = -q1
+    q = Gf.Slerp(t, q0, q1)
+    tr = tr0 + (tr1 - tr0) * t
+    sc = sc0 + (sc1 - sc0) * t
+    out = Gf.Transform()
+    out.SetScale(sc)
+    out.SetRotation(Gf.Rotation(q))
+    out.SetTranslation(tr)
+    return out.GetMatrix()
+
+
 def export_md_bridge_handoff(request):
     import json
     import math
@@ -6921,10 +7046,171 @@ def export_md_bridge_handoff(request):
     os.makedirs(bridge_dir, exist_ok=True)
 
     slug = _safe_bridge_slug(request.get('baseName'), fallback='sublayer')
-    obj_path = os.path.join(bridge_dir, f'{slug}_avatar.obj')
-    tmp_obj = f'{obj_path}.{os.getpid()}.tmp'
+    export_format = str(request.get('format') or 'obj').lower()
     manifest_path = os.path.join(bridge_dir, 'handoff_manifest.json')
     tmp_manifest = f'{manifest_path}.{os.getpid()}.tmp'
+
+    existing_manifest = {}
+    if os.path.isfile(manifest_path):
+        try:
+            with open(manifest_path, 'r', encoding='utf-8') as ef:
+                existing_manifest = json.load(ef) or {}
+        except Exception:
+            existing_manifest = {}
+
+    if export_format == 'abc':
+        from pxr import Sdf
+        if not Sdf.FileFormat.FindByExtension('abc'):
+            raise ValueError('Alembic export requires the upstream OpenUSD usdAbc plugin')
+        ramp_frames = int(request.get('rampFrames') or 30)
+        if ramp_frames < 1:
+            ramp_frames = 30
+        hold_frames = 2
+        total_frames = ramp_frames + hold_frames
+        abc_path = os.path.join(bridge_dir, f'{slug}_avatar_pose.abc')
+        tmp_abc = f'{abc_path}.{os.getpid()}.tmp.abc'
+        # MD's Alembic importer (and ImportFileW) defaults to Metres, unlike OBJ (mm).
+        abc_conv_mat = Gf.Matrix4d().SetScale(stage_mpu * extra_scale)
+        if up_axis == 'Z':
+            rot_abc = Gf.Matrix4d(1)
+            rot_abc.SetRotate(Gf.Rotation(Gf.Vec3d(1, 0, 0), 90))
+            abc_conv_mat = abc_conv_mat * rot_abc
+        try:
+            out_stage = Usd.Stage.CreateInMemory()
+            out_root = UsdGeom.Xform.Define(out_stage, '/Body')
+            out_stage.SetDefaultPrim(out_root.GetPrim())
+            UsdGeom.SetStageUpAxis(out_stage, UsdGeom.Tokens.z if up_axis == 'Z' else UsdGeom.Tokens.y)
+            UsdGeom.SetStageMetersPerUnit(out_stage, 1.0)
+            out_stage.SetStartTimeCode(0.0)
+            out_stage.SetEndTimeCode(float(total_frames))
+            out_stage.SetFramesPerSecond(24.0)
+            out_stage.SetTimeCodesPerSecond(24.0)
+
+            skel_pose_data = {}
+            for _, sq in skin_bindings.values():
+                spath = str(sq.GetPrim().GetPath())
+                if spath in skel_pose_data:
+                    continue
+                skel = UsdSkel.Skeleton(sq.GetPrim())
+                rest_local = list(skel.GetRestTransformsAttr().Get() or [])
+                target_local = list(sq.ComputeJointLocalTransforms(tc) or [])
+                bind_world = list(skel.GetBindTransformsAttr().Get() or [])
+                topology = sq.GetTopology()
+                if rest_local and target_local and bind_world and len(rest_local) == len(target_local) == len(bind_world):
+                    bind_inv = [b.GetInverse() for b in bind_world]
+                    skel_pose_data[spath] = (topology, rest_local, target_local, bind_inv, sq.GetPrim())
+
+            xform_cache = UsdGeom.XformCache(tc)
+            source_meshes = []
+            combined_counts = []
+            combined_indices = []
+            v_offset = 0
+            for prim in stage.Traverse(Usd.TraverseInstanceProxies()):
+                if not prim.IsActive() or not prim.IsA(UsdGeom.Mesh):
+                    continue
+                prim_path = str(prim.GetPath())
+                if selected_prefixes is not None and not any(
+                    prim_path == pref or prim_path.startswith(pref + '/')
+                    for pref in selected_prefixes
+                ):
+                    continue
+                src_mesh = UsdGeom.Mesh(prim)
+                counts = src_mesh.GetFaceVertexCountsAttr().Get(tc) or src_mesh.GetFaceVertexCountsAttr().Get()
+                indices = src_mesh.GetFaceVertexIndicesAttr().Get(tc) or src_mesh.GetFaceVertexIndicesAttr().Get()
+                base_pts = src_mesh.GetPointsAttr().Get(tc) or src_mesh.GetPointsAttr().Get()
+                if not counts or not indices or not base_pts:
+                    continue
+                combined_counts.extend(int(c) for c in counts)
+                combined_indices.extend(v_offset + int(idx) for idx in indices)
+                source_meshes.append((prim, prim_path, base_pts))
+                v_offset += len(base_pts)
+
+            mesh_count = len(source_meshes)
+            if mesh_count == 0:
+                raise ValueError('No active polygon meshes found to export to MD Bridge')
+
+            dst_mesh = UsdGeom.Mesh.Define(out_stage, '/Body/Avatar')
+            dst_mesh.CreateSubdivisionSchemeAttr().Set(UsdGeom.Tokens.none)
+            dst_mesh.CreateFaceVertexCountsAttr().Set(combined_counts)
+            dst_mesh.CreateFaceVertexIndicesAttr().Set(combined_indices)
+
+            pts_attr = dst_mesh.CreatePointsAttr()
+            ext_attr = dst_mesh.CreateExtentAttr()
+            has_any_skin = any(prim_path in skin_bindings for _, prim_path, _ in source_meshes)
+            frame_list = range(total_frames + 1) if has_any_skin else (0,)
+            for f in frame_list:
+                report_status(
+                    f'frame {f}/{total_frames}',
+                    {'kind': 'md-export', 'frame': f, 'totalFrames': total_frames},
+                )
+                t = 0.0 if f <= hold_frames else float(f - hold_frames) / float(ramp_frames)
+                frame_pts = []
+                # Precompute interpolated skinning transforms once per skeleton per frame.
+                skel_xforms_frame = {}
+                for prim, prim_path, base_pts in source_meshes:
+                    skin_entry = skin_bindings.get(prim_path)
+                    if skin_entry is not None:
+                        sq_skin, sq = skin_entry
+                        spath = str(sq.GetPrim().GetPath())
+                        pose_info = skel_pose_data.get(spath)
+                        if pose_info is not None:
+                            topology, rest_local, target_local, bind_inv, skel_prim = pose_info
+                            if spath not in skel_xforms_frame:
+                                local_t = [_interp_mat4(rest_local[j], target_local[j], t) for j in range(len(rest_local))]
+                                world_t = UsdSkel.ConcatJointTransforms(topology, local_t)
+                                skel_xforms_frame[spath] = Vt.Matrix4dArray([bind_inv[j] * world_t[j] for j in range(len(bind_inv))])
+                            skin_xforms = skel_xforms_frame[spath]
+                            mapper = sq_skin.GetJointMapper()
+                            if mapper:
+                                skin_xforms = mapper.RemapTransforms(skin_xforms)
+                            pts = Vt.Vec3fArray(base_pts)
+                            sq_skin.ComputeSkinnedPoints(skin_xforms, pts, tc)
+                            world_mat = xform_cache.GetLocalToWorldTransform(skel_prim) * abc_conv_mat
+                        else:
+                            pts = base_pts
+                            world_mat = xform_cache.GetLocalToWorldTransform(prim) * abc_conv_mat
+                    else:
+                        pts = base_pts
+                        world_mat = xform_cache.GetLocalToWorldTransform(prim) * abc_conv_mat
+                    for p in pts:
+                        frame_pts.append(Gf.Vec3f(world_mat.Transform(Gf.Vec3d(p))))
+                pts_attr.Set(Vt.Vec3fArray(frame_pts), float(f))
+                ext = UsdGeom.Boundable.ComputeExtentFromPlugins(dst_mesh, float(f))
+                if ext:
+                    ext_attr.Set(ext, float(f))
+            report_status(
+                'writing .abc...',
+                {'kind': 'md-export', 'frame': total_frames, 'totalFrames': total_frames},
+            )
+            if not out_stage.GetRootLayer().Export(tmp_abc):
+                raise ValueError(f'Unable to export Alembic pose ramp: {abc_path}')
+            os.replace(tmp_abc, abc_path)
+
+            manifest = {
+                **existing_manifest,
+                'handoffAbcPath': abc_path,
+                'baseName': slug,
+                'upAxis': up_axis,
+                'metersPerUnit': meters_per_unit,
+                'scale': extra_scale,
+                'meshCount': mesh_count,
+                'rampFrames': ramp_frames,
+                'handoffAbcExportedAt': int(time.time() * 1000),
+            }
+            with open(tmp_manifest, 'w', encoding='utf-8') as mf:
+                json.dump(manifest, mf, indent=2)
+            os.replace(tmp_manifest, manifest_path)
+            return manifest
+        finally:
+            for tp in (tmp_abc, tmp_manifest):
+                if os.path.exists(tp):
+                    try:
+                        os.remove(tp)
+                    except OSError:
+                        pass
+
+    obj_path = os.path.join(bridge_dir, f'{slug}_avatar.obj')
+    tmp_obj = f'{obj_path}.{os.getpid()}.tmp'
 
     xform_cache = UsdGeom.XformCache(tc)
     v_offset = 1
@@ -7041,6 +7327,7 @@ def export_md_bridge_handoff(request):
         os.replace(tmp_obj, obj_path)
 
         manifest = {
+            **existing_manifest,
             'handoffPath': obj_path,
             'baseName': slug,
             'upAxis': up_axis,
@@ -7610,14 +7897,22 @@ def _open_alembic_source_stage(path, reload=False):
                 py_path = os.path.join(usd_root, 'lib', 'python')
                 if os.path.isdir(py_path):
                     env['PYTHONPATH'] = py_path + (os.pathsep + env['PYTHONPATH'] if env.get('PYTHONPATH') else '')
-                extra_paths = [p for p in (os.path.join(usd_root, 'lib'), os.path.join(usd_root, 'bin')) if os.path.isdir(p)]
+                extra_paths = [
+                    p
+                    for p in (
+                        os.path.join(usd_root, 'lib'),
+                        os.path.join(usd_root, 'bin'),
+                        os.path.join(usd_root, 'plugin', 'usd'),
+                    )
+                    if os.path.isdir(p)
+                ]
                 if extra_paths:
                     env['PATH'] = os.pathsep.join(extra_paths) + (os.pathsep + env['PATH'] if env.get('PATH') else '')
                 script = (
                     "import os, sys\n"
                     "usd_root = sys.argv[3]\n"
                     "if hasattr(os, 'add_dll_directory'):\n"
-                    "    for d in (os.path.join(usd_root, 'lib'), os.path.join(usd_root, 'bin')):\n"
+                    "    for d in (os.path.join(usd_root, 'lib'), os.path.join(usd_root, 'bin'), os.path.join(usd_root, 'plugin', 'usd')):\n"
                     "        if os.path.isdir(d):\n"
                     "            os.add_dll_directory(d)\n"
                     "from pxr import Sdf, Usd\n"
@@ -8103,18 +8398,39 @@ def _open_sublayer_source_stage(path, reload=False):
     return source
 
 
-def _open_source_stage(path, reload=False, load_payloads=True):
+def _open_source_stage(
+    path,
+    reload=False,
+    load_payloads=True,
+    megascans_lod=0,
+    megascans_resolution='auto',
+    megascans_normal_convention='opengl',
+):
     from pxr import Usd
+    import megascans
 
     ext = os.path.splitext(path)[1].lower()
     if ext == '.abc':
-        return _open_alembic_source_stage(path, reload=reload)
+        return megascans._ensure_static_default_samples(_open_alembic_source_stage(path, reload=reload))
     if ext == '.obj':
         return _open_obj_source_stage(path)
     if ext == '.vdb':
         return _open_vdb_source_stage(path)
     if ext == '.goz':
         return _open_goz_source_stage(path)
+    if ext == '.fbx':
+        return megascans.open_fbx_source_stage(path)
+    if ext in ('.gltf', '.glb'):
+        return megascans.open_gltf_source_stage(path)
+    if ext == '.json' and megascans.is_megascans_or_fab_json(path):
+        return megascans.open_megascans_source_stage(
+            path,
+            open_stage_fn=_open_source_stage,
+            lod=megascans_lod,
+            resolution=megascans_resolution,
+            normal_convention=megascans_normal_convention,
+            reload=reload,
+        )
     if ext in ('.sublayer', '.orchflow'):
         return _open_sublayer_source_stage(path, reload=reload)
     stage_load = Usd.Stage.LoadAll if load_payloads else Usd.Stage.LoadNone
@@ -8158,3 +8474,159 @@ def _pose_dependency_stamps(node, files):
             stat = os.stat(path) if os.path.isfile(path) else None
             result.append((did, path, stat.st_mtime_ns if stat else 0, stat.st_size if stat else 0))
     return result
+
+
+def instancer_root(node_id):
+    return '/Scene/Instancer_' + str(node_id).encode('utf-8').hex()
+
+
+def apply_instancer(stage, upstream, node, keepalive):
+    """Manual reference placements. Only anonymous layers are authored."""
+    import math
+    import re
+    from pxr import Gf, Sdf, Usd, UsdGeom, UsdShade, UsdSkel
+    cfg = node.get('instancer') or {}
+    items = cfg.get('instances') or []
+    if len(items) > 100000:
+        raise ValueError('Instancer supports at most 100,000 placements')
+    root_path = instancer_root(node['id'])
+    if upstream.GetPrimAtPath(root_path):
+        raise ValueError('Instancer namespace collides with an upstream prim')
+    prototypes = {}
+    ids = set()
+    for item in items:
+        ident = item.get('id', '')
+        if not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', ident) or ident in ids:
+            raise ValueError('Instancer IDs must be unique and valid')
+        ids.add(ident)
+        source_path = Sdf.Path(item.get('sourcePath', ''))
+        if not source_path.IsAbsolutePath() or not source_path.IsPrimPath() or source_path == Sdf.Path.absoluteRootPath:
+            raise ValueError('Instancer source must be an absolute prim path')
+        source = upstream.GetPrimAtPath(source_path)
+        if not source or not source.IsActive():
+            raise ValueError(f'Instancer source is missing: {source_path}. Relink or remove its placements.')
+        while source.IsInstanceProxy():
+            source = source.GetParent()
+        source_path = source.GetPath()
+        if not UsdGeom.Xformable(source) or source.IsA(UsdGeom.PointInstancer):
+            raise ValueError(f'Instancer needs a transformable object or containing instance: {source_path}')
+        if any(p.IsA(UsdSkel.Root) or p.IsA(UsdSkel.Skeleton) or bool(UsdSkel.BindingAPI(p).GetInheritedSkeleton()) for p in Usd.PrimRange(source, Usd.TraverseInstanceProxies())):
+            raise ValueError('Instancer does not support skeletal subtrees; select a static object')
+        t = item.get('transform') or {}
+        for field, default in [('translation', [0,0,0]), ('rotation', [0,0,0]), ('scale', [1,1,1])]:
+            values = t.get(field, default)
+            if len(values) != 3 or not all(math.isfinite(float(v)) and (field != 'scale' or float(v) > 0) for v in values):
+                raise ValueError('Instancer transforms must be finite with positive scale')
+        if source_path not in prototypes:
+            prototype = Usd.Stage.CreateInMemory('instancer-prototype.usda')
+            UsdGeom.Xform.Define(prototype, '/Prototype')
+            content = prototype.DefinePrim('/Prototype/Content')
+            content.GetReferences().AddReference(upstream.GetRootLayer().identifier, source_path)
+            # A private prototype can author inherited materials before being instanced.
+            if content.IsInstance():
+                content.SetInstanceable(False)
+            cache = UsdGeom.XformCache(Usd.TimeCode.Default())
+            world = cache.GetLocalToWorldTransform(source)
+            origin = world.ExtractTranslation()
+            basis = Gf.Matrix4d(world)
+            basis.SetTranslateOnly(Gf.Vec3d(0))
+            xf = UsdGeom.Xformable(content)
+            xf.ClearXformOpOrder()
+            content_op = xf.AddTransformOp()
+            content_op.Set(basis)
+            xf.SetResetXformStack(False)
+            sample_times = set()
+            ancestor = source
+            while ancestor and not ancestor.IsPseudoRoot():
+                ancestor_xf = UsdGeom.Xformable(ancestor)
+                if ancestor_xf:
+                    sample_times.update(ancestor_xf.GetTimeSamples())
+                ancestor = ancestor.GetParent()
+            origins = {}
+            for sample in sorted(sample_times):
+                world_sample = UsdGeom.XformCache(Usd.TimeCode(sample)).GetLocalToWorldTransform(source)
+                origins[sample] = world_sample.ExtractTranslation()
+                basis_sample = Gf.Matrix4d(world_sample)
+                basis_sample.SetTranslateOnly(Gf.Vec3d(0))
+                content_op.Set(basis_sample, sample)
+            materials = {}
+            for prim in Usd.PrimRange(source, Usd.TraverseInstanceProxies()):
+                bound, _ = UsdShade.MaterialBindingAPI(prim).ComputeBoundMaterial()
+                if not bound:
+                    continue
+                material_path = bound.GetPath()
+                if material_path not in materials:
+                    dest = '/Prototype/Materials/M_' + hashlib.sha256(str(material_path).encode()).hexdigest()[:16]
+                    material = UsdShade.Material.Define(prototype, dest)
+                    material.GetPrim().GetReferences().AddReference(upstream.GetRootLayer().identifier, material_path)
+                    materials[material_path] = material
+                dest_path = Sdf.Path('/Prototype/Content').AppendPath(prim.GetPath().MakeRelativePath(source_path)) if prim != source else Sdf.Path('/Prototype/Content')
+                target = prototype.GetPrimAtPath(dest_path)
+                if target.IsInstanceProxy():
+                    # Never silently de-instance nested source geometry for material edits.
+                    existing, _ = UsdShade.MaterialBindingAPI(target).ComputeBoundMaterial()
+                    if not existing:
+                        raise ValueError(f'Instancer cannot preserve an external material binding inside nested instance {prim.GetPath()}')
+                    continue
+                UsdShade.MaterialBindingAPI.Apply(target).Bind(materials[material_path])
+            # Inherited constant primvars and visibility survive the removed parent chain.
+            for pv in UsdGeom.PrimvarsAPI(source).FindPrimvarsWithInheritance():
+                if pv.GetPrimvarName() not in [p.GetPrimvarName() for p in UsdGeom.PrimvarsAPI(content).GetPrimvars()]:
+                    new_pv = UsdGeom.PrimvarsAPI(content).CreatePrimvar(pv.GetPrimvarName(), pv.GetTypeName(), pv.GetInterpolation(), pv.GetElementSize())
+                    new_pv.Set(pv.ComputeFlattened())
+            UsdGeom.Imageable(content).CreateVisibilityAttr().Set(UsdGeom.Imageable(source).ComputeVisibility())
+            keepalive.append(prototype)
+            prototypes[source_path] = (prototype, origin, origins)
+        prototype, origin, origins = prototypes[source_path]
+        path = root_path + '/I_' + ident.encode().hex()
+        wrapper = UsdGeom.Xform.Define(stage, path)
+        translation = t.get('translation', [0,0,0])
+        op = wrapper.AddTransformOp()
+        def placement_matrix(source_origin, time):
+            parent = UsdGeom.XformCache(time).GetLocalToWorldTransform(upstream.GetPrimAtPath('/Scene'))
+            if abs(parent.GetDeterminant()) < 1e-12:
+                raise ValueError('Instancer cannot place objects under a singular upstream transform')
+            value = dict(t)
+            value['translation'] = [float(source_origin[i]) + float(translation[i]) for i in range(3)]
+            return _build_transform_matrix(value) * parent.GetInverse()
+        op.Set(placement_matrix(origin, Usd.TimeCode.Default()))
+        for sample, sample_origin in origins.items():
+            op.Set(placement_matrix(sample_origin, Usd.TimeCode(sample)), sample)
+        prim = wrapper.GetPrim()
+        prim.SetCustomDataByKey('orchflowInstancer', {'nodeId': str(node['id']), 'id': ident, 'sourcePath': str(source_path), 'translation': Gf.Vec3d(*translation)})
+        if not item.get('visible', True):
+            UsdGeom.Imageable(prim).CreateVisibilityAttr().Set(UsdGeom.Tokens.invisible)
+        content = stage.DefinePrim(path + '/Instance')
+        content.GetReferences().AddReference(prototype.GetRootLayer().identifier, '/Prototype')
+        content.SetInstanceable(True)
+
+
+def instancer_handles(stage, frame=0):
+    from pxr import UsdGeom, Usd
+    if stage is None:
+        return []
+    cache = UsdGeom.XformCache(Usd.TimeCode(float(frame)))
+    result = []
+    for prim in stage.Traverse():
+        data = prim.GetCustomDataByKey('orchflowInstancer')
+        if data:
+            result.append({'nodeId': data['nodeId'], 'id': data['id'], 'path': str(prim.GetPath()), 'sourcePath': data['sourcePath'], 'origin': list(cache.GetLocalToWorldTransform(prim).ExtractTranslation()), 'translation': list(data['translation'])})
+    return result
+
+
+def instancer_pick_target(stage, path, frame=0):
+    """Resolve renderer proxy hits to editable object roots and world pivots."""
+    from pxr import Usd, UsdGeom, UsdSkel
+    if not stage or not path:
+        return None
+    prim = stage.GetPrimAtPath(path)
+    if not prim:
+        return None
+    while prim.IsInstanceProxy():
+        prim = prim.GetParent()
+    if not UsdGeom.Xformable(prim) or prim.IsA(UsdGeom.PointInstancer):
+        return {'error': 'Select a transformable object or a containing instance'}
+    if any(p.IsA(UsdSkel.Root) or p.IsA(UsdSkel.Skeleton) or bool(UsdSkel.BindingAPI(p).GetInheritedSkeleton()) for p in Usd.PrimRange(prim, Usd.TraverseInstanceProxies())):
+        return {'error': 'Instancer supports static objects; skeletal subtrees cannot be instanced'}
+    origin = UsdGeom.XformCache(Usd.TimeCode(float(frame))).GetLocalToWorldTransform(prim).ExtractTranslation()
+    return {'sourcePrim': str(prim.GetPath()), 'origin': list(origin)}

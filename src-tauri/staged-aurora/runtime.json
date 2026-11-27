@@ -1,0 +1,11 @@
+{
+    "auroraVersion":  "v26.08-preview",
+    "usdVersion":  [
+                       0,
+                       25,
+                       8
+                   ],
+    "materialXVersion":  "1.39.5",
+    "binaryRoot":  "bin",
+    "pluginInfo":  "bin/usd/hdAurora/resources/plugInfo.json"
+}

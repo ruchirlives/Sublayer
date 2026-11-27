@@ -127,7 +127,7 @@ fn ensure_worker_script_dir() -> Result<std::path::PathBuf, String> {
             return Ok(dir);
         }
     }
-    let files: [(&str, &str); 14] = [
+    let files: [(&str, &str); 15] = [
         ("metahuman.py", include_str!("../../worker/metahuman.py")),
         (
             "metahuman_riglogic.py",
@@ -154,6 +154,7 @@ fn ensure_worker_script_dir() -> Result<std::path::PathBuf, String> {
             include_str!("../../worker/cloth_proxy.py"),
         ),
         ("cache_edit.py", include_str!("../../worker/cache_edit.py")),
+        ("megascans.py", include_str!("../../worker/megascans.py")),
         ("usd_graph.py", include_str!("../../worker/usd_graph.py")),
         ("pose_node.py", include_str!("../../worker/pose_node.py")),
         (

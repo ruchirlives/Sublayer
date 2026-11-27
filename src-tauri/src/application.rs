@@ -419,6 +419,19 @@ pub fn evaluation_graph(
         if !(n.id==node_id && application_input) {if let Some(live)=&n.data.live_adjustment {used.insert(&live.edited_dependency_id);used.insert(&live.baseline_dependency_id);used.insert(&live.handoff_dependency_id);}}
         if let Some(id) = &n.data.metahuman_body_dependency_id { used.insert(id); }
         let mut value=serde_json::json!({"id":n.id,"operation":operation,"inputDependencyId":n.data.input_dependency_id,"publishedDependencyId":published,"nativeProjectDependencyId":if n.id == node_id && application_input { None } else { n.data.native_project_dependency_id.as_ref() },"instanced":n.data.instanced.unwrap_or(false),"axis":n.data.axis,"frontAxis":n.data.front_axis,"scale":n.data.scale,"transform":n.data.transform,"assetOverrides":n.data.asset_overrides,"publication":if n.id == node_id && application_input {None} else {n.data.publication.as_ref().map(|p|serde_json::json!({"sourceRevisions":p.source_revisions}))}});
+        if n.data.operation == "source" {
+            value["loadPayloads"] = serde_json::json!(n.data.load_payloads);
+            value["useAsPayload"] = serde_json::json!(n.data.use_as_payload);
+            if let Some(lod) = n.data.megascans_lod {
+                value["megascansLod"] = serde_json::json!(lod);
+            }
+            if let Some(res) = &n.data.megascans_resolution {
+                value["megascansResolution"] = serde_json::json!(res);
+            }
+            if let Some(conv) = &n.data.megascans_normal_convention {
+                value["megascansNormalConvention"] = serde_json::json!(conv);
+            }
+        }
         if n.data.operation == "metahuman" {
             value["metahumanLod"] = serde_json::json!(n.data.metahuman_lod);
             value["metahumanMaterials"] = serde_json::json!(n.data.metahuman_materials);
@@ -429,6 +442,7 @@ pub fn evaluation_graph(
         if n.data.operation=="blender"{if let Some(scene)=&n.data.blender_scene{value["blenderScene"]=serde_json::to_value(scene).unwrap();}if let Some(sel)=&n.data.blender_selections{value["blenderSelections"]=serde_json::to_value(sel).unwrap();}if let Some(mode)=&n.data.blender_material_mode{value["blenderMaterialMode"]=serde_json::to_value(mode).unwrap();}if let Some(cp)=n.data.blender_convert_procedurals{value["blenderConvertProcedurals"]=serde_json::to_value(cp).unwrap();}if let Some(es)=n.data.blender_export_skeletons{value["blenderExportSkeletons"]=serde_json::to_value(es).unwrap();}if let Some(secs)=n.data.last_extraction_seconds{value["lastExtractionSeconds"]=serde_json::to_value(secs).unwrap();}}
 if n.data.operation=="camera"{if let Some(cam)=&n.data.camera{value["camera"]=serde_json::to_value(cam).unwrap();}if let Some(views)=&n.data.camera_views{value["cameraViews"]=serde_json::to_value(views).unwrap();}}
         if !(n.id==node_id && application_input) {if let Some(live)=&n.data.live_adjustment {value["liveAdjustment"]=serde_json::to_value(live).unwrap();value["publishedDependencyId"]=serde_json::Value::Null;value["publication"]=serde_json::Value::Null;}}
+        if n.data.operation=="instancer" {value["instancer"]=serde_json::to_value(&n.data.instancer).unwrap();}
         if n.data.operation=="delete" {value["deletePaths"]=serde_json::to_value(&n.data.delete_paths).unwrap();}
         if n.data.operation=="group"{if let Some(gn)=&n.data.group_name {value["groupName"]=serde_json::to_value(gn).unwrap();}}
         if n.data.operation=="materialx"{value["materialX"]=serde_json::to_value(&n.data.material_x).unwrap();if let Some(rules)=&n.data.material_x_rules {value["materialXRules"]=serde_json::to_value(rules).unwrap();}}

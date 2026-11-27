@@ -111,6 +111,8 @@ pub struct ViewportCamera {
     pub pan_x: f64,
     pub pan_y: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fov: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dof_enabled: Option<bool>,
@@ -118,6 +120,39 @@ pub struct ViewportCamera {
     pub focus_distance: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub f_stop: Option<f64>,
+}
+
+fn validate_viewport_camera(cam: &ViewportCamera) -> Result<(), String> {
+    if !cam.yaw.is_finite()
+        || !cam.pitch.is_finite()
+        || !cam.zoom.is_finite()
+        || cam.zoom <= 0.0
+        || !cam.pan_x.is_finite()
+        || !cam.pan_y.is_finite()
+    {
+        return Err("Camera yaw, pitch, pan, and positive zoom must be finite".into());
+    }
+    if let Some(proj) = &cam.projection {
+        if !matches!(proj.as_str(), "perspective" | "orthographic") {
+            return Err("Camera projection must be perspective or orthographic".into());
+        }
+    }
+    if cam
+        .fov
+        .is_some_and(|v| !v.is_finite() || !(5.0..=170.0).contains(&v))
+    {
+        return Err("Camera fov must be between 5 and 170 degrees".into());
+    }
+    if cam
+        .focus_distance
+        .is_some_and(|v| !v.is_finite() || v <= 0.0)
+    {
+        return Err("Camera focusDistance must be positive and finite".into());
+    }
+    if cam.f_stop.is_some_and(|v| !v.is_finite() || v <= 0.0) {
+        return Err("Camera fStop must be positive and finite".into());
+    }
+    Ok(())
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -326,7 +361,33 @@ fn default_scatter_ramp_b() -> [f64; 3] {
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InstancerInstance {
+    pub id: String,
+    pub source_path: String,
+    #[serde(default = "default_true")]
+    pub visible: bool,
+    #[serde(default)]
+    pub transform: Transform,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InstancerSettings {
+    #[serde(default = "default_instancer_movement")]
+    pub movement: String,
+    #[serde(default)]
+    pub locked_axes: [bool; 3],
+    #[serde(default)]
+    pub instances: Vec<InstancerInstance>,
+}
+fn default_instancer_movement() -> String {
+    "ground".into()
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NodeData {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instancer: Option<InstancerSettings>,
     #[serde(default = "default_true")]
     pub load_payloads: bool,
     #[serde(default)]
@@ -428,6 +489,12 @@ pub struct NodeData {
     pub metahuman_body_dependency_id: Option<String>,
     #[serde(default = "default_true")]
     pub metahuman_materials: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub megascans_lod: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub megascans_resolution: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub megascans_normal_convention: Option<String>,
     #[serde(default)]
     pub pose: Option<PoseSettings>,
     #[serde(default)]
@@ -1779,6 +1846,7 @@ impl Project {
                     "delete",
                     "group",
                     "scatter",
+                    "instancer",
                     "character",
                     "pose",
                 ]
@@ -1843,6 +1911,19 @@ impl Project {
             if n.data.metahuman_lod > 31 {
                 return Err("MetaHuman LOD must be between 0 and 31".into());
             }
+            if n.data.megascans_lod.is_some_and(|lod| lod > 15) {
+                return Err("Megascans LOD must be between 0 and 15".into());
+            }
+            if let Some(res) = &n.data.megascans_resolution {
+                if !["auto", "16K", "8K", "4K", "2K", "1K"].contains(&res.as_str()) {
+                    return Err("Megascans resolution must be auto, 16K, 8K, 4K, 2K, or 1K".into());
+                }
+            }
+            if let Some(conv) = &n.data.megascans_normal_convention {
+                if !["opengl", "directx"].contains(&conv.as_str()) {
+                    return Err("Megascans normal convention must be opengl or directx".into());
+                }
+            }
             if let Some(id) = &n.data.published_dependency_id {
                 check(id, &DependencyKind::Usd)?;
             }
@@ -1866,6 +1947,52 @@ impl Project {
                 !crate::application_profiles::SCOPES.contains(&s.as_str()) || !scope.insert(s)
             }) {
                 return Err("Unknown or duplicate node edit scope".into());
+            }
+            if let Some(settings) = &n.data.instancer {
+                if n.data.operation != "instancer"
+                    || !["ground", "free", "x", "y", "z", "custom"]
+                        .contains(&settings.movement.as_str())
+                    || settings.instances.len() > 100_000
+                {
+                    return Err("Invalid Instancer settings or instance limit exceeded".into());
+                }
+                let mut ids = HashSet::new();
+                for item in &settings.instances {
+                    if item.id.is_empty()
+                        || item.id.len() > 128
+                        || !item
+                            .id
+                            .bytes()
+                            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+                        || !ids.insert(&item.id)
+                    {
+                        return Err("Instancer IDs must be unique and contain only letters, digits, underscores or hyphens".into());
+                    }
+                    if !item.source_path.starts_with('/')
+                        || item.source_path == "/"
+                        || item.source_path.split('/').skip(1).any(|part| {
+                            part.is_empty()
+                                || !part.chars().enumerate().all(|(i, c)| {
+                                    c == '_' || c.is_alphabetic() || (i > 0 && c.is_ascii_digit())
+                                })
+                        })
+                    {
+                        return Err("Instancer source must be an absolute prim path".into());
+                    }
+                    if item
+                        .transform
+                        .translation
+                        .iter()
+                        .chain(item.transform.rotation.iter())
+                        .chain(item.transform.scale.iter())
+                        .any(|v| !v.is_finite())
+                        || item.transform.scale.iter().any(|v| *v <= 0.0)
+                    {
+                        return Err(
+                            "Instancer transforms must be finite with positive scale".into()
+                        );
+                    }
+                }
             }
             if let Some(scatter) = &n.data.scatter {
                 if scatter.count == 0 || scatter.count > 1_000_000 {
@@ -2618,6 +2745,18 @@ impl Project {
                     return Err("Duplicate node asset reference".into());
                 }
             }
+            if let Some(cam) = &n.data.camera {
+                validate_viewport_camera(cam)?;
+            }
+            if let Some(views) = &n.data.camera_views {
+                let mut view_ids = HashSet::new();
+                for view in views {
+                    if view.id.trim().is_empty() || !view_ids.insert(view.id.as_str()) {
+                        return Err("Camera view IDs must be non-empty and unique".into());
+                    }
+                    validate_viewport_camera(&view.camera)?;
+                }
+            }
             indegree.insert(n.id.as_str(), 0usize);
         }
         if let Some(id) = &self.viewport.pinned_node_id {
@@ -2639,6 +2778,9 @@ impl Project {
             if !matches!(mat.as_str(), "auto" | "scene" | "solid") {
                 return Err("Viewport materials must be auto, scene, or solid".into());
             }
+        }
+        if let Some(cam) = &self.viewport.camera {
+            validate_viewport_camera(cam)?;
         }
         let mut edge_ids = HashSet::new();
         for e in &self.edges {
@@ -2783,6 +2925,48 @@ pub fn load(path: &str) -> Result<Project, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn instancer_validates_persists_and_serializes_domain_graph() {
+        let mut p = project();
+        p.nodes[0].data.operation = "instancer".into();
+        p.nodes[0].data.instancer = Some(serde_json::from_value(serde_json::json!({"instances":[{"id":"one","sourcePath":"/Scene/Tree","transform":{"translation":[3.0,0.0,0.0],"rotation":[0.0,0.0,0.0],"scale":[1.0,1.0,1.0]}}]})).unwrap());
+        p.validate().unwrap();
+        let restored = Project::from_value(serde_json::to_value(&p).unwrap()).unwrap();
+        let graph = crate::application::evaluation_graph(&restored, &p.nodes[0].id, false).unwrap();
+        assert_eq!(graph["nodes"][0]["instancer"]["movement"], "ground");
+        assert_eq!(
+            graph["nodes"][0]["instancer"]["instances"][0]["transform"]["translation"][0],
+            3.0
+        );
+        p.nodes[0].data.instancer.as_mut().unwrap().instances[0]
+            .transform
+            .scale[0] = 0.0;
+        assert!(p.validate().is_err());
+        p.nodes[0].data.instancer.as_mut().unwrap().instances[0]
+            .transform
+            .scale[0] = 1.0;
+        p.nodes[0].data.instancer.as_mut().unwrap().instances[0].source_path =
+            "/Scene/../Tree".into();
+        assert!(p.validate().is_err());
+        p.nodes[0].data.instancer.as_mut().unwrap().instances[0].source_path = "/Scene/Tree".into();
+        let item: InstancerInstance = serde_json::from_value(
+            serde_json::to_value(&p.nodes[0].data.instancer.as_ref().unwrap().instances[0])
+                .unwrap(),
+        )
+        .unwrap();
+        p.nodes[0]
+            .data
+            .instancer
+            .as_mut()
+            .unwrap()
+            .instances
+            .push(item);
+        assert!(p.validate().is_err());
+        p.nodes[0].data.instancer.as_mut().unwrap().instances.pop();
+        p.nodes[0].data.instancer.as_mut().unwrap().movement = "invalid".into();
+        assert!(p.validate().is_err());
+    }
+
     #[test]
     fn metahuman_asset_lod_and_domain_graph_round_trip() {
         let mut p = project();
@@ -3265,6 +3449,77 @@ mod tests {
         p.nodes[0].data.character.as_mut().unwrap().head_grooms[0].attach_mode = "joint".into();
         p.nodes[0].data.character.as_mut().unwrap().head_grooms[0].dependency_id =
             Some("missing-dep".into());
+        assert!(p.validate().is_err());
+    }
+
+    #[test]
+    fn orthographic_camera_views_validate_and_round_trip() {
+        let mut p = project();
+        p.viewport.camera = Some(ViewportCamera {
+            yaw: 0.0,
+            pitch: 90.0,
+            zoom: 1.0,
+            pan_x: 0.0,
+            pan_y: 0.0,
+            projection: Some("orthographic".into()),
+            fov: Some(45.0),
+            dof_enabled: Some(false),
+            focus_distance: Some(5.0),
+            f_stop: Some(5.6),
+        });
+        p.nodes[0].data.operation = "camera".into();
+        p.nodes[0].data.camera_views = Some(vec![
+            CameraView {
+                id: "front-ortho".into(),
+                name: "Front Ortho".into(),
+                camera: ViewportCamera {
+                    yaw: 0.0,
+                    pitch: 0.0,
+                    zoom: 1.25,
+                    pan_x: 0.1,
+                    pan_y: -0.1,
+                    projection: Some("orthographic".into()),
+                    fov: Some(45.0),
+                    dof_enabled: None,
+                    focus_distance: None,
+                    f_stop: None,
+                },
+            },
+            CameraView {
+                id: "persp-hero".into(),
+                name: "Hero Persp".into(),
+                camera: ViewportCamera {
+                    yaw: 35.0,
+                    pitch: 20.0,
+                    zoom: 1.0,
+                    pan_x: 0.0,
+                    pan_y: 0.0,
+                    projection: Some("perspective".into()),
+                    fov: Some(50.0),
+                    dof_enabled: Some(true),
+                    focus_distance: Some(3.0),
+                    f_stop: Some(2.8),
+                },
+            },
+        ]);
+        p.validate().unwrap();
+        let saved = serde_json::to_value(&p).unwrap();
+        let restored = Project::from_value(saved).unwrap();
+        assert_eq!(
+            restored
+                .viewport
+                .camera
+                .as_ref()
+                .and_then(|c| c.projection.as_deref()),
+            Some("orthographic")
+        );
+        assert_eq!(
+            restored.nodes[0].data.camera_views,
+            p.nodes[0].data.camera_views
+        );
+
+        // Reject unknown projection
+        p.viewport.camera.as_mut().unwrap().projection = Some("fisheye".into());
         assert!(p.validate().is_err());
     }
 }

@@ -1,5 +1,7 @@
 {
   "version": 1,
+  "revision": 1,
+  "megascansLibrary": {"libraryRoot":"","downloadsDirs":[],"socketEnabled":true,"socketPort":24981},
   "applications": [
     {
       "id": "blender",

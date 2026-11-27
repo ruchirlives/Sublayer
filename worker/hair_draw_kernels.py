@@ -236,7 +236,7 @@ def _init_draw_kernels(wp):
     @wp.kernel
     def raycast_curve_to_mesh_kernel(
         mesh: wp.uint64,
-        ro: wp.vec3,
+        ro_arr: wp.array(dtype=wp.vec3),
         rd_arr: wp.array(dtype=wp.vec3),
         max_d: float,
         out_pos: wp.array(dtype=wp.vec3),
@@ -245,6 +245,7 @@ def _init_draw_kernels(wp):
         out_hit: wp.array(dtype=int),
     ):
         tid = wp.tid()
+        ro = ro_arr[tid]
         rd = rd_arr[tid]
         h = wp.mesh_query_ray(mesh, ro, rd, max_d)
         if h.result:

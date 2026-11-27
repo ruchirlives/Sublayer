@@ -98,11 +98,16 @@ def configure_runtime():
         return
     root = os.path.abspath(root)
     sys.path.insert(0, os.path.join(root, 'lib', 'python'))
-    for folder in ('bin', 'lib'):
+    for folder in ('bin', 'lib', os.path.join('plugin', 'usd')):
         directory = os.path.join(root, folder)
         if os.path.isdir(directory) and hasattr(os, 'add_dll_directory'):
             _dll_dirs.append(os.add_dll_directory(directory))
-    os.environ['PATH'] = os.pathsep.join([os.path.join(root, 'bin'), os.path.join(root, 'lib'), os.environ.get('PATH', '')])
+    os.environ['PATH'] = os.pathsep.join([
+        os.path.join(root, 'bin'),
+        os.path.join(root, 'lib'),
+        os.path.join(root, 'plugin', 'usd'),
+        os.environ.get('PATH', ''),
+    ])
     os.environ.setdefault('PXR_MTLX_STDLIB_SEARCH_PATHS', os.path.join(root, 'libraries'))
     _configure_aurora_runtime()
 
@@ -252,38 +257,7 @@ class ViewportSelection:
         self.results.clear()
 
 
-def _transform_only_node(prev_graph, next_graph, live_transforms):
-    if not isinstance(prev_graph, dict) or not isinstance(next_graph, dict):
-        return None
-    target_id = next_graph.get('targetNodeId')
-    if not target_id or prev_graph.get('targetNodeId') != target_id:
-        return None
-    if any(
-        prev_graph.get(k) != next_graph.get(k)
-        for k in set(prev_graph.keys()) | set(next_graph.keys())
-        if k != 'nodes'
-    ):
-        return None
-    prev_nodes = prev_graph.get('nodes')
-    next_nodes = next_graph.get('nodes')
-    if not isinstance(prev_nodes, list) or not isinstance(next_nodes, list) or len(prev_nodes) != len(next_nodes):
-        return None
-    changed_node = None
-    for pn, nn in zip(prev_nodes, next_nodes):
-        if pn == nn:
-            continue
-        if (
-            not isinstance(pn, dict)
-            or not isinstance(nn, dict)
-            or pn.get('id') != nn.get('id')
-            or nn.get('id') not in live_transforms
-            or nn.get('operation') != 'transform'
-        ):
-            return None
-        if {k: v for k, v in pn.items() if k != 'transform'} != {k: v for k, v in nn.items() if k != 'transform'}:
-            return None
-        changed_node = nn
-    return changed_node
+from usd_graph import transform_only_node as _transform_only_node
 
 
 def _define_bbox_mesh(stage, path, box_min, box_max):
@@ -457,10 +431,14 @@ class Viewport:
         width = int(finite_number(request.get('width', 960), 'width', 64, 2048))
         height = int(finite_number(request.get('height', 640), 'height', 64, 2048))
         yaw = math.radians(finite_number(request.get('yaw', 35), 'yaw', -36000, 36000))
-        pitch = math.radians(finite_number(request.get('pitch', 20), 'pitch', -89, 89))
+        pitch = math.radians(finite_number(request.get('pitch', 20), 'pitch', -90, 90))
         zoom = finite_number(request.get('zoom', 1), 'zoom', 0.001, 100)
         pan_x = finite_number(request.get('panX', 0), 'panX', -100, 100)
         pan_y = finite_number(request.get('panY', 0), 'panY', -100, 100)
+        projection = str(request.get('projection') or 'perspective')
+        if projection not in ('perspective', 'orthographic'):
+            raise ValueError('Camera projection must be perspective or orthographic')
+        is_ortho = projection == 'orthographic'
         materials = request.get('materials', 'auto')
         if materials not in ('auto', 'scene', 'solid'):
             raise ValueError('Material preview must be auto, scene, or solid')
@@ -858,12 +836,11 @@ class Viewport:
         center,radius=Gf.Vec3d(self.camera_anchor[0]),self.camera_anchor[1]
         req_up = str(request.get('upAxis', 'Y')).upper()
         if req_up == 'Z':
-            up = Gf.Vec3d(0, 0, 1)
             forward = Gf.Vec3d(math.sin(yaw)*math.cos(pitch), -math.cos(yaw)*math.cos(pitch), math.sin(pitch))
+            right = Gf.Vec3d(math.cos(yaw), math.sin(yaw), 0.0)
         else:
-            up = Gf.Vec3d(0, 1, 0)
             forward = Gf.Vec3d(math.sin(yaw)*math.cos(pitch), math.sin(pitch), math.cos(yaw)*math.cos(pitch))
-        right = Gf.Cross(up, forward).GetNormalized()
+            right = Gf.Vec3d(math.cos(yaw), 0.0, -math.sin(yaw))
         camera_up = Gf.Cross(forward, right).GetNormalized()
         aspect = width / height
         fov = max(5.0, min(170.0, float(request.get('fov') or 45.0)))
@@ -898,20 +875,30 @@ class Viewport:
             self.camera_anchor_translation = cur_trans
         if new_center is not None:
             old_pivot = center + right * (pan_x * radius) + camera_up * (pan_y * radius)
-            old_dist = (radius / sin_k) * 1.15 * zoom
-            old_eye = old_pivot + forward * old_dist
-            delta_eye = old_eye - new_center
-            new_dist = max(1e-4, float(Gf.Dot(delta_eye, forward)))
-            pan_x = float(Gf.Dot(delta_eye, right)) / radius
-            pan_y = float(Gf.Dot(delta_eye, camera_up)) / radius
-            zoom = new_dist / ((radius / sin_k) * 1.15)
+            if is_ortho:
+                delta_pivot = old_pivot - new_center
+                pan_x = float(Gf.Dot(delta_pivot, right)) / radius
+                pan_y = float(Gf.Dot(delta_pivot, camera_up)) / radius
+            else:
+                old_dist = (radius / sin_k) * 1.15 * zoom
+                old_eye = old_pivot + forward * old_dist
+                delta_eye = old_eye - new_center
+                new_dist = max(1e-4, float(Gf.Dot(delta_eye, forward)))
+                pan_x = float(Gf.Dot(delta_eye, right)) / radius
+                pan_y = float(Gf.Dot(delta_eye, camera_up)) / radius
+                zoom = new_dist / ((radius / sin_k) * 1.15)
             self.camera_anchor = (Gf.Vec3d(new_center), radius)
             center = Gf.Vec3d(new_center)
             camera_sync = {'panX': pan_x, 'panY': pan_y, 'zoom': zoom}
         center += right * (pan_x * radius) + camera_up * (pan_y * radius)
         fit_distance = radius / sin_k * 1.15
         distance = fit_distance * zoom
-        eye = center + forward * distance
+        ortho_half_height = max(1e-5, distance * math.tan(half_fov))
+        ortho_half_width = ortho_half_height * aspect
+        clip_radius = max(radius, getattr(self, 'scene_radius', radius))
+        trans_reach = Gf.Vec3d(*cur_trans).GetLength() if cur_trans else 0.0
+        eye_distance = max(distance, clip_radius * 4.0 + trans_reach * 2.0, 1.0) if is_ortho else distance
+        eye = center + forward * eye_distance
         hair_brush = request.get('hairBrush')
         committed_groom_deltas = None
         committed_groom_node_id = None
@@ -945,6 +932,7 @@ class Viewport:
                 s_fwd = inv_vc.TransformDir(-forward).GetNormalized()
                 s_right = inv_vc.TransformDir(right).GetNormalized()
                 s_up = inv_vc.TransformDir(camera_up).GetNormalized()
+                s_ortho_hh = float(inv_vc.TransformDir(camera_up * ortho_half_height).GetLength())
                 cam_basis = {
                     'origin': (float(s_eye[0]), float(s_eye[1]), float(s_eye[2])),
                     'forward': (float(s_fwd[0]), float(s_fwd[1]), float(s_fwd[2])),
@@ -952,6 +940,8 @@ class Viewport:
                     'up': (float(s_up[0]), float(s_up[1]), float(s_up[2])),
                     'tan_half_fov': float(math.tan(math.radians(fov * 0.5))),
                     'aspect': float(aspect),
+                    'orthographic': is_ortho,
+                    'ortho_half_height': s_ortho_hh,
                 }
                 hair_stats = {'totalStrands': 0, 'guideStrands': 0, 'fullSolveStrands': 0}
                 hair_started = time.perf_counter()
@@ -1003,6 +993,7 @@ class Viewport:
                 s_fwd = inv_vc.TransformDir(-forward).GetNormalized()
                 s_right = inv_vc.TransformDir(right).GetNormalized()
                 s_up = inv_vc.TransformDir(camera_up).GetNormalized()
+                s_ortho_hh = float(inv_vc.TransformDir(camera_up * ortho_half_height).GetLength())
                 cam_basis = {
                     'origin': (float(s_eye[0]), float(s_eye[1]), float(s_eye[2])),
                     'forward': (float(s_fwd[0]), float(s_fwd[1]), float(s_fwd[2])),
@@ -1010,6 +1001,8 @@ class Viewport:
                     'up': (float(s_up[0]), float(s_up[1]), float(s_up[2])),
                     'tan_half_fov': float(math.tan(math.radians(fov * 0.5))),
                     'aspect': float(aspect),
+                    'orthographic': is_ortho,
+                    'ortho_half_height': s_ortho_hh,
                 }
                 c_started = time.perf_counter()
                 with Usd.EditContext(stage, stage.GetSessionLayer()):
@@ -1129,14 +1122,15 @@ class Viewport:
                 if skin_layer is not None:
                     skin_layer.Clear()
                 self._pose_skin_active = False
-        view = view_conversion * Gf.Matrix4d().SetLookAt(eye, center, up)
+        view = view_conversion * Gf.Matrix4d().SetLookAt(eye, center, camera_up)
         camera_transform = usd_graph.decompose_camera_transform(view.GetInverse(), stage, Usd.TimeCode(frame))
         frustum = Gf.Frustum()
-        clip_radius = max(radius, getattr(self, 'scene_radius', radius))
-        trans_reach = Gf.Vec3d(*cur_trans).GetLength() if cur_trans else 0.0
-        near_clip = max(1e-4, min(clip_radius * 0.001, distance * 0.001))
-        far_clip = max(distance * 100.0, clip_radius * 100.0, trans_reach * 10.0, near_clip * 1000.0)
-        frustum.SetPerspective(fov, aspect, near_clip, far_clip)
+        near_clip = max(1e-4, min(clip_radius * 0.001, eye_distance * 0.001))
+        far_clip = max(eye_distance * 100.0, clip_radius * 100.0, trans_reach * 10.0, near_clip * 1000.0)
+        if is_ortho:
+            frustum.SetOrthographic(-ortho_half_width, ortho_half_width, -ortho_half_height, ortho_half_height, near_clip, far_clip)
+        else:
+            frustum.SetPerspective(fov, aspect, near_clip, far_clip)
         if self.size != (width, height):
             self.fbo = None
             fmt = self.QtOpenGL.QOpenGLFramebufferObjectFormat()
@@ -1291,12 +1285,19 @@ class Viewport:
             if picked_prim:
                 u_p = float(pick[0])
                 v_p = float(pick[1])
-                tan_half = math.tan(math.radians(fov * 0.5))
-                sx = (u_p * 2.0 - 1.0) * tan_half * aspect
-                sy = (1.0 - v_p * 2.0) * tan_half
-                rdir_v = (-forward + right * sx + camera_up * sy).GetNormalized()
                 vc_inv = view_conversion.GetInverse()
-                ro_s = vc_inv.Transform(eye)
+                if is_ortho:
+                    ox = (u_p * 2.0 - 1.0) * ortho_half_width
+                    oy = (1.0 - v_p * 2.0) * ortho_half_height
+                    ro_v = eye + right * ox + camera_up * oy
+                    rdir_v = (-forward).GetNormalized()
+                    ro_s = vc_inv.Transform(ro_v)
+                else:
+                    tan_half = math.tan(math.radians(fov * 0.5))
+                    sx = (u_p * 2.0 - 1.0) * tan_half * aspect
+                    sy = (1.0 - v_p * 2.0) * tan_half
+                    rdir_v = (-forward + right * sx + camera_up * sy).GetNormalized()
+                    ro_s = vc_inv.Transform(eye)
                 rd_s = vc_inv.TransformDir(rdir_v)
                 hit = raycast_prim_hit(
                     stage,
@@ -1324,11 +1325,14 @@ class Viewport:
         binary_frame = bool(request.get('binaryFrame'))
         response = {
                 'width': width, 'height': height, 'renderer': renderer,
+                'projection': projection,
                 'viewProjection': [list(row) for row in view * frustum.ComputeProjectionMatrix()],
                 'poseBones': live_pose_bones,
                 'interactive': interactive, 'encoding': encoding, 'encodedBytes': len(encoded),
                 'graphStats': self.graph_stats,
                 'selectionInfo':selection_info,
+                'instancerHandles': usd_graph.instancer_handles(stage, frame) if graph and any(n.get('operation') == 'instancer' for n in graph.get('nodes', [])) else [],
+                'pickedObject': usd_graph.instancer_pick_target(stage, picked_prim, frame) if picked_prim and graph and any(n.get('operation') == 'instancer' for n in graph.get('nodes', [])) else None,
                 'pickedPrim': picked_prim,
                 'pickedMaterial': picked_material,
                 'pickedPoint': picked_point,
@@ -1545,9 +1549,14 @@ def dispatch(request):
         return coordinate_preflight(request)
     if operation == 'dependencies':
         from pxr import Sdf, UsdUtils
+        import megascans
         path = request.get('path')
         if not isinstance(path, str) or not path.strip():
             raise ValueError('A USD root layer path is required')
+        ext = os.path.splitext(path)[1].lower()
+        if ext in ('.json', '.fbx', '.gltf', '.glb', '.obj', '.goz'):
+            stage = _open_source_stage(path)
+            return {'files': megascans.collect_stage_external_files(stage, path), 'unresolved': []}
         root = Sdf.Layer.FindOrOpen(path)
         if root is None:
             raise ValueError('Unable to open USD root layer for dependency discovery')
@@ -1597,7 +1606,7 @@ def dispatch(request):
         stage,keepalive,_=compile_graph(json.loads(graph) if isinstance(graph,str) else graph)
     else:
         ext = os.path.splitext(path)[1].lower()
-        if ext in ('.abc', '.obj', '.vdb', '.goz', '.sublayer', '.orchflow'):
+        if ext in ('.abc', '.obj', '.vdb', '.goz', '.fbx', '.gltf', '.glb', '.json', '.sublayer', '.orchflow'):
             stage = _open_source_stage(path)
         else:
             stage = Usd.Stage.Open(path, load=Usd.Stage.LoadNone)

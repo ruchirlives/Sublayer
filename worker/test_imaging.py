@@ -193,3 +193,98 @@ class ImagingTests(unittest.TestCase):
         storm = self.request(renderer='HdStormRendererPlugin')
         self.assertEqual(storm['renderer'], 'HdStormRendererPlugin')
         self.assertTrue(storm['image'].startswith('data:image/png;base64,'))
+
+    def test_orthographic_projection_presets_picking_and_anchor_settle(self):
+        from pxr import Usd, UsdGeom
+        from PySide6.QtGui import QImage
+        with tempfile.TemporaryDirectory() as folder:
+            path = str(pathlib.Path(folder) / 'ortho_pair.usda')
+            stage = Usd.Stage.CreateNew(path)
+            UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.y)
+            UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+            root = UsdGeom.Xform.Define(stage, '/World')
+            stage.SetDefaultPrim(root.GetPrim())
+
+            def define_box_mesh(prim_path, tx, tz, color):
+                mesh = UsdGeom.Mesh.Define(stage, prim_path)
+                h = 0.5
+                mesh.CreatePointsAttr([
+                    (-h, -h, -h), (h, -h, -h), (h, h, -h), (-h, h, -h),
+                    (-h, -h, h), (h, -h, h), (h, h, h), (-h, h, h),
+                ])
+                mesh.CreateFaceVertexCountsAttr([4, 4, 4, 4, 4, 4])
+                mesh.CreateFaceVertexIndicesAttr([
+                    4, 5, 6, 7,  1, 0, 3, 2,  0, 4, 7, 3,
+                    5, 1, 2, 6,  3, 7, 6, 2,  0, 1, 5, 4,
+                ])
+                mesh.AddTranslateOp().Set((tx, 0.0, tz))
+                mesh.CreateDisplayColorAttr([color])
+                return mesh
+
+            # Near box at (-1.2, 0, +1.5), Far box at (+1.2, 0, -1.5), identical size 1.0
+            define_box_mesh('/World/NearBox', -1.2, 1.5, (0.95, 0.25, 0.25))
+            define_box_mesh('/World/FarBox', 1.2, -1.5, (0.25, 0.65, 0.95))
+            stage.GetRootLayer().Save()
+
+            def side_span(img_b64):
+                img = QImage.fromData(base64.b64decode(img_b64.split(',')[1]), 'PNG')
+                w, h = img.width(), img.height()
+                bg = img.pixelColor(0, 0)
+                left_ys = [y for y in range(h) for x in range(w // 2) if img.pixelColor(x, y) != bg]
+                right_ys = [y for y in range(h) for x in range(w // 2, w) if img.pixelColor(x, y) != bg]
+                return (max(left_ys) - min(left_ys)), (max(right_ys) - min(right_ys))
+
+            persp = self.request(path=path, width=480, height=320, yaw=0, pitch=0, zoom=1.2, projection='perspective', materials='solid', reload=True)
+            ortho = self.request(path=path, width=480, height=320, yaw=0, pitch=0, zoom=1.2, projection='orthographic', materials='solid')
+            self.assertEqual(persp['projection'], 'perspective')
+            self.assertEqual(ortho['projection'], 'orthographic')
+            p_left_h, p_right_h = side_span(persp['image'])
+            o_left_h, o_right_h = side_span(ortho['image'])
+            self.assertGreater(p_left_h, p_right_h + 10, 'Perspective must project the closer box taller than the far box')
+            self.assertLessEqual(abs(o_left_h - o_right_h), 2, 'Orthographic must project identical-size boxes at different depths to equal height')
+
+            # Exact Top (+90) and Bottom (-90) views must render cleanly with no gimbal singularity
+            for pitch_deg in (90, -90):
+                polar = self.request(path=path, width=320, height=240, yaw=0, pitch=pitch_deg, projection='orthographic', materials='solid')
+                self.assertEqual(polar['projection'], 'orthographic')
+                self.assertEqual(len(polar['viewProjection']), 4)
+
+            # Orthographic picking hits the off-center front face (z = +2.0) via parallel ray
+            vp = ortho['viewProjection']
+            clip = [sum(v * vp[r][c] for r, v in enumerate((-1.2, 0.0, 2.0, 1.0))) for c in range(4)]
+            u_near = (clip[0] / clip[3] + 1.0) * 0.5
+            v_near = (1.0 - clip[1] / clip[3]) * 0.5
+            picked = self.request(path=path, width=480, height=320, yaw=0, pitch=0, zoom=1.2, projection='orthographic', materials='solid', pick=[u_near, v_near])
+            self.assertEqual(picked['pickedPrim'], '/World/NearBox')
+            self.assertIsNotNone(picked['pickedPoint'])
+            self.assertAlmostEqual(picked['pickedPoint'][0], -1.2, delta=0.05)
+            self.assertAlmostEqual(picked['pickedPoint'][2], 2.0, delta=0.05)
+
+            # Orthographic transform-anchor settling keeps zoom unchanged when translating along camera depth
+            graph_base = {
+                'targetNodeId': 'out',
+                'nodes': [
+                    {'id': 'src', 'operation': 'source', 'inputDependencyId': 'dep'},
+                    {'id': 'xf', 'operation': 'transform', 'transform': {'translation': [0.0, 0.0, 0.0], 'rotation': [0.0, 0.0, 0.0], 'scale': [1.0, 1.0, 1.0]}},
+                    {'id': 'out', 'operation': 'output'},
+                ],
+                'edges': [{'id': 'e1', 'source': 'src', 'target': 'xf'}, {'id': 'e2', 'source': 'xf', 'target': 'out'}],
+                'dependencies': [{'id': 'dep', 'path': path}],
+            }
+            self.request(graph=graph_base, cameraSession='ortho-settle', frameFit=1, yaw=0, pitch=0, zoom=1.35, projection='orthographic', transformGizmoNodeId='xf', materials='solid')
+            graph_moved = {
+                **graph_base,
+                'nodes': [
+                    graph_base['nodes'][0],
+                    {'id': 'xf', 'operation': 'transform', 'transform': {'translation': [0.0, 0.0, 2.0], 'rotation': [0.0, 0.0, 0.0], 'scale': [1.0, 1.0, 1.0]}},
+                    graph_base['nodes'][2],
+                ],
+            }
+            settled = self.request(graph=graph_moved, cameraSession='ortho-settle', frameFit=1, yaw=0, pitch=0, zoom=1.35, projection='orthographic', transformGizmoNodeId='xf', materials='solid')
+            self.assertIsNotNone(settled['cameraSync'])
+            self.assertAlmostEqual(settled['cameraSync']['zoom'], 1.35, places=6)
+
+            # Reject invalid projection
+            with self.assertRaises(ValueError):
+                self.request(projection='fisheye')
+            self.request()

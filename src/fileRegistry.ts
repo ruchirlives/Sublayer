@@ -736,6 +736,19 @@ export const defaultPostFx: PostFxSettings = {
   sharpness: 0.5,
 };
 
+export type InstancerInstance = {
+  id: string;
+  sourcePath: string;
+  visible: boolean;
+  transform: Transform;
+};
+export type InstancerSettings = {
+  movement: "ground" | "free" | "x" | "y" | "z" | "custom";
+  lockedAxes: [boolean, boolean, boolean];
+  instances: InstancerInstance[];
+};
+export const defaultInstancer: InstancerSettings = { movement: "ground", lockedAxes: [false, false, false], instances: [] };
+
 export type Data = {
   blenderSelections?: string[];
   blenderScene?: string | null;
@@ -756,6 +769,9 @@ export type Data = {
   metahumanLod?: number;
   metahumanBodyPath?: string;
   metahumanMaterials?: boolean;
+  megascansLod?: number;
+  megascansResolution?: string;
+  megascansNormalConvention?: string;
   character?: CharacterSettings | null;
   pose?: PoseSettings | null;
   camera?: ViewportCamera | null;
@@ -770,6 +786,7 @@ export type Data = {
   nativePreparation?:Omit<NativeImport,"baselineDependencyId">|null;
   deletePaths?:string[];
   scatter?: ScatterSettings | null;
+  instancer?: InstancerSettings | null;
   groupName?: string;
   loadPayloads?: boolean;
   useAsPayload?: boolean;
@@ -805,12 +822,15 @@ export type StoredData = Omit<
   mdBridgeDependencyId?: string | null;
   publishedDependencyId: string | null;
 };
+export type CameraProjection = "perspective" | "orthographic";
+
 export type ViewportCamera = {
   yaw: number;
   pitch: number;
   zoom: number;
   panX: number;
   panY: number;
+  projection?: CameraProjection;
   fov?: number;
   dofEnabled?: boolean;
   focusDistance?: number;
@@ -906,7 +926,7 @@ export function storeProject(
     return result.ids[0] || null;
   }
   const stored = nodes.map((node) => {
-    const { path, metahumanBodyPath, nativeProject, publishedPath, appExecutable, ...data } = node.data;
+    const { path, metahumanBodyPath, nativeProject, mdBridgePath, publishedPath, appExecutable, ...data } = node.data;
     return {
       ...node,
       data: {
@@ -918,7 +938,7 @@ export function storeProject(
           : {}),
         appExecutableDependencyId: register(appExecutable || "", "executable"),
         nativeProjectDependencyId: register(nativeProject, "nativeProject"),
-        mdBridgeDependencyId: register(node.data.mdBridgePath || "", "asset"),
+        mdBridgeDependencyId: register(mdBridgePath || "", "asset"),
         publishedDependencyId: register(publishedPath, "usd"),
       },
     };
@@ -1297,6 +1317,15 @@ export function graphPreview(
       id: n.id,
       operation: applicationInput && n.id === targetNodeId ? (n.data.inputDependencyId ? "source" : "output") : n.data.operation,
       inputDependencyId: n.data.inputDependencyId,
+      ...(n.data.operation === "source"
+        ? {
+            ...(typeof n.data.megascansLod === "number" ? { megascansLod: n.data.megascansLod } : {}),
+            ...(n.data.megascansResolution ? { megascansResolution: n.data.megascansResolution } : {}),
+            ...(n.data.megascansNormalConvention
+              ? { megascansNormalConvention: n.data.megascansNormalConvention }
+              : {}),
+          }
+        : {}),
       ...(n.data.operation === "metahuman"
         ? {
             metahumanLod: n.data.metahumanLod ?? 0,
@@ -1325,6 +1354,7 @@ export function graphPreview(
       ...(n.data.operation==="transform" && n.data.transformTargets?.length ? {transformTargets: n.data.transformTargets} : {}),
       ...(n.data.operation==="delete" ? {deletePaths:n.data.deletePaths || []}:{}),
       ...(n.data.operation==="scatter" ? {scatter: n.data.scatter || defaultScatter}:{}),
+      ...(n.data.operation==="instancer" ? {instancer: n.data.instancer || defaultInstancer}:{}),
       ...(n.data.operation==="group" && n.data.groupName ? {groupName: n.data.groupName}:{}),
       ...(n.data.operation==="material_bind" ? {materialBindings:n.data.materialBindings || []}:{}),
       ...(n.data.operation==="light" ? {lightOverrides:n.data.lightOverrides || [], ...(typeof n.data.lightIntensityScale === "number" && n.data.lightIntensityScale > 0 ? {lightIntensityScale: n.data.lightIntensityScale} : {})}:{}),

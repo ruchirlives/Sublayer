@@ -4,7 +4,7 @@ import { emitTo, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { LatestRenderQueue } from "./renderQueue";
 
-type ViewportCamera = { yaw: number; pitch: number; zoom: number; panX: number; panY: number };
+type ViewportCamera = { yaw: number; pitch: number; zoom: number; panX: number; panY: number; projection?: "perspective" | "orthographic"; fov?: number };
 
 type HairGroomStatePayload = {
   path: string;

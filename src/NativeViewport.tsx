@@ -1,8 +1,13 @@
+import { InstancerViewport } from "./InstancerViewport";
+import type { InstancerEditor, InstancerHandle } from "./instancer";
+import type { InstancerSettings } from "./fileRegistry";
 import { PoseViewportEditor, type LivePoseOverride, type PoseViewportProps } from "./PoseViewportEditor";
 import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent, type ReactNode } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { LatestRenderQueue, previewSize } from "./renderQueue";
+import { paintViewportBitmap } from "./viewportImage";
+import { viewportGraphContext } from "./viewportGraph";
 import { NumberInput } from "./NumberInput";
 import type { CacheEditDelta, CacheEditMask, HairGroomDelta, Transform, ViewportCamera, ViewportSettings } from "./fileRegistry";
 import { TransformGizmo } from "./TransformGizmo";
@@ -10,7 +15,7 @@ import { TransformGizmo } from "./TransformGizmo";
 type Delegate = { id: string; name: string; support: string };
 type OvrtxMode = "realtime" | "pathTracing";
 type CameraAnchor = { session: string; fit: number; center: [number, number, number]; radius: number; unitScale?: number; translation?: [number, number, number]; transformTarget?: string | null; gizmoOffset?: [number, number, number] | null };
-type PickResult = { prim: string; material?: string | null; point: Frame["pickedPoint"] };
+type PickResult = { sourcePrim?: string; origin?: [number, number, number]; error?: string; prim: string; material?: string | null; point: Frame["pickedPoint"] };
 type Capabilities = {
   version: string;
   viewport: boolean;
@@ -19,6 +24,7 @@ type Capabilities = {
   viewportError?: string;
 };
 type Frame = {
+  instancerHandles?: InstancerHandle[];
   viewProjection?:number[][];
   poseBones?: { worldPoints: number[][]; worldAxes: number[][][] } | null;
   image: string;
@@ -49,10 +55,12 @@ type Frame = {
   roundTripMs: number;
   pngBytes: number;
   interactive?: boolean;
+  pickedObject?: {sourcePrim?: string; origin?: [number,number,number];error?:string} | null;
   pickedPrim?: string | null;
   pickedMaterial?: string | null;
   pickedPoint?: [number, number, number] | null;
   encoding?: string;
+  projection?: "perspective" | "orthographic";
   upAxis: string;
   materialMode?: "scene" | "solid" | "mixed";
   selectionInfo?: { materialCount: number; meshCount: number };
@@ -66,7 +74,7 @@ type Frame = {
   vramUsedMb?: number | null;
   vramTotalMb?: number | null;
   cachedScenes?: number;
-  updateKind?: "cache-hit" | "material-delta" | "material-delta-fast" | "full-rebuild" | "hair-delta" | "hair-brush" | "groom-commit" | "groom-xform-delta" | "pose-delta" | "cache-delta" | "postfx-delta";
+  updateKind?: "transform-overlay" | "cache-hit" | "material-delta" | "material-delta-fast" | "full-rebuild" | "hair-delta" | "hair-brush" | "groom-commit" | "groom-xform-delta" | "pose-delta" | "cache-delta" | "postfx-delta";
   sceneMs?: number;
   stepMs?: number;
   hairGroomDeltas?: Record<string, HairGroomDelta>;
@@ -85,7 +93,21 @@ type Frame = {
   pickId?: number;
   nativePopupOpen?: boolean;
 };
-const home = { yaw: 35, pitch: 20, zoom: 1, panX: 0, panY: 0 };
+const home: ViewportCamera = { yaw: 35, pitch: 20, zoom: 1, panX: 0, panY: 0, projection: "perspective" };
+const VIEW_PRESETS = [
+  { id: "persp", label: "3/4 Persp", yaw: 35, pitch: 20, projection: "perspective" as const },
+  { id: "front", label: "Front", yaw: 0, pitch: 0, projection: "orthographic" as const },
+  { id: "back", label: "Back", yaw: 180, pitch: 0, projection: "orthographic" as const },
+  { id: "right", label: "Right", yaw: 90, pitch: 0, projection: "orthographic" as const },
+  { id: "left", label: "Left", yaw: -90, pitch: 0, projection: "orthographic" as const },
+  { id: "top", label: "Top", yaw: 0, pitch: 90, projection: "orthographic" as const },
+  { id: "bottom", label: "Bottom", yaw: 0, pitch: -90, projection: "orthographic" as const },
+] as const;
+
+function normalizeDeg180(deg: number): number {
+  const m = ((deg + 180) % 360 + 360) % 360;
+  return m === 0 && deg > 0 ? 180 : m - 180;
+}
 function hashContent(value: string): string {
   let h1 = 0xdeadbeef, h2 = 0x41c64e6d;
   for (let i = 0; i < value.length; i++) {
@@ -100,7 +122,8 @@ function hashContent(value: string): string {
 
 export function NativeViewport({
   path,
-  graph,
+  graph: sourceGraph,
+  instancerEditor,
   emptyTitle,
   emptyMessage,
   previewControls,
@@ -130,6 +153,7 @@ export function NativeViewport({
 }: {
   path: string;
   graph?: string;
+  instancerEditor?: InstancerEditor | null;
   emptyTitle?: string;
   emptyMessage?: string;
   previewControls?: ReactNode;
@@ -167,6 +191,13 @@ export function NativeViewport({
   onTimeChange?: (frame: number) => void;
   seekFrameRequest?: { frame: number; seq: number } | null;
 }) {
+  const [instancerPreview, setInstancerPreview] = useState<InstancerSettings | null>(null);
+  const graph = useMemo(() => {
+    if (!sourceGraph || !instancerPreview || !instancerEditor) return sourceGraph;
+    const parsed = JSON.parse(sourceGraph);
+    parsed.nodes = parsed.nodes.map((n: {id: string}) => n.id === instancerEditor.nodeId ? {...n, instancer: instancerPreview} : n);
+    return JSON.stringify(parsed);
+  }, [sourceGraph, instancerPreview, instancerEditor?.nodeId]);
   const host = useRef<HTMLDivElement>(null);
   const onCommitHairGroomRef = useRef(onCommitHairGroom);
   onCommitHairGroomRef.current = onCommitHairGroom;
@@ -392,10 +423,89 @@ export function NativeViewport({
     a!.zoom === b!.zoom &&
     a!.panX === b!.panX &&
     a!.panY === b!.panY &&
+    (a!.projection ?? "perspective") === (b!.projection ?? "perspective") &&
     a!.fov === b!.fov &&
     a!.dofEnabled === b!.dofEnabled &&
     a!.focusDistance === b!.focusDistance &&
     a!.fStop === b!.fStop;
+
+  const activePresetId = useMemo(() => {
+    const proj = camera.projection ?? "perspective";
+    const normYaw = normalizeDeg180(camera.yaw);
+    for (const p of VIEW_PRESETS) {
+      if (p.projection !== proj) continue;
+      if (Math.abs(camera.pitch - p.pitch) > 0.05) continue;
+      if (Math.abs(p.pitch) >= 89.95 && Math.abs(normYaw) <= 0.05) return p.id;
+      const diffYaw = Math.abs(normalizeDeg180(normYaw - p.yaw));
+      if (diffYaw <= 0.05) return p.id;
+    }
+    return "custom";
+  }, [camera.yaw, camera.pitch, camera.projection]);
+
+  const applyViewPreset = useCallback((presetId: (typeof VIEW_PRESETS)[number]["id"]) => {
+    const preset = VIEW_PRESETS.find((p) => p.id === presetId);
+    if (!preset) return;
+    setCamera((c) => ({
+      ...c,
+      yaw: preset.yaw,
+      pitch: preset.pitch,
+      panX: 0,
+      panY: 0,
+      projection: preset.projection,
+    }));
+  }, []);
+
+  const toggleProjection = useCallback(() => {
+    setCamera((c) => ({
+      ...c,
+      projection: c.projection === "orthographic" ? "perspective" : "orthographic",
+    }));
+  }, []);
+
+  useEffect(() => {
+    if (!sceneMode) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          target.tagName === "SELECT" ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+      if (event.altKey || event.metaKey || event.shiftKey) return;
+      const isCtrl = event.ctrlKey;
+      const code = event.code;
+      const key = event.key;
+      if (code === "Numpad1" || key === "1") {
+        event.preventDefault();
+        applyViewPreset(isCtrl ? "back" : "front");
+      } else if (code === "Numpad3" || key === "3") {
+        event.preventDefault();
+        applyViewPreset(isCtrl ? "left" : "right");
+      } else if (code === "Numpad7" || key === "7") {
+        event.preventDefault();
+        applyViewPreset(isCtrl ? "bottom" : "top");
+      } else if (!isCtrl && (code === "Numpad5" || key === "5")) {
+        event.preventDefault();
+        toggleProjection();
+      } else if (!isCtrl && (code === "Numpad9" || key === "9")) {
+        event.preventDefault();
+        setCamera((c) =>
+          Math.abs(c.pitch) >= 89.95
+            ? { ...c, pitch: -c.pitch }
+            : { ...c, yaw: normalizeDeg180(c.yaw + 180) },
+        );
+      } else if (!isCtrl && (code === "Numpad0" || key === "0")) {
+        event.preventDefault();
+        applyViewPreset("persp");
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [sceneMode, applyViewPreset, toggleProjection]);
 
   useEffect(() => {
     if (interacting || !viewportSettings?.camera) return;
@@ -684,6 +794,7 @@ export function NativeViewport({
           image.src = result.image;
           try {
             await image.decode();
+            result.imageBitmap = await createImageBitmap(image);
           } catch (decodeError) {
             if (result.image.startsWith("blob:")) URL.revokeObjectURL(result.image);
             throw decodeError;
@@ -696,6 +807,7 @@ export function NativeViewport({
         };
         result.presentedCamera = {
           yaw: Number(request.yaw), pitch: Number(request.pitch),
+          projection: request.projection === "orthographic" ? "orthographic" : "perspective",
           fov: typeof request.fov === "number" ? request.fov : undefined,
           panX: result.cameraSync?.panX ?? result.sentCamera.panX,
           panY: result.cameraSync?.panY ?? result.sentCamera.panY,
@@ -705,15 +817,14 @@ export function NativeViewport({
         return result;
       },
       present: (result) => {
+        // Paint before retiring the previous decoded frame. The canvas stays mounted
+        // across PNG/JPEG/RGBA transitions and retains its last pixels during decode.
+        paintViewportBitmap(rgbaCanvasRef.current, result);
         if (presentedImage?.bitmap && presentedImage.bitmap !== result.imageBitmap) {
           presentedImage.bitmap.close();
         }
-        presentedImage = result.viewportImageId ? { id: result.viewportImageId, url: result.image, bitmap: result.imageBitmap } : null;
-        if (result.image && result.image.startsWith("blob:")) {
-          revokePreviousUrl(result.image);
-        } else {
-          revokePreviousUrl("");
-        }
+        presentedImage = { id: result.viewportImageId ?? "", url: result.image, bitmap: result.imageBitmap };
+        revokePreviousUrl(result.image.startsWith("blob:") ? result.image : "");
         if (result.cameraAnchor) cameraAnchor.current = result.cameraAnchor;
         if (result.cameraTransform) onCameraTransformChange?.(result.cameraTransform);
         if (result.cameraSync && result.sentCamera) {
@@ -734,13 +845,6 @@ export function NativeViewport({
         if (typeof result.hairPinnedCount === "number") {
           setPinnedCount(result.hairPinnedCount);
         }
-        const canvas = rgbaCanvasRef.current;
-        if (canvas && result.imageBitmap) {
-          if (canvas.width !== result.width) canvas.width = result.width;
-          if (canvas.height !== result.height) canvas.height = result.height;
-          const ctx = canvas.getContext("2d");
-          if (ctx) ctx.drawImage(result.imageBitmap, 0, 0);
-        }
         setFrame(result);
         if (result.hairSolveStats?.totalStrands) {
           setLastHairFrame((previous) => ({
@@ -753,13 +857,14 @@ export function NativeViewport({
         const pick = pendingPick.current;
         if (pick && pick.id === result.pickId) {
           pendingPick.current = null;
-          pick.resolve(result.pickedPrim ? { prim: result.pickedPrim, material: result.pickedMaterial, point: result.pickedPoint } : null);
+          pick.resolve(result.pickedPrim ? { ...result.pickedObject, prim: result.pickedPrim, material: result.pickedMaterial, point: result.pickedPoint } : null);
         }
         setPresentedContext(latestContextKeyRef.current);
         setActiveStatus(null);
         setError("");
       },
       discard: (result) => {
+        if (result.imageBitmap && result.imageBitmap !== presentedImage?.bitmap) result.imageBitmap.close();
         if (result.image.startsWith("blob:") && result.image !== activeObjectUrl.current) {
           URL.revokeObjectURL(result.image);
         }
@@ -785,6 +890,8 @@ export function NativeViewport({
     queue.current = scheduler;
     return () => {
       scheduler.dispose();
+      presentedImage?.bitmap?.close();
+      presentedImage = null;
       pendingPick.current?.resolve(null);
       pendingPick.current = null;
       revokePreviousUrl("");
@@ -885,30 +992,7 @@ export function NativeViewport({
   const contextGraphKey = useMemo(() => {
     if (!graph) return undefined;
     try {
-      const parsed = JSON.parse(graph);
-      if (Array.isArray(parsed?.nodes)) {
-        parsed.nodes = parsed.nodes.map((n: Record<string, unknown>) => {
-          if (n?.operation === "transform") return { ...n, transform: null };
-          if (n?.operation === "pose") return { ...n, pose: null };
-          if (n?.operation === "cache_edit" && n.cacheEdit && typeof n.cacheEdit === "object") {
-            const ce = n.cacheEdit as Record<string, unknown>;
-            return {
-              ...n,
-              cacheEdit: {
-                targetQuery: ce.targetQuery ?? "",
-                simEnabled: Boolean(ce.simEnabled),
-                simCacheVersion: ce.simCacheVersion ?? 0,
-                layers: ce.layers,
-                temporalSmoothFrames: ce.temporalSmoothFrames ?? 0,
-                temporalSmoothStrength: ce.temporalSmoothStrength ?? 0,
-                maskWeights: ce.maskWeights,
-              },
-            };
-          }
-          return n;
-        });
-      }
-      return hashContent(JSON.stringify(parsed));
+      return hashContent(viewportGraphContext(graph));
     } catch {
       return graphKey;
     }
@@ -1265,14 +1349,6 @@ export function NativeViewport({
   }, [hairPopupOpen]);
 
   useEffect(() => {
-    const canvas = rgbaCanvasRef.current;
-    if (!canvas || !frame?.imageBitmap) return;
-    if (canvas.width !== frame.width) canvas.width = frame.width;
-    if (canvas.height !== frame.height) canvas.height = frame.height;
-    const ctx = canvas.getContext("2d");
-    if (ctx) ctx.drawImage(frame.imageBitmap, 0, 0);
-  }, [frame]);
-  useEffect(() => {
     if (!livePhysics || !hasSimulatedHair || brushingActive || busy || error || !path || !capabilities?.viewport) return;
     hairGroomDirtyRef.current = true;
     setHairBrush({
@@ -1364,9 +1440,13 @@ export function NativeViewport({
             const anchorRadius = Math.max(0.05, cameraAnchor.current?.radius ?? 0.5);
             const unitScale = Math.max(1e-4, cameraAnchor.current?.unitScale ?? 1.0);
             const aspectMin = Math.min(popupSize.width / Math.max(1, popupSize.height), 1);
-            const baseFovRad = Math.atan(Math.tan((22.5 * Math.PI) / 180) * aspectMin);
+            const fitTan = Math.tan((22.5 * Math.PI) / 180);
+            const baseFovRad = Math.atan(fitTan * aspectMin);
             const camDist = (anchorRadius / Math.sin(baseFovRad)) * 1.15 * Math.max(0.002, popupCamera.zoom);
-            const tanHalfFov = Math.tan((22.5 * Math.PI) / 180);
+            const tanHalfFov =
+              popupCamera.projection === "orthographic"
+                ? fitTan
+                : Math.tan((((popupCamera.fov ?? 45) * 0.5) * Math.PI) / 180);
             return Math.max(
               6,
               Math.min(
@@ -1733,9 +1813,13 @@ export function NativeViewport({
   function getCacheBrushPxRad(viewWidth: number, viewHeight: number): number {
     const anchorRadius = Math.max(0.05, cameraAnchor.current?.radius ?? 0.5);
     const aspectMin = Math.min(viewWidth / Math.max(1, viewHeight), 1);
-    const baseFovRad = Math.atan(Math.tan((22.5 * Math.PI) / 180) * aspectMin);
+    const fitTan = Math.tan((22.5 * Math.PI) / 180);
+    const baseFovRad = Math.atan(fitTan * aspectMin);
     const camDist = (anchorRadius / Math.sin(baseFovRad)) * 1.15 * Math.max(0.002, camera.zoom);
-    const tanHalfFov = Math.tan((((camera.fov ?? 45) * 0.5) * Math.PI) / 180);
+    const tanHalfFov =
+      camera.projection === "orthographic"
+        ? fitTan
+        : Math.tan((((camera.fov ?? 45) * 0.5) * Math.PI) / 180);
     // Scale brush radius relative to scene anchor so cursor is always intuitive regardless of asset units
     const worldRad = cacheBrushRadius * Math.max(0.1, anchorRadius);
     return Math.max(
@@ -2152,30 +2236,19 @@ export function NativeViewport({
           : {
               ...start.camera,
               yaw: start.camera.yaw - dx * 0.4,
-              pitch: Math.max(-89, Math.min(89, start.camera.pitch + dy * 0.4)),
+              pitch: Math.max(-90, Math.min(90, start.camera.pitch + dy * 0.4)),
             },
     );
   }
   return (
     <>
       <div ref={host} className="native-viewport">
-        {frame ? (
-          <>
-            <canvas
-              ref={rgbaCanvasRef}
-              className="hydra-frame"
-              style={{ display: frame.imageBitmap ? "block" : "none" }}
-            />
-            {!frame.imageBitmap && (
-              <img
-                className="hydra-frame"
-                src={frame.image}
-                alt={`USD stage rendered by ${renderer} on ${frame.gpu}`}
-                draggable={false}
-              />
-            )}
-          </>
-        ) : (
+        <canvas
+          ref={rgbaCanvasRef}
+          className="hydra-frame"
+          style={{ display: frame ? "block" : "none" }}
+        />
+        {!frame && (
           <div className="placeholder">
             <div>◈</div>
             <h1>{!path && emptyTitle ? emptyTitle : busy ? "Rendering scene…" : error ? "Unable to preview scene" : path ? "Scene preview" : "Your stage, connected."}</h1>
@@ -2375,9 +2448,13 @@ export function NativeViewport({
           const anchorRadius = Math.max(0.05, cameraAnchor.current?.radius ?? 0.5);
           const unitScale = Math.max(1e-4, cameraAnchor.current?.unitScale ?? 1.0);
           const aspectMin = Math.min(size.width / Math.max(1, size.height), 1);
-          const baseFovRad = Math.atan(Math.tan((22.5 * Math.PI) / 180) * aspectMin);
+          const fitTan = Math.tan((22.5 * Math.PI) / 180);
+          const baseFovRad = Math.atan(fitTan * aspectMin);
           const camDist = (anchorRadius / Math.sin(baseFovRad)) * 1.15 * Math.max(0.002, camera.zoom);
-          const tanHalfFov = Math.tan((((camera.fov ?? 45) * 0.5) * Math.PI) / 180);
+          const tanHalfFov =
+            camera.projection === "orthographic"
+              ? fitTan
+              : Math.tan((((camera.fov ?? 45) * 0.5) * Math.PI) / 180);
           const pxRad = Math.max(
             6,
             Math.min(size.height * 0.45, ((brushRadius * unitScale) / Math.max(1e-4, camDist * tanHalfFov)) * (size.height * 0.5)),
@@ -2411,6 +2488,16 @@ export function NativeViewport({
             />
           );
         })()}
+        {instancerEditor?.enabled && graphTargetNodeIdRef.current !== instancerEditor.nodeId && <div style={{position:"absolute",bottom:70,left:16,zIndex:8,background:"#13241e",padding:8}}>Preview the Instancer output to edit. <button onClick={instancerEditor.onPreviewNode}>Preview this node</button></div>}
+        {instancerEditor && <InstancerViewport key={instancerEditor.nodeId} editor={instancerEditor} host={host}
+          active={sceneMode && instancerEditor.enabled && graphTargetNodeIdRef.current === instancerEditor.nodeId}
+          camera={frame?.presentedCamera ?? camera} upAxis={upAxis} width={size.width} height={size.height}
+          center={frame?.cameraAnchor?.center ?? [0,0,0]} radius={frame?.cameraAnchor?.radius ?? 1}
+          matrix={frame?.viewProjection} handles={frame?.instancerHandles ?? []}
+          pick={(x,y) => pickPrimAtClientPoint(x,y,false)} onPreview={setInstancerPreview} onError={setError}
+          onNavigate={(dx,dy,done) => {setInteracting(!done);setCamera({...camera,yaw:camera.yaw-dx*0.4,pitch:Math.max(-90,Math.min(90,camera.pitch+dy*0.4))});}}
+
+        />}
         {poseEditor && graph && frame && <PoseViewportEditor editor={poseEditor} graph={graph} frame={time} matrix={frame.viewProjection} width={size.width} height={size.height} interactive={sceneMode} onInteractingChange={onPoseInteractingChange} onLiveRotateJoint={setLivePoseOverride} liveBones={frame.poseBones ?? null} />}
         {transformGizmo && gizmoNodeId && frame?.cameraAnchor?.transformTarget === gizmoNodeId && (
           <TransformGizmo
@@ -2591,15 +2678,31 @@ export function NativeViewport({
           >
             Scene
           </button>
-          <button onClick={() => { setCamera(home); setFrameTarget(undefined); setFrameFit(value => value + 1); }}>Frame all</button>
+          <button
+            onClick={() => {
+              setCamera((c) =>
+                c.projection === "orthographic"
+                  ? { ...c, panX: 0, panY: 0, zoom: 1 }
+                  : { ...c, yaw: home.yaw, pitch: home.pitch, panX: 0, panY: 0, zoom: 1 },
+              );
+              setFrameTarget(undefined);
+              setFrameFit((value) => value + 1);
+            }}
+          >
+            Frame all
+          </button>
           <button
             disabled={!selectedPrim}
             title={selectedPrim ? `Frame selected prim: ${selectedPrim}` : "Select a prim to frame"}
             onClick={() => {
               if (selectedPrim) {
-                setCamera(home);
+                setCamera((c) =>
+                  c.projection === "orthographic"
+                    ? { ...c, panX: 0, panY: 0, zoom: 1 }
+                    : { ...c, yaw: home.yaw, pitch: home.pitch, panX: 0, panY: 0, zoom: 1 },
+                );
                 setFrameTarget(selectedPrim);
-                setFrameFit(value => value + 1);
+                setFrameFit((value) => value + 1);
               }
             }}
           >
@@ -3295,6 +3398,39 @@ export function NativeViewport({
               </select>
             </>
           )}
+          <button
+            type="button"
+            aria-label="Camera projection"
+            className={camera.projection === "orthographic" ? "chosen" : ""}
+            onClick={toggleProjection}
+            title="Toggle Perspective / Orthographic projection (Shortcut: 5 in Scene mode)"
+          >
+            {camera.projection === "orthographic" ? "Ortho" : "Persp"}
+          </button>
+          <select
+            aria-label="Viewport view preset"
+            value={activePresetId}
+            onChange={(e) => {
+              const next = e.target.value;
+              if (next !== "custom") {
+                applyViewPreset(next as (typeof VIEW_PRESETS)[number]["id"]);
+              }
+            }}
+            title="Switch to 3/4 Perspective or axis-aligned Orthographic view (Shortcuts in Scene mode: 1 Front, Ctrl+1 Back, 3 Right, Ctrl+3 Left, 7 Top, Ctrl+7 Bottom, 9 Opposite, 0 Persp)"
+          >
+            {activePresetId === "custom" && (
+              <option value="custom" disabled>
+                View: {camera.projection === "orthographic" ? "Custom (Ortho)" : "Custom"}
+              </option>
+            )}
+            <option value="persp">View: 3/4 Persp</option>
+            <option value="front">View: Front (Ortho)</option>
+            <option value="back">View: Back (Ortho)</option>
+            <option value="right">View: Right (Ortho)</option>
+            <option value="left">View: Left (Ortho)</option>
+            <option value="top">View: Top (Ortho)</option>
+            <option value="bottom">View: Bottom (Ortho)</option>
+          </select>
           <select
             aria-label="View up axis"
             value={upAxis}
@@ -3314,7 +3450,7 @@ export function NativeViewport({
       <div className="viewport-caption">
         <span>
           {sceneMode
-            ? "Drag to orbit · Shift/right-drag to pan · Right-click for menu · Double-click for Graph · Ctrl+right-drag or scroll to dolly · Ctrl-click to pick"
+            ? "Drag to orbit · Shift/right-drag to pan · 1/3/7/5 ortho views · Right-click for menu · Double-click for Graph · Ctrl+right-drag or scroll to dolly · Ctrl-click to pick"
             : "Graph mode · Double-click canvas for Scene · Ctrl-click to pick"}
         </span>
         {showBusyStatus ? (
@@ -3325,7 +3461,7 @@ export function NativeViewport({
         {frame && !gizmoDragging ? (
           <span>
             {frame.updateKind ? `${frame.renderer === "OmniverseRTX" ? "RTX" : frame.renderer} (${frame.updateKind}) · ` : ""}
-            {frame.width}×{frame.height} · {frame.upAxis} up ·{" "}
+            {frame.width}×{frame.height} · {frame.upAxis} up{camera.projection === "orthographic" ? " · ortho" : ""} ·{" "}
             {frame.renderMs.toFixed(0)} ms render · {frame.captureMs.toFixed(0)}{" "}
             ms capture · {frame.roundTripMs.toFixed(0)} ms round trip
             {combMode && lastHairFrame?.hairSolveStats ? ` · last groom: ${lastHairFrame.hairSolveStats.guideStrands} guides / ${lastHairFrame.hairSolveStats.totalStrands} strands${lastHairFrame.hairSolveStats.fullSolveStrands ? ` · full solve on ${lastHairFrame.hairSolveStats.fullSolveStrands}` : ""}` : ""}

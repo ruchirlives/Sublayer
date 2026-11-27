@@ -2,6 +2,7 @@ import { InspectorHint } from "./InspectorHint";
 import { OperationProgress } from "./OperationProgress";
 import { useEffect, useState } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { defaultEditScope } from "./profilePolicy";
 import { useApplicationCatalog, findProfile } from "./applicationProfiles";
 import { PublicationPanel } from "./PublicationPanel";
@@ -73,6 +74,12 @@ export function NativeProjectPanel({
   const inheritedExecutable = profile?.executable || "";
   const effectiveExecutable = data.appExecutable || inheritedExecutable;
   const [busy, setBusy] = useState(false);
+  const [busyScope, setBusyScope] = useState<"md-export" | "native" | null>(null);
+  const [busyLabel, setBusyLabel] = useState("");
+  const [exportProgress, setExportProgress] = useState<{
+    detail?: string;
+    progress?: number | null;
+  }>({});
   const [creationMessage, setCreationMessage] = useState("");
   const [quickstartMessage, setQuickstartMessage] = useState("");
   const [preparingQuickstart, setPreparingQuickstart] = useState(false);
@@ -90,11 +97,14 @@ export function NativeProjectPanel({
     handoffAvailable?: boolean;
     handoffPath?: string;
     handoffExportedAt?: number;
+    handoffAbcAvailable?: boolean;
+    handoffAbcPath?: string;
+    handoffAbcExportedAt?: number;
   } | null>(null);
   const [bridgeFeedback, setBridgeFeedback] = useState("");
-  const [copiedScript, setCopiedScript] = useState<"send" | "pull" | null>(null);
+  const [copiedScript, setCopiedScript] = useState<"send" | "pull" | "abc" | null>(null);
 
-  async function copyBridgeScript(kind: "send" | "pull", text: string) {
+  async function copyBridgeScript(kind: "send" | "pull" | "abc", text: string) {
     let copied = false;
     try {
       await navigator.clipboard.writeText(text);
@@ -135,6 +145,9 @@ export function NativeProjectPanel({
         handoffAvailable?: boolean;
         handoffPath?: string;
         handoffExportedAt?: number;
+        handoffAbcAvailable?: boolean;
+        handoffAbcPath?: string;
+        handoffAbcExportedAt?: number;
       }>("md_bridge_status");
       setMdBridge(info);
     } catch {
@@ -216,16 +229,53 @@ export function NativeProjectPanel({
     };
   }, [data.nativeProject, effectiveExecutable, revision, onStatus]);
 
-  async function run(task: () => Promise<void>) {
+  async function run(
+    task: () => Promise<void>,
+    scope: "md-export" | "native" = "native",
+    label = "",
+  ) {
     setBusy(true);
+    setBusyScope(scope);
+    setBusyLabel(label);
+    setExportProgress({});
     try {
       await task();
     } catch (error) {
       onStatus(String(error));
     } finally {
       setBusy(false);
+      setBusyScope(null);
+      setBusyLabel("");
+      setExportProgress({});
     }
   }
+
+  useEffect(() => {
+    if (!isTauri() || !busy || busyScope !== "md-export") return;
+    let unlisten: (() => void) | undefined;
+    listen<{
+      phase?: string;
+      details?: { kind?: string; frame?: number; totalFrames?: number };
+    }>("renderer-status", (event) => {
+      const details = event.payload?.details;
+      if (details?.kind !== "md-export") return;
+      const pct =
+        typeof details.frame === "number" &&
+        typeof details.totalFrames === "number" &&
+        details.totalFrames > 0
+          ? details.frame / details.totalFrames
+          : null;
+      setExportProgress({
+        detail: event.payload?.phase || undefined,
+        progress: pct,
+      });
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, [busy, busyScope]);
 
   async function browse(field: "nativeProject") {
     const { open } = await import("@tauri-apps/plugin-dialog");
@@ -457,52 +507,206 @@ export function NativeProjectPanel({
         </section>
       )}
 
-      <section className="coordinate-panel app-workflow-step">
-        <div className="app-section-heading">
-          <h3>
-            <span className="app-step-number">01</span> Handoff
-            <InspectorHint text="Create one binary USD handoff, with the selected objects, materials and coordinate conversion. Textures remain linked. Recreate it explicitly after upstream changes; this does not create a native project." />
-          </h3>
-          <span className={"app-state " + (data.handoff ? "ready" : "")}>
-            {data.handoff ? "Prepared" : "Not prepared"}
-          </span>
-        </div>
-        {data.handoff && (
-          <div
-            className="app-file"
-            title={
-              project.dependencies.find(
-                (d) => d.id === data.handoff?.dependencyId,
-              )?.path
+      {data.app === "Marvelous Designer" ? (
+        <section className="coordinate-panel app-workflow-step">
+          {busy && busyScope === "md-export" && (
+            <OperationProgress
+              label={busyLabel || "Exporting MD Bridge handoff..."}
+              detail={exportProgress.detail}
+              progress={exportProgress.progress}
+            />
+          )}
+          <div className="app-section-heading">
+            <h3>
+              <span className="app-step-number">01</span> Send to MD
+              <InspectorHint text="Export your character/avatar in millimetres for Marvelous Designer. Use Pose Ramp (.abc, 30f) to animate from rest pose at frame 0 into the current pose at frame 30, or Static Avatar (.obj) with sublayer_pull_avatar.py." />
+            </h3>
+            <span
+              className={
+                "app-state " +
+                (mdBridge?.handoffAbcAvailable || mdBridge?.handoffAvailable
+                  ? "ready"
+                  : "")
+              }
+            >
+              {mdBridge?.handoffAbcAvailable || mdBridge?.handoffAvailable
+                ? "Prepared"
+                : "Not sent"}
+            </span>
+          </div>
+          {mdBridge?.handoffAbcAvailable && mdBridge.handoffAbcPath && (
+            <div className="app-file" title={mdBridge.handoffAbcPath}>
+              <span className="app-file-kind">Pose ramp (0→30f)</span>
+              <strong>{mdBridge.handoffAbcPath.split(/[\\/]/).pop()}</strong>
+              <button
+                type="button"
+                className="app-text-action"
+                onClick={() =>
+                  void copyBridgeScript("abc", mdBridge.handoffAbcPath!)
+                }
+              >
+                {copiedScript === "abc" ? "Copied ✓" : "Copy path"}
+              </button>
+            </div>
+          )}
+          {mdBridge?.handoffAvailable && mdBridge.handoffPath && (
+            <div className="app-file" title={mdBridge.handoffPath}>
+              <span className="app-file-kind">Static avatar (.obj)</span>
+              <strong>{mdBridge.handoffPath.split(/[\\/]/).pop()}</strong>
+            </div>
+          )}
+          <button
+            className="primary"
+            type="button"
+            disabled={busy || !isTauri()}
+            title="Export an Alembic (.abc) that starts in the default rest pose at frame 0 and animates over 30 frames into the current pose"
+            onClick={() =>
+              run(async () => {
+                const res = await invoke<{
+                  handoffAbcPath: string;
+                  meshCount: number;
+                  rampFrames: number;
+                }>("send_to_md_bridge", {
+                  project,
+                  nodeId,
+                  baseName: `${projectName}_${data.label}`,
+                  format: "abc",
+                  rampFrames: 30,
+                });
+                await refreshMdBridge();
+                const msg = `Exported ${res.handoffAbcPath.split(/[\\/]/).pop()} (${res.meshCount} mesh(es), 0→${res.rampFrames}f pose ramp). Import via File → Import → Alembic in MD.`;
+                setBridgeFeedback(msg);
+                onStatus(msg);
+              }, "md-export", "Exporting 30-frame pose ramp (.abc)...")
             }
           >
-            <span className="app-file-kind">USD input</span>
-            <strong>
-              {project.dependencies
-                .find((d) => d.id === data.handoff?.dependencyId)
-                ?.path.split(/[\\/]/)
-                .pop()}
-            </strong>
+            Export Pose Ramp (.abc, 30f)
+          </button>
+          <button
+            className="app-secondary"
+            type="button"
+            disabled={busy || !isTauri()}
+            onClick={() =>
+              run(async () => {
+                const res = await invoke<{
+                  handoffPath: string;
+                  meshCount: number;
+                }>("send_to_md_bridge", {
+                  project,
+                  nodeId,
+                  baseName: `${projectName}_${data.label}`,
+                  format: "obj",
+                });
+                await refreshMdBridge();
+                const msg = `Sent ${res.handoffPath.split(/[\\/]/).pop()} (${res.meshCount} mesh(es)) to MD Bridge. Run sublayer_pull_avatar.py in MD to import it.`;
+                setBridgeFeedback(msg);
+                onStatus(msg);
+              }, "md-export", "Exporting static avatar (.obj)...")
+            }
+          >
+            Send Static Avatar (.obj)
+          </button>
+          {mdBridge?.pullScriptPath && (
+            <button
+              className="app-secondary"
+              type="button"
+              onClick={() =>
+                void copyBridgeScript("pull", mdBridge.pullScriptPath!)
+              }
+            >
+              {copiedScript === "pull"
+                ? "Copied Pull Avatar script ✓"
+                : "Copy Pull Avatar script"}
+            </button>
+          )}
+          <button
+            className="app-secondary"
+            type="button"
+            disabled={!isTauri()}
+            onClick={() => void invoke("open_md_bridge_folder")}
+          >
+            Open Bridge Folder
+          </button>
+          <details className="node-options">
+            <summary>Advanced: USD Handoff &amp; coordinates</summary>
+            {data.handoff && (
+              <div
+                className="app-file"
+                title={
+                  project.dependencies.find(
+                    (d) => d.id === data.handoff?.dependencyId,
+                  )?.path
+                }
+              >
+                <span className="app-file-kind">USD input</span>
+                <strong>
+                  {project.dependencies
+                    .find((d) => d.id === data.handoff?.dependencyId)
+                    ?.path.split(/[\\/]/)
+                    .pop()}
+                </strong>
+              </div>
+            )}
+            <CoordinatePanel
+              projectName={projectName}
+              project={project}
+              nodeId={nodeId}
+              data={data}
+              onChange={onChange}
+              onHandoff={onHandoff}
+              onStatus={onStatus}
+            />
+          </details>
+        </section>
+      ) : (
+        <section className="coordinate-panel app-workflow-step">
+          <div className="app-section-heading">
+            <h3>
+              <span className="app-step-number">01</span> Handoff
+              <InspectorHint text="Create one binary USD handoff, with the selected objects, materials and coordinate conversion. Textures remain linked. Recreate it explicitly after upstream changes; this does not create a native project." />
+            </h3>
+            <span className={"app-state " + (data.handoff ? "ready" : "")}>
+              {data.handoff ? "Prepared" : "Not prepared"}
+            </span>
           </div>
-        )}
-        <CoordinatePanel
-          projectName={projectName}
-          project={project}
-          nodeId={nodeId}
-          data={data}
-          onChange={onChange}
-          onHandoff={onHandoff}
-          onStatus={onStatus}
-        />
-      </section>
+          {data.handoff && (
+            <div
+              className="app-file"
+              title={
+                project.dependencies.find(
+                  (d) => d.id === data.handoff?.dependencyId,
+                )?.path
+              }
+            >
+              <span className="app-file-kind">USD input</span>
+              <strong>
+                {project.dependencies
+                  .find((d) => d.id === data.handoff?.dependencyId)
+                  ?.path.split(/[\\/]/)
+                  .pop()}
+              </strong>
+            </div>
+          )}
+          <CoordinatePanel
+            projectName={projectName}
+            project={project}
+            nodeId={nodeId}
+            data={data}
+            onChange={onChange}
+            onHandoff={onHandoff}
+            onStatus={onStatus}
+          />
+        </section>
+      )}
 
       <section className="coordinate-panel app-workflow-step">
-        {busy && !preparingQuickstart && (
+        {busy && !preparingQuickstart && busyScope === "native" && (
           <OperationProgress
             label={
-              data.nativeProject
+              busyLabel ||
+              (data.nativeProject
                 ? "Opening or linking native project..."
-                : "Preparing native project..."
+                : "Preparing native project...")
             }
           />
         )}
@@ -673,149 +877,133 @@ export function NativeProjectPanel({
         )}
       </section>
 
-      {data.app === "Marvelous Designer" && (
-        <section className="coordinate-panel app-workflow-step">
-          <div className="app-section-heading">
-            <h3>
-              MD Live Bridge
-              <InspectorHint text="Run scripts/md_bridge/sublayer_send_garment.py inside Marvelous Designer (Script -> Python Editor) to export your open garment without the avatar, then pull it here." />
-            </h3>
-            <button
-              className="app-text-action"
-              type="button"
-              onClick={() => void refreshMdBridge()}
-            >
-              Refresh
-            </button>
-          </div>
-          {mdBridge?.available && mdBridge.exportPath ? (
-            <>
-              <div className="app-file" title={mdBridge.exportPath}>
-                <span className="app-file-kind">
-                  Open garment · {mdBridge.projectName || "Untitled"}
+      {data.app === "Marvelous Designer" ? (
+        <>
+          <section className="coordinate-panel app-workflow-step">
+            <div className="app-section-heading">
+              <h3>
+                <span className="app-step-number">03</span> Pull Garment
+                <InspectorHint text="Export your simulated garment as garment.abc or garment.obj into the MD Bridge folder (or run sublayer_send_garment.py), then click Pull Garment into Scene." />
+              </h3>
+              <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                <button
+                  className="app-text-action"
+                  type="button"
+                  onClick={() => void refreshMdBridge()}
+                >
+                  Refresh
+                </button>
+                <span className={"app-state " + (data.mdBridgePath ? "ready" : "")}>
+                  {data.mdBridgePath ? "Active" : mdBridge?.available ? "Ready" : "Waiting"}
                 </span>
-                <strong>{mdBridge.exportPath.split(/[\\/]/).pop()}</strong>
               </div>
-              <button
-                className="primary"
-                type="button"
-                disabled={busy || !isTauri()}
-                onClick={() => {
-                  const patch: Partial<Data> = {
-                    mdBridgePath: mdBridge.exportPath!,
-                  };
-                  if (
-                    !data.nativeProject &&
-                    mdBridge.projectPath &&
-                    /\.(zprj|zpac)$/i.test(mdBridge.projectPath)
-                  ) {
-                    patch.nativeProject = mdBridge.projectPath;
-                  }
-                  onChange(patch);
-                  onMdBridgePulled?.();
-                  const fileName = mdBridge.exportPath!.split(/[\\/]/).pop() || "garment.obj";
-                  const msg = `Pulled ${fileName} into scene output (combined with upstream avatar, mm → m).`;
-                  setBridgeFeedback(msg);
-                  onStatus(msg);
-                }}
-              >
-                Pull from MD Bridge
-              </button>
-            </>
-          ) : (
-            <p className="hint">
-              No MD bridge export yet. Run <code>sublayer_send_garment.py</code>{" "}
-              in MD&apos;s Python Editor.
-            </p>
-          )}
-          {data.mdBridgePath && (
-            <div className="app-file" title={data.mdBridgePath}>
-              <span className="app-file-kind">Active MD garment</span>
-              <strong>{data.mdBridgePath.split(/[\\/]/).pop()}</strong>
-              <button
-                type="button"
-                className="app-text-action"
-                onClick={() => {
-                  onChange({ mdBridgePath: "" });
-                  setBridgeFeedback("Cleared pulled MD garment.");
-                }}
-              >
-                Clear
-              </button>
             </div>
-          )}
-          {mdBridge?.handoffAvailable && mdBridge.handoffPath && (
-            <div className="app-file" title={mdBridge.handoffPath}>
-              <span className="app-file-kind">Handoff avatar</span>
-              <strong>{mdBridge.handoffPath.split(/[\\/]/).pop()}</strong>
-            </div>
-          )}
-          <button
-            type="button"
-            disabled={busy || !isTauri()}
-            onClick={() =>
-              run(async () => {
-                const res = await invoke<{
-                  handoffPath: string;
-                  meshCount: number;
-                }>("send_to_md_bridge", {
-                  project,
-                  nodeId,
-                  baseName: `${projectName}_${data.label}`,
-                });
-                await refreshMdBridge();
-                const msg = `Sent ${res.handoffPath.split(/[\\/]/).pop()} (${res.meshCount} mesh(es)) to MD Bridge. Run sublayer_pull_avatar.py in MD to import it.`;
-                setBridgeFeedback(msg);
-                onStatus(msg);
-              })
-            }
-          >
-            Send Handoff to MD Bridge
-          </button>
-          {mdBridge?.scriptPath && (
-            <button
-              className="app-secondary"
-              type="button"
-              onClick={() => void copyBridgeScript("send", mdBridge.scriptPath)}
-            >
-              {copiedScript === "send"
-                ? "Copied Send Garment script ✓"
-                : "Copy Send Garment script"}
-            </button>
-          )}
-          {mdBridge?.pullScriptPath && (
-            <button
-              className="app-secondary"
-              type="button"
-              onClick={() =>
-                void copyBridgeScript("pull", mdBridge.pullScriptPath!)
-              }
-            >
-              {copiedScript === "pull"
-                ? "Copied Pull Avatar script ✓"
-                : "Copy Pull Avatar script"}
-            </button>
-          )}
-          {bridgeFeedback && (
-            <p className="app-notice" role="status">
-              {bridgeFeedback}
-            </p>
-          )}
-        </section>
-      )}
+            {data.mdBridgePath && (
+              <div className="app-file" title={data.mdBridgePath}>
+                <span className="app-file-kind">Active MD garment</span>
+                <strong>{data.mdBridgePath.split(/[\\/]/).pop()}</strong>
+                <button
+                  type="button"
+                  className="app-text-action"
+                  onClick={() => {
+                    onChange({ mdBridgePath: "" });
+                    setBridgeFeedback("Cleared pulled MD garment.");
+                  }}
+                >
+                  Clear
+                </button>
+              </div>
+            )}
+            {mdBridge?.available && mdBridge.exportPath ? (
+              <>
+                <div className="app-file" title={mdBridge.exportPath}>
+                  <span className="app-file-kind">
+                    Bridge export · {mdBridge.projectName || "MD"}
+                  </span>
+                  <strong>{mdBridge.exportPath.split(/[\\/]/).pop()}</strong>
+                </div>
+                <button
+                  className="primary"
+                  type="button"
+                  disabled={busy || !isTauri()}
+                  onClick={() => {
+                    const patch: Partial<Data> = {
+                      mdBridgePath: mdBridge.exportPath!,
+                    };
+                    if (
+                      !data.nativeProject &&
+                      mdBridge.projectPath &&
+                      /\.(zprj|zpac)$/i.test(mdBridge.projectPath)
+                    ) {
+                      patch.nativeProject = mdBridge.projectPath;
+                    }
+                    onChange(patch);
+                    onMdBridgePulled?.();
+                    const fileName =
+                      mdBridge.exportPath!.split(/[\\/]/).pop() || "garment";
+                    const msg = `Pulled ${fileName} into scene output (combined with upstream avatar, mm → m).`;
+                    setBridgeFeedback(msg);
+                    onStatus(msg);
+                  }}
+                >
+                  Pull Garment into Scene
+                </button>
+              </>
+            ) : (
+              <p className="hint">
+                No MD bridge export yet. Export <code>garment.abc</code> /{" "}
+                <code>garment.obj</code> to the bridge folder, or run{" "}
+                <code>sublayer_send_garment.py</code> in MD.
+              </p>
+            )}
+            {mdBridge?.scriptPath && (
+              <button
+                className="app-secondary"
+                type="button"
+                onClick={() => void copyBridgeScript("send", mdBridge.scriptPath)}
+              >
+                {copiedScript === "send"
+                  ? "Copied Send Garment script ✓"
+                  : "Copy Send Garment script"}
+              </button>
+            )}
+            {bridgeFeedback && (
+              <p className="app-notice" role="status">
+                {bridgeFeedback}
+              </p>
+            )}
+          </section>
 
-      <PublicationPanel
-        key={data.nativeImport?.baselineDependencyId}
-        onLive={onLive}
-        onBaseline={onBaseline}
-        project={project}
-        nodeId={nodeId}
-        data={data}
-        onPublished={onPublished}
-        onChange={onChange}
-        onStatus={onStatus}
-        onConfigure={onConfigure}
-      />
+          <details className="node-options">
+            <summary>Advanced: Manual baseline diff</summary>
+            <PublicationPanel
+              key={data.nativeImport?.baselineDependencyId}
+              onLive={onLive}
+              onBaseline={onBaseline}
+              project={project}
+              nodeId={nodeId}
+              data={data}
+              onPublished={onPublished}
+              onChange={onChange}
+              onStatus={onStatus}
+              onConfigure={onConfigure}
+            />
+          </details>
+        </>
+      ) : (
+        <PublicationPanel
+          key={data.nativeImport?.baselineDependencyId}
+          onLive={onLive}
+          onBaseline={onBaseline}
+          project={project}
+          nodeId={nodeId}
+          data={data}
+          onPublished={onPublished}
+          onChange={onChange}
+          onStatus={onStatus}
+          onConfigure={onConfigure}
+        />
+      )}
 
       <details className="node-options app-advanced">
         <summary>Advanced</summary>

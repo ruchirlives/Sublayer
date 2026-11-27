@@ -1,8 +1,8 @@
-"""Sublayer <-> Marvelous Designer Live Bridge: Pull avatar/handoff into open MD.
+"""Sublayer <-> Marvelous Designer Live Bridge: Pull avatar/pose-ramp into open MD.
 
 Load this script in Marvelous Designer (Script -> Python Editor) and click Run
-to import the latest handoff *_avatar.obj from %LOCALAPPDATA%/Sublayer/md_bridge/
-as an Avatar in the open scene.
+to import the newest handoff (*_avatar_pose.abc or *_avatar.obj) from
+%LOCALAPPDATA%/Sublayer/md_bridge/ as an Avatar in the open scene.
 """
 
 import json
@@ -17,18 +17,29 @@ def _resolve_handoff_path(bridge_dir):
     if os.path.isfile(manifest_path):
         try:
             with open(manifest_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            candidate = data.get("handoffPath") or ""
-            if candidate and os.path.isfile(candidate):
-                return candidate, data
+                data = json.load(f) or {}
+            candidates = []
+            abc_path = data.get("handoffAbcPath") or ""
+            if abc_path and os.path.isfile(abc_path):
+                abc_ts = int(data.get("handoffAbcExportedAt") or os.path.getmtime(abc_path) * 1000)
+                candidates.append((abc_ts, abc_path, data))
+            obj_path = data.get("handoffPath") or ""
+            if obj_path and os.path.isfile(obj_path):
+                obj_ts = int(data.get("exportedAt") or os.path.getmtime(obj_path) * 1000)
+                candidates.append((obj_ts, obj_path, data))
+            if candidates:
+                candidates.sort(key=lambda item: item[0], reverse=True)
+                return candidates[0][1], candidates[0][2]
         except Exception:
             pass
-    # Fallback: newest *_avatar.obj or handoff.obj in bridge_dir.
+
     if os.path.isdir(bridge_dir):
         candidates = [
             os.path.join(bridge_dir, name)
             for name in os.listdir(bridge_dir)
-            if name.endswith("_avatar.obj") or name == "handoff.obj"
+            if name.endswith("_avatar_pose.abc")
+            or name.endswith("_avatar.obj")
+            or name == "handoff.obj"
         ]
         candidates = [p for p in candidates if os.path.isfile(p)]
         if candidates:
@@ -40,9 +51,12 @@ def _resolve_handoff_path(bridge_dir):
 def main():
     local_app_data = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
     bridge_dir = os.path.join(local_app_data, "Sublayer", "md_bridge")
-    handoff_path, meta = _resolve_handoff_path(bridge_dir)
+    handoff_path, _meta = _resolve_handoff_path(bridge_dir)
     if not handoff_path:
-        msg = f"No Sublayer handoff avatar OBJ found in:\n{bridge_dir}\nClick 'Send Handoff to MD Bridge' in Sublayer first."
+        msg = (
+            f"No Sublayer handoff avatar (.abc or .obj) found in:\n{bridge_dir}\n"
+            "Click 'Export Pose Ramp (.abc, 30f)' or 'Send Static Avatar (.obj)' in Sublayer first."
+        )
         print(msg)
         try:
             utility_api.DisplayMessageBoxW(msg)
@@ -52,7 +66,7 @@ def main():
 
     opt = cloApiTypes.ImportExportOption()
     opt.bAdd = True
-    opt.scale = 1.0  # Sublayer already exports handoff *_avatar.obj in mm (0.001 m/unit).
+    opt.scale = 1.0  # Sublayer exports handoff .abc/.obj in mm (0.001 m/unit).
 
     # Import as Avatar when the enum/member is exposed by cloApiTypes.
     try:
@@ -65,7 +79,12 @@ def main():
     except Exception:
         pass
 
-    ok = import_api.ImportOBJW(handoff_path, opt)
+    ext = os.path.splitext(handoff_path)[1].lower()
+    if ext == ".abc":
+        ok = import_api.ImportFileW(handoff_path, opt)
+    else:
+        ok = import_api.ImportOBJW(handoff_path, opt)
+
     try:
         utility_api.Refresh3DWindow()
     except Exception:

@@ -138,3 +138,24 @@ Sublayer is licensed under the **GNU General Public License v3.0 or later (`GPL-
    - The Windows installer stages the open-source Autodesk Aurora Hydra delegate (`scripts/bundle-windows.ps1`) and explicitly removes proprietary NVIDIA MDL SDK DLLs (`libmdl_*.dll`) before packaging.
 3. **External Optional Runtimes**:
    - OpenUSD, `uv`, Python packages, and optional NVIDIA packages installed via `scripts/installer-runtimes.ps1` are downloaded directly by the user from their respective official upstream sources and remain governed by their own licenses.
+
+## Fab Browser and central asset library
+
+Configure **Applications → Megascans / Fab library**, then save the application settings. Library paths and multiple external-browser Downloads folders live in the shared `applications.json`. On first use Sublayer detects `I:\EpicGames\Megascans` if it exists and the Windows Downloads known folder, including relocated folders.
+
+**◈ Megascans / Fab** opens the local library panel. **Fab Browser** opens a separate embedded browser with a persistent WebView2 login profile, navigation buttons, and the configured download location. Sign in yourself and complete any site verification in that window. Use Fab's own Download button and format picker. Fab has no public download API.
+
+Completed embedded-browser downloads are redirected into the central library, indexed, and added to the graph. An unambiguous pending listing drop is filled first. External-browser Downloads folders and files placed directly in the library root are watched while a canvas listing drop is pending or Fab Browser is open.
+
+Rescan discovers custom nested folders up to six levels deep. Loose ZIPs are safely extracted beside the archive, which is retained. Existing extraction folders are preserved. Asset folders retain their variations, previews, and shared texture links. No project asset copies are created.
+
+Desktop acceptance remains manual: sign in and download an asset in Fab Browser, confirm library indexing and a selected graph node, drag a Fab listing card onto the canvas, save library settings in Applications, and Rescan an extracted asset in a nested custom folder.
+
+
+## Manual instance placement
+
+Connect a scene to an **Instancer** node and preview its output. Select the node, enter **Scene** mode, and **Alt + left-drag** an existing object to create one shared USD reference instance. Alt-drag a created placement to duplicate its transform. A small drag threshold prevents accidental overlapping copies. Clicking a placement selects it for the existing **W / E / R** move/rotate/scale gizmo; **Delete** removes only placements owned by this node. **Escape** cancels a drag and **Undo/Redo** operate on completed gestures.
+
+The inspector defaults to **Ground plane**, preserving starting height along the active Y/Z up axis. Choose Free, X/Y/Z only, or custom axis locks; constraints affect world-space translation, while rotation/scale remain available. The instance list provides visibility, source prim relinking, numeric transforms and Duplicate/Delete. Numeric coordinates allow explicit placement. **Edit instances** disables/enables these viewport tools; an unrelated pinned preview offers **Preview this node**.
+
+Original objects pass through, geometry/materials remain referenced, and placement records live in the single project JSON. Picking inside an existing USD instance selects its containing instance root. Skeletal/skinned subtrees and individual PointInstancer points are unsupported and report errors. Storm/RTX rendering and picking have headless coverage; desktop gesture feel and large-scene drag performance still require manual verification.

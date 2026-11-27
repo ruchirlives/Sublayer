@@ -32,9 +32,11 @@ import {
   defaultCacheEditSettings,
   defaultHairSettings,
   defaultCharacterSettings,
+  defaultMaterialX,
   identityTransform,
   defaultScatter,
   defaultPostFx,
+  registerFiles,
   editNodeData,
   expandProject,
   storeProject,
@@ -43,8 +45,11 @@ import {
   type Dependency,
   type ProceduralGraph,
   type StoredProject,
+  type ViewportCamera,
   type ViewportSettings,
 } from "./fileRegistry";
+import type { FabDropOutcome, MegascansAssetSummary } from "./MegascansPanel";
+const MegascansPanel = lazy(() => import("./MegascansPanel").then((m) => ({ default: m.MegascansPanel })));
 import { detachNodeFromEdges, insertExistingNodeOnEdge, insertToolbarNode, toolbarOperations, type DropTarget } from "./graphInsertion";
 import { previewTarget } from "./previewTarget";
 import { NativeViewport } from "./NativeViewport";
@@ -62,6 +67,8 @@ const CharacterInspector = lazy(() => import("./CharacterInspector").then((m) =>
 const BlenderInspector = lazy(() => import("./BlenderInspector").then((m) => ({ default: m.BlenderInspector })));
 import { TransformInspector } from "./TransformInspector";
 import { GroupInspector } from "./GroupInspector";
+import { InstancerInspector } from "./InstancerInspector";
+import { defaultInstancer, type InstancerSettings } from "./fileRegistry";
 import { ScatterInspector } from "./ScatterInspector";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -328,7 +335,7 @@ const Card = memo(function Card({ id, data, selected }: NodeProps<StageNode>) {
       <div className="card-body">
         <strong>{data.label}</strong>
         <p>
-          {["delete", "scatter", "transform", "group", "output", "assetOverride", "materialx", "material_bind", "light", "hdri", "postfx", "hair", "cache_edit", "pose", "character"].includes(data.operation)
+          {["delete", "scatter", "instancer", "transform", "group", "output", "assetOverride", "materialx", "material_bind", "light", "hdri", "postfx", "hair", "cache_edit", "pose", "character"].includes(data.operation)
             ? "Combined USD inputs"
             : data.operation === "blender"
               ? (data.nativeProject?.split(/[\\/]/).pop() || "No .blend linked")
@@ -370,6 +377,8 @@ const Card = memo(function Card({ id, data, selected }: NodeProps<StageNode>) {
           ? `XYZ scale ${(data.transform || identityTransform).scale.join(", ")}`
           : data.operation === "group"
           ? `/${(data.groupName || "Group").trim() || "Group"} · scale ${(data.transform || identityTransform).scale.join(", ")}`
+          : data.operation === "instancer"
+          ? `${data.instancer?.instances.length || 0} manual instances`
           : data.operation === "scatter"
           ? `${(data.scatter || defaultScatter).count} instances · ${(data.scatter || defaultScatter).distribution}`
           : data.operation === "pose"
@@ -431,6 +440,10 @@ function Workspace() {
   const [dependencies, setDependencies] = useState<Dependency[]>([]);
   const [materialXEditorId,setMaterialXEditorId]=useState<string|null>(null);
   const [materialXPrimDrop,setMaterialXPrimDrop]=useState<{primPath:string;seq:number}|null>(null);
+  const [megascansOpen, setMegascansOpen] = useState(false);
+  const [pendingFabDrops, setPendingFabDrops] = useState<Record<string, { nodeId: string; url: string; title: string }>>({});
+  const pendingFabDropsRef = useRef(pendingFabDrops);
+  pendingFabDropsRef.current = pendingFabDrops;
   const [overrideNodeId, setOverrideNodeId] = useState<string | null>(null);
   const [inspectorWidth, setInspectorWidth] = useState(310);
   const [resizingInspector, setResizingInspector] = useState(false);
@@ -484,6 +497,8 @@ function Workspace() {
     if(clearScenePrompt)clearSceneDialog.current?.showModal();
     else clearSceneDialog.current?.close();
   },[clearScenePrompt]);
+  const [instancerEditing, setInstancerEditing] = useState<string | null>(null);
+  const [instancerSelection, setInstancerSelection] = useState<{nodeId: string; id: string | null} | null>(null);
   const history=useRef(new ProjectHistory());
   const [,historyChanged]=useState(0);
   function commitQuickstart(nodeId: string, original: StoredProject, prepared: StoredProject) {
@@ -569,6 +584,7 @@ function Workspace() {
   }, []);
   function pin(id:string|null){applyProject({...projectRef.current,viewport:{...projectRef.current.viewport,pinnedNodeId:id}},"Pin preview");}
   const node = nodes.find((n) => n.id === selected);
+  useEffect(() => { setInstancerEditing(node?.data.operation === "instancer" ? node.id : null); setInstancerSelection(null); }, [node?.id, currentProjectSession]);
   const pinnedNode = nodes.find((n) => n.id === pinnedNodeId);
   const previewNode = pinnedNode || node;
   const previewId = previewNode?.id || "";
@@ -689,22 +705,388 @@ function Workspace() {
       editScope: defaultEditScope(chosen),
     };
   }
-  function dropNode(event:React.DragEvent) {
-    const operation=event.dataTransfer.getData("application/orchflow-node");
-    if(!toolbarOperations.includes(operation))return;
-    event.preventDefault();setDropTarget(null);
-    const position=flowInstance.current?.screenToFlowPosition({x:event.clientX,y:event.clientY});
-    if(!position)return;
-    const id=crypto.randomUUID();
-    const label=operation === "materialx"?"MaterialX":operation === "material_bind"?"Material Bind":operation === "light"?"Light":operation === "hdri"?"HDRI":operation === "postfx"?"PostFX":operation === "hair"?"Hair":operation === "cache_edit"?"Cache Sculptor":operation === "character"?"Character":operation === "camera"?"Camera":operation === "metahuman"?"MetaHuman":operation === "blender"?"Blender":operation === "assetOverride"?"Asset Override":operation === "source"?"Source stage":operation[0].toUpperCase()+operation.slice(1);
-    const defaultCamera = { yaw: 35, pitch: 20, zoom: 1, panX: 0, panY: 0, fov: 45, dofEnabled: false, focusDistance: 5, fStop: 5.6 };
-    const initialCamera = { ...defaultCamera, ...(projectRef.current.viewport?.camera ?? {}) };
-    const added=storeProject([{...seed[0],id,position,data:{...seed[0].data,label,operation,transform:structuredClone(identityTransform),...(operation === "application" ? defaultApplicationFields() : {}),...(operation === "postfx" ? { postFx: structuredClone(defaultPostFx) } : {}),...(operation === "cache_edit" ? { cacheEdit: structuredClone(defaultCacheEditSettings) } : {}),...(operation === "character" ? { character: structuredClone(defaultCharacterSettings) } : {}),...(operation === "camera" ? { cameraViews: [{ id: crypto.randomUUID(), name: "Camera 1", camera: initialCamera }] } : {})}}],[],[]).nodes[0];
+  function sanitizeUsdMaterialName(raw: string): string {
+    const cleaned = raw.replace(/[^A-Za-z0-9_]+/g, "_").replace(/^_+/, "");
+    const prefixed = /^[A-Za-z_]/.test(cleaned) ? cleaned : `M_${cleaned || "Megascans"}`;
+    return prefixed.slice(0, 96);
+  }
+
+  function buildProjectWithMegascansAsset(
+    base: StoredProject,
+    asset: MegascansAssetSummary,
+    position: { x: number; y: number },
+    dropTargetArg: DropTarget,
+    replaceNodeId?: string,
+  ): { project: StoredProject; nodeId: string } {
+    let deps = [...base.dependencies];
+    const regOne = (filePath: string | undefined, kind: "usd" | "asset"): string | null => {
+      if (!filePath || !filePath.trim()) return null;
+      const res = registerFiles(deps, [filePath], kind);
+      deps = res.dependencies;
+      return res.ids[0] || null;
+    };
+
+    const nodeId = replaceNodeId || crypto.randomUUID();
+    const isSurface = asset.assetType === "surface" || asset.assetType === "atlas";
+    const isHdri = asset.assetType === "hdri";
+
+    let storedNodeData: StoredProject["nodes"][number]["data"];
+    let discoveredForSource: { sourceId: string; files: { path: string; kind: "usd" | "asset" }[] } | null = null;
+
+    if (isSurface) {
+      const baseColorId = regOne(asset.pbrMaps.albedo, "asset");
+      const roughnessId = regOne(asset.pbrMaps.roughness || asset.pbrMaps.gloss, "asset");
+      const metallicId = regOne(asset.pbrMaps.metalness, "asset");
+      const normalId = regOne(asset.pbrMaps.normal || asset.pbrMaps.bump, "asset");
+      const opacityId = regOne(asset.pbrMaps.opacity, "asset");
+      const emissionId = regOne(asset.pbrMaps.emissive, "asset");
+      const matSettings = {
+        ...structuredClone(defaultMaterialX),
+        name: sanitizeUsdMaterialName(asset.name),
+        baseColor: [0.85, 0.85, 0.85] as [number, number, number],
+        subsurface: asset.pbrMaps.translucency ? 0.42 : 0,
+        baseColorTextureDependencyId: baseColorId,
+        roughnessTextureDependencyId: roughnessId,
+        metallicTextureDependencyId: metallicId,
+        normalTextureDependencyId: normalId,
+        opacityTextureDependencyId: opacityId,
+        emissionTextureDependencyId: emissionId,
+      };
+      const baseSeed = storeProject([{ ...seed[0], id: nodeId, position }], [], deps).nodes[0].data;
+      storedNodeData = {
+        ...baseSeed,
+        label: asset.name,
+        operation: "materialx",
+        transform: structuredClone(identityTransform),
+        materialX: matSettings,
+        materialXRules: [
+          {
+            id: crypto.randomUUID(),
+            enabled: true,
+            mode: "replace",
+            searchType: "simple",
+            query: "*",
+            material: structuredClone(matSettings),
+          },
+        ],
+      };
+    } else if (isHdri) {
+      const hdriId = regOne(asset.primaryPath, "asset");
+      const baseSeed = storeProject([{ ...seed[0], id: nodeId, position }], [], deps).nodes[0].data;
+      storedNodeData = {
+        ...baseSeed,
+        label: asset.name,
+        operation: "hdri",
+        transform: structuredClone(identityTransform),
+        hdri: {
+          textureDependencyId: hdriId,
+          intensity: 1,
+          exposure: 0,
+          rotation: 0,
+          color: [1, 1, 1],
+          textureFormat: "latlong",
+        },
+      };
+    } else {
+      const srcId = regOne(asset.primaryPath, "usd");
+      const baseSeed = storeProject([{ ...seed[0], id: nodeId, position }], [], deps).nodes[0].data;
+      const isJson = /\.json$/i.test(asset.primaryPath);
+      storedNodeData = {
+        ...baseSeed,
+        label: asset.name,
+        operation: "source",
+        inputDependencyId: srcId,
+        instanced: asset.assetType !== "3dplant",
+        transform: structuredClone(identityTransform),
+        ...(isJson ? { megascansLod: 0, megascansResolution: "auto", megascansNormalConvention: "opengl" } : {}),
+      };
+      if (srcId) {
+        const texFiles = Object.values(asset.pbrMaps).map((p) => ({ path: p, kind: "asset" as const }));
+        if (texFiles.length > 0) {
+          discoveredForSource = { sourceId: srcId, files: texFiles };
+        }
+      }
+    }
+
+    let nextProject: StoredProject;
+    if (replaceNodeId && base.nodes.some((n) => n.id === replaceNodeId)) {
+      nextProject = {
+        ...base,
+        dependencies: deps,
+        nodes: base.nodes.map((n) => (n.id === replaceNodeId ? { ...n, data: storedNodeData } : n)),
+      };
+    } else {
+      const newStoredNode: StoredProject["nodes"][number] = {
+        id: nodeId,
+        type: "stage",
+        position,
+        data: storedNodeData,
+      };
+      nextProject = insertToolbarNode({ ...base, dependencies: deps }, newStoredNode, dropTargetArg);
+    }
+
+    if (discoveredForSource) {
+      nextProject = mergeUsdDiscovery(nextProject, discoveredForSource.sourceId, discoveredForSource.files);
+    }
+    return { project: nextProject, nodeId };
+  }
+
+  function addMegascansAsset(asset: MegascansAssetSummary, posOverride?: { x: number; y: number }, targetOverride: DropTarget = null) {
+    const cur = projectRef.current;
+    const position = posOverride || { x: 180 + cur.nodes.length * 70, y: 190 + cur.nodes.length * 55 };
     try {
-      const target=targetAt(event.target);
-      applyProject(insertToolbarNode(projectRef.current,added,target),"Insert node");select(id);
-      setStatus(target?.kind === "edge"?"Inserted node into edge and shifted downstream nodes.":target?"Connected node and made space for the new branch.":"Added node at drop location.");
-    }catch(error){reportStatus(String(error));}
+      const { project: updated, nodeId } = buildProjectWithMegascansAsset(cur, asset, position, targetOverride);
+      applyProject(updated, `Import ${asset.name}`);
+      select(nodeId);
+      setStatus(`Added "${asset.name}" (${asset.assetType.toUpperCase()}) linked from ${asset.folderPath}.`);
+    } catch (error) {
+      reportStatus(String(error));
+    }
+  }
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    let unlistenReady: (() => void) | null = null;
+    let unlistenErr: (() => void) | null = null;
+    let unlistenSocket: (() => void) | null = null;
+    let disposed = false;
+
+    void import("@tauri-apps/api/event").then(async ({ listen }) => {
+      const u1 = await listen<{ dropId: string; asset: MegascansAssetSummary }>("fab-download-ready", (evt) => {
+        const { dropId, asset } = evt.payload;
+        const matches = Object.entries(pendingFabDropsRef.current).filter(([, pending]) =>
+          (asset.listingUid && pending.url.includes(asset.listingUid)) || pending.title && asset.name.toLowerCase().replace(/[^a-z0-9]/g,"") === pending.title.toLowerCase().replace(/[^a-z0-9]/g,""));
+        const matchedId = pendingFabDropsRef.current[dropId] ? dropId : matches.length === 1 ? matches[0][0] : dropId;
+        const pending = pendingFabDropsRef.current[matchedId];
+        if (pending) void invoke("cancel_fab_drop_watch", { dropId: matchedId });
+        setPendingFabDrops((prev) => {
+          const copy = { ...prev };
+          delete copy[matchedId];
+          return copy;
+        });
+        const cur = projectRef.current;
+        const existingNode = pending ? cur.nodes.find((n) => n.id === pending.nodeId) : undefined;
+        const pos = existingNode?.position || { x: 220, y: 200 };
+        const { project: updated, nodeId } = buildProjectWithMegascansAsset(
+          cur,
+          asset,
+          pos,
+          null,
+          existingNode?.id,
+        );
+        applyProject(updated, `Import Fab asset ${asset.name}`);
+        select(nodeId);
+        setStatus(`Fab download complete: "${asset.name}" unpacked into central library (${asset.folderPath}).`);
+      });
+      const u2 = await listen<{ dropId: string; error: string }>("fab-download-error", (evt) => {
+        const { dropId, error } = evt.payload;
+        setPendingFabDrops((prev) => {
+          const copy = { ...prev };
+          delete copy[dropId];
+          return copy;
+        });
+        reportStatus(error);
+      });
+      const u3 = await listen<MegascansAssetSummary[]>("megascans-socket-import", (evt) => {
+        const incomingAssets = evt.payload || [];
+        if (!incomingAssets.length) return;
+        let cur = projectRef.current;
+        let lastId = "";
+        incomingAssets.forEach((asset, idx) => {
+          const pos = { x: 200 + (cur.nodes.length + idx) * 75, y: 190 + idx * 65 };
+          const res = buildProjectWithMegascansAsset(cur, asset, pos, null);
+          cur = res.project;
+          lastId = res.nodeId;
+        });
+        applyProject(cur, `Socket import (${incomingAssets.length} asset${incomingAssets.length > 1 ? "s" : ""})`);
+        if (lastId) select(lastId);
+        setStatus(`Imported ${incomingAssets.length} asset(s) via Megascans / Fab socket.`);
+      });
+      if (disposed) {
+        u1();
+        u2();
+        u3();
+      } else {
+        unlistenReady = u1;
+        unlistenErr = u2;
+        unlistenSocket = u3;
+      }
+    });
+
+    return () => {
+      disposed = true;
+      unlistenReady?.();
+      unlistenErr?.();
+      unlistenSocket?.();
+    };
+  }, [reportStatus]);
+
+  function extractDroppedWebUrl(dt: DataTransfer): { url: string; title: string } | null {
+    const html = dt.getData("text/html");
+    let parsedUrl = "";
+    let parsedTitle = "";
+    if (html) {
+      try {
+        const doc = new DOMParser().parseFromString(html, "text/html");
+        const anchor = doc.querySelector("a[href]") as HTMLAnchorElement | null;
+        if (anchor?.href && /^https?:\/\//i.test(anchor.href)) {
+          parsedUrl = anchor.href.trim();
+          parsedTitle = (anchor.textContent || anchor.getAttribute("aria-label") || anchor.title || "").trim();
+        }
+        if (!parsedTitle) {
+          const img = doc.querySelector("img[alt]") as HTMLImageElement | null;
+          if (img?.alt) parsedTitle = img.alt.trim();
+        }
+      } catch {
+        /* ignore malformed html */
+      }
+    }
+    if (!parsedUrl) {
+      const uriList = dt.getData("text/uri-list") || dt.getData("text/plain");
+      const firstLine = uriList
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .find((l) => l && !l.startsWith("#") && /^https?:\/\//i.test(l));
+      if (firstLine) parsedUrl = firstLine;
+    }
+    if (!parsedUrl) return null;
+    return { url: parsedUrl, title: parsedTitle };
+  }
+
+  function isExternalAssetDrag(dt: DataTransfer): boolean {
+    const types = dt.types;
+    return (
+      types.includes("application/orchflow-node") ||
+      types.includes("application/orchflow-megascans") ||
+      types.includes("Files") ||
+      types.includes("text/uri-list") ||
+      types.includes("text/html")
+    );
+  }
+
+  function dropNode(event:React.DragEvent) {
+    const dt = event.dataTransfer;
+    const operation = dt.getData("application/orchflow-node");
+    if (toolbarOperations.includes(operation)) {
+      event.preventDefault();setDropTarget(null);
+      const position=flowInstance.current?.screenToFlowPosition({x:event.clientX,y:event.clientY});
+      if(!position)return;
+      const id=crypto.randomUUID();
+      const label=operation === "materialx"?"MaterialX":operation === "material_bind"?"Material Bind":operation === "light"?"Light":operation === "hdri"?"HDRI":operation === "postfx"?"PostFX":operation === "hair"?"Hair":operation === "cache_edit"?"Cache Sculptor":operation === "character"?"Character":operation === "camera"?"Camera":operation === "metahuman"?"MetaHuman":operation === "blender"?"Blender":operation === "assetOverride"?"Asset Override":operation === "source"?"Source stage":operation[0].toUpperCase()+operation.slice(1);
+      const defaultCamera = { yaw: 35, pitch: 20, zoom: 1, panX: 0, panY: 0, fov: 45, dofEnabled: false, focusDistance: 5, fStop: 5.6 };
+      const initialCamera = { ...defaultCamera, ...(projectRef.current.viewport?.camera ?? {}) };
+      const added=storeProject([{...seed[0],id,position,data:{...seed[0].data,label,operation,transform:structuredClone(identityTransform),...(operation === "application" ? defaultApplicationFields() : {}),...(operation === "postfx" ? { postFx: structuredClone(defaultPostFx) } : {}),...(operation === "cache_edit" ? { cacheEdit: structuredClone(defaultCacheEditSettings) } : {}),...(operation === "character" ? { character: structuredClone(defaultCharacterSettings) } : {}),...(operation === "camera" ? { cameraViews: [{ id: crypto.randomUUID(), name: "Camera 1", camera: initialCamera }] } : {})}}],[],[]).nodes[0];
+      try {
+        const target=targetAt(event.target);
+        applyProject(insertToolbarNode(projectRef.current,added,target),"Insert node");select(id);
+        setStatus(target?.kind === "edge"?"Inserted node into edge and shifted downstream nodes.":target?"Connected node and made space for the new branch.":"Added node at drop location.");
+      }catch(error){reportStatus(String(error));}
+      return;
+    }
+
+    // 1. Card dragged from Megascans / Fab Library panel
+    const msPayload = dt.getData("application/orchflow-megascans");
+    if (msPayload) {
+      event.preventDefault();
+      setDropTarget(null);
+      const position = flowInstance.current?.screenToFlowPosition({ x: event.clientX, y: event.clientY });
+      if (!position) return;
+      try {
+        const asset = JSON.parse(msPayload) as MegascansAssetSummary;
+        const target = targetAt(event.target);
+        addMegascansAsset(asset, position, target);
+      } catch (error) {
+        reportStatus(String(error));
+      }
+      return;
+    }
+
+    // 2. Local file(s) dragged from browser Downloads bar or Explorer
+    if (dt.files && dt.files.length > 0 && isTauri()) {
+      event.preventDefault();
+      setDropTarget(null);
+      const basePos = flowInstance.current?.screenToFlowPosition({ x: event.clientX, y: event.clientY });
+      if (!basePos) return;
+      const target = targetAt(event.target);
+      const droppedFiles = Array.from(dt.files).map((f) => ({ name: f.name, size: f.size }));
+      const projDir = projectPathRef.current
+        ? projectPathRef.current.replace(/[\\/][^\\/]+$/, "")
+        : null;
+      void run(async () => {
+        for (let i = 0; i < droppedFiles.length; i++) {
+          const item = droppedFiles[i];
+          setOperationProgress(`Importing ${item.name}…`);
+          const summary = await invoke<MegascansAssetSummary>("ingest_dropped_local_file", {
+            fileName: item.name,
+            fileSize: item.size,
+            projectDir: projDir,
+          });
+          addMegascansAsset(
+            summary,
+            { x: basePos.x + i * 70, y: basePos.y + i * 55 },
+            i === 0 ? target : null,
+          );
+        }
+      });
+      return;
+    }
+
+    // 3. Literal webpage drag (e.g. fab.com listing card or direct .glb/.usdz/.hdr URL)
+    const webDrop = extractDroppedWebUrl(dt);
+    if (webDrop && isTauri()) {
+      event.preventDefault();
+      setDropTarget(null);
+      const position = flowInstance.current?.screenToFlowPosition({ x: event.clientX, y: event.clientY });
+      if (!position) return;
+      const target = targetAt(event.target);
+      const dropId = crypto.randomUUID();
+      void (async () => {
+        try {
+          setStatus(`Checking central library for "${webDrop.title || webDrop.url}"…`);
+          const outcome = await invoke<FabDropOutcome>("resolve_or_watch_fab_drop", {
+            url: webDrop.url,
+            titleHint: webDrop.title,
+            dropId,
+          });
+          if (outcome.status === "ready" && outcome.asset) {
+            addMegascansAsset(outcome.asset, position, target);
+            setStatus(outcome.message);
+            return;
+          }
+          // Place pending node right at drop location and wait for browser download
+          const placeholderId = crypto.randomUUID();
+          const placeholderNode = storeProject(
+            [
+              {
+                ...seed[0],
+                id: placeholderId,
+                position,
+                data: {
+                  ...seed[0].data,
+                  label: `⏳ ${outcome.title} (Download in Fab)`,
+                  operation: "source",
+                  transform: structuredClone(identityTransform),
+                },
+              },
+            ],
+            [],
+            [],
+          ).nodes[0];
+          applyProject(
+            insertToolbarNode(projectRef.current, placeholderNode, target),
+            `Wait for Fab asset ${outcome.title}`,
+          );
+          select(placeholderId);
+          setPendingFabDrops((prev) => ({
+            ...prev,
+            [dropId]: { nodeId: placeholderId, url: outcome.url, title: outcome.title },
+          }));
+          setStatus(outcome.message);
+        } catch (error) {
+          reportStatus(String(error));
+        }
+      })();
+    }
   }
   function addNode(operation: string) {
     const id = crypto.randomUUID();
@@ -848,14 +1230,14 @@ function Workspace() {
       for (const dependency of initial.dependencies) {
         if (
           !dependency.usdReferences?.length &&
-          /\.(usd|usda|usdc|usdz)$/i.test(dependency.path)
+          /\.(usd|usda|usdc|usdz|json|fbx|gltf|glb|obj|goz)$/i.test(dependency.path)
         )
           rootIds.add(dependency.id);
       }
       const sources = Array.from(rootIds)
         .map((id) => initial.dependencies.find((d) => d.id === id))
         .filter((d): d is Dependency => {
-          if (!d || !/\.(usd|usda|usdc|usdz)$/i.test(d.path)) return false;
+          if (!d || !/\.(usd|usda|usdc|usdz|json|fbx|gltf|glb|obj|goz)$/i.test(d.path)) return false;
           if (!forceAll && d.usdReferences && d.usdReferences.length > 0) return false;
           return true;
         });
@@ -910,10 +1292,11 @@ function Workspace() {
       multiple: false,
       filters: [
         {
-          name: "Scene / Volume source",
-          extensions: ["usd", "usda", "usdc", "usdz", "abc", "obj", "vdb", "goz", "sublayer", "orchflow"],
+          name: "Scene / Megascans / Fab / Volume source",
+          extensions: ["usd", "usda", "usdc", "usdz", "abc", "fbx", "glb", "gltf", "json", "obj", "vdb", "goz", "sublayer", "orchflow"],
         },
         { name: "USD stage", extensions: ["usd", "usda", "usdc", "usdz"] },
+        { name: "Megascans / Fab (JSON / GLB / FBX)", extensions: ["json", "glb", "gltf", "fbx"] },
         { name: "Sublayer project", extensions: ["sublayer", "orchflow"] },
         { name: "Alembic", extensions: ["abc"] },
         { name: "Wavefront OBJ", extensions: ["obj"] },
@@ -941,7 +1324,7 @@ function Workspace() {
     if (!node || !node.data.path.trim()) return;
     const { save } = await import("@tauri-apps/plugin-dialog");
     const defaultName =
-      node.data.path.replace(/\.(abc|obj|vdb|goz|sublayer|orchflow)$/i, "") + ".usdc";
+      node.data.path.replace(/\.(abc|obj|vdb|goz|fbx|gltf|glb|json|sublayer|orchflow)$/i, "") + ".usdc";
     const destination = await save({
       defaultPath: defaultName,
       filters: [
@@ -1045,6 +1428,7 @@ function Workspace() {
                 else if (op === "materialx") settings = d.materialXRules ? { materialXRules: d.materialXRules } : { materialX: d.materialX ?? null };
                 else if (op === "transform") settings = { transform: d.transform ?? null, transformTargets: d.transformTargets ?? null };
                 else if (op === "pose") settings = { pose: d.pose ?? null };
+                else if (op === "instancer") settings = { instancer: d.instancer ?? defaultInstancer };
                 else if (op === "delete") settings = { deletePaths: d.deletePaths ?? [] };
                 else if (op === "camera") settings = { camera: d.camera ?? null, cameraViews: d.cameraViews ?? [] };
                 else if (op === "blender") settings = { blenderScene: d.blenderScene ?? null, blenderSelections: d.blenderSelections ?? [], blenderMaterialMode: d.blenderMaterialMode ?? null, blenderExportSkeletons: d.blenderExportSkeletons ?? null, scale: d.scale ?? 1 };
@@ -1181,6 +1565,17 @@ function Workspace() {
           <span className="nav-divider" aria-hidden="true" />
           <button className={"nav-tab" + (activeTab==="canvas"?" chosen":"")} onClick={()=>setActiveTab("canvas")}>Canvas</button>
           <button className={"nav-tab" + (activeTab==="applications"?" chosen":"")} onClick={()=>setActiveTab("applications")}>Applications</button>
+          <button
+            className={"nav-action" + (megascansOpen ? " chosen" : "")}
+            title="Browse I:\EpicGames\Megascans or import Fab assets"
+            onClick={() => {
+              setActiveTab("canvas");
+              setMegascansOpen((v) => !v);
+            }}
+          >
+            ◈ Megascans / Fab
+          </button>
+          <button className="nav-action" disabled={!isTauri()} onClick={() => void invoke("open_fab_browser").catch(e => reportStatus(String(e)))}>Fab Browser</button>
           {backendOutdated && (
             <button
               className="nav-action"
@@ -1249,6 +1644,18 @@ function Workspace() {
           <button onClick={() => setStatus("Ready")}>Dismiss</button>
         </div>
       )}
+      {megascansOpen && activeTab === "canvas" && (
+        <Suspense fallback={null}>
+          <MegascansPanel
+            onAddAsset={(asset) => addMegascansAsset(asset)}
+            onDragStartCanvasMode={() => setGraphModeRequest((n) => n + 1)}
+            onDragEndCanvas={() => setDropTarget(null)}
+            onStatus={reportStatus}
+            onSettings={() => { setMegascansOpen(false); setSettingsTarget(v => ({ id: "megascans-library", visit: v.visit + 1 })); setActiveTab("applications"); }}
+            onClose={() => setMegascansOpen(false)}
+          />
+        </Suspense>
+      )}
       {materialXEditorId && projectModel.nodes.some(n=>n.id===materialXEditorId && n.data.operation==="materialx") && <Suspense fallback={null}><MaterialXPanel key={materialXEditorId} project={projectModel} nodeId={materialXEditorId} pendingPrimDrop={materialXPrimDrop} onProjectChange={applyProject} onClose={()=>setMaterialXEditorId(null)}/></Suspense>}
       {overrideNodeId && projectModel.nodes.some(n => n.id === overrideNodeId) && (
         <div className="override-backdrop" onKeyDown={e => {
@@ -1270,7 +1677,7 @@ function Workspace() {
         <section className="workspace" style={activeTab==="applications"?{display:"none"}:undefined}>
           <SceneOverview path={target.path} graph={target.graph} selected={selectedPrim} onSelect={path=>setPrimSelection({key:sceneKey,path})} onAddToMaterialX={materialXEditorId && projectModel.nodes.some(n=>n.id===materialXEditorId && n.data.operation==="materialx") ? (primPath)=>setMaterialXPrimDrop(c=>({primPath,seq:(c?.seq ?? 0)+1})) : undefined} isolatedPrim={isolatedPrim} hiddenPrims={hiddenPrims} onHidePrim={p=>setHiddenPrims(prev=>prev.includes(p)?prev:[...prev,p])} onShowPrim={p=>setHiddenPrims(prev=>prev.filter(x=>x!==p))} onIsolatePrim={p=>setIsolatedPrim(cur=>cur===p?null:p)} onShowAll={()=>{setHiddenPrims([]);setIsolatedPrim(null);}} onStatus={reportStatus}/>
           <div className={"canvas " + (sceneMode ? "scene-mode" : "")} onDrop={dropNode} onDragOver={e=>{
-            if(e.dataTransfer.types.includes("application/orchflow-node")){e.preventDefault();e.dataTransfer.dropEffect="copy";const target=targetAt(e.target);setDropTarget(previous=>JSON.stringify(previous)===JSON.stringify(target)?previous:target);}
+            if(isExternalAssetDrag(e.dataTransfer)){e.preventDefault();e.dataTransfer.dropEffect="copy";const target=targetAt(e.target);setDropTarget(previous=>JSON.stringify(previous)===JSON.stringify(target)?previous:target);}
           }} onDragLeave={e=>{if(!e.currentTarget.contains(e.relatedTarget as Node))setDropTarget(null);}}>
             <NativeViewport key={currentProjectSession}
               onViewportError={(err) => { (bridgeStateRef.current as Record<string, unknown>).viewportError = err || null; }}
@@ -1424,6 +1831,16 @@ function Workspace() {
                 },
                 onCommit:()=>history.current.endGroup(),
               }:null}
+              instancerEditor={node?.data.operation === "instancer" ? {
+                nodeId: node.id,
+                settings: node.data.instancer || defaultInstancer,
+                onPreviewNode: () => pin(node.id),
+                enabled: instancerEditing === node.id,
+                selectedId: instancerSelection?.nodeId === node.id ? instancerSelection.id : null,
+                onSelect: id => setInstancerSelection({nodeId: node.id, id}),
+                onChange: (instancer: InstancerSettings, group?: string) => applyProject(editNodeData(projectRef.current, node.id, {instancer}), "Edit instances", group || null),
+                onCommit: () => history.current.endGroup(),
+              } : null}
               transformGizmo={(() => {
                 if (node?.data.operation === "transform") {
                   return {
@@ -1710,6 +2127,7 @@ function Workspace() {
                 ["camera", "Camera"],
                 ["delete", "Delete prims"],
                 ["scatter", "Scatter"],
+                ["instancer", "Instancer"],
                 ["output", "Output"],
               ];
               return (
@@ -1817,6 +2235,14 @@ function Workspace() {
                 </label>
                 {node.data.operation === "assetOverride" && <button onClick={() => setOverrideNodeId(node.id)}>Edit Asset Overrides… ({node.data.assetOverrides?.length || 0})</button>}
                 {node.data.operation === "delete" && <label><span className="field-label">Prim paths<InspectorHint text="One absolute path per line. Deactivates these prims on this branch; original files are unchanged. Instance-proxy children cannot be deleted separately."/></span><textarea value={(node.data.deletePaths || []).join("\n")} onChange={e=>update({deletePaths:e.target.value.split("\n").map(v=>v.trim()).filter(Boolean)})}/></label>}
+                {node.data.operation === "instancer" && <InstancerInspector
+                  value={node.data.instancer || defaultInstancer}
+                  selectedId={instancerSelection?.nodeId === node.id ? instancerSelection.id : null}
+                  editing={instancerEditing === node.id}
+                  onEditingChange={active => setInstancerEditing(active ? node.id : null)}
+                  onSelect={id => setInstancerSelection({nodeId: node.id, id})}
+                  onChange={instancer => update({instancer})}
+                />}
                 {node.data.operation === "scatter" && (
                   <ScatterInspector
                     project={projectModel}
@@ -1849,13 +2275,92 @@ function Workspace() {
                 {["source", "application"].includes(node.data.operation) && (
                   <>
                     {node.data.operation==="source"&&<>
-                      <label>Source file (USD / ABC / OBJ / VDB / GoZ / Sublayer)<input placeholder="C:\\assets\\scene.usda" value={node.data.path} onChange={e=>update({path:e.target.value})}/></label>
-                      <button disabled={busy || !isTauri()} onClick={()=>run(browse)}>Browse source...</button>
-                      {/\.(abc|obj|vdb|goz|sublayer|orchflow)$/i.test(node.data.path.trim()) && (
+                      {(() => {
+                        const pendingEntry = Object.entries(pendingFabDrops).find(([, v]) => v.nodeId === node.id);
+                        if (!pendingEntry) return null;
+                        const [dropId, info] = pendingEntry;
+                        return (
+                          <div className="fab-pending-banner">
+                            <strong>Waiting for Fab browser download…</strong>
+                            <p className="hint">
+                              Click <b>Download</b> on <code>{info.title}</code> in your browser. Sublayer is watching your Downloads folder and will unpack it into your central Megascans/Fab library automatically.
+                            </p>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                void invoke("cancel_fab_drop_watch", { dropId });
+                                setPendingFabDrops((prev) => {
+                                  const next = { ...prev };
+                                  delete next[dropId];
+                                  return next;
+                                });
+                                setStatus(`Cancelled Fab download watch for "${info.title}".`);
+                              }}
+                            >
+                              Cancel watch
+                            </button>
+                          </div>
+                        );
+                      })()}
+                      <label>Source file (USD / FBX / GLB / ABC / OBJ / Megascans JSON / VDB / GoZ)<input placeholder="I:\\EpicGames\\Megascans\\...\\asset.json" value={node.data.path} onChange={e=>update({path:e.target.value})}/></label>
+                      <div style={{ display: "flex", gap: "6px" }}>
+                        <button style={{ flex: 1 }} disabled={busy || !isTauri()} onClick={()=>run(browse)}>Browse source...</button>
+                        <button type="button" onClick={() => setMegascansOpen(true)}>Megascans / Fab...</button>
+                      </div>
+                      {/\.(abc|obj|vdb|goz|fbx|gltf|glb|json|sublayer|orchflow)$/i.test(node.data.path.trim()) && (
                         <button disabled={busy || !isTauri()} onClick={()=>run(convertSourceToUsd)}>Convert to USD...</button>
                       )}
                       <table className="source-options-table">
                         <tbody>
+                          {/\.json$/i.test(node.data.path.trim()) && (
+                            <>
+                              <tr>
+                                <td>Megascans LOD</td>
+                                <td>
+                                  <select
+                                    aria-label="Megascans LOD"
+                                    value={node.data.megascansLod ?? 0}
+                                    onChange={(e) => update({ megascansLod: Number(e.target.value) })}
+                                  >
+                                    {[0, 1, 2, 3, 4, 5].map((lod) => (
+                                      <option key={lod} value={lod}>
+                                        {lod === 0 ? "LOD 0 (Highest)" : `LOD ${lod}`}
+                                      </option>
+                                    ))}
+                                  </select>
+                                </td>
+                              </tr>
+                              <tr>
+                                <td>Texture resolution</td>
+                                <td>
+                                  <select
+                                    aria-label="Texture resolution"
+                                    value={node.data.megascansResolution || "auto"}
+                                    onChange={(e) => update({ megascansResolution: e.target.value })}
+                                  >
+                                    <option value="auto">Auto (Highest)</option>
+                                    <option value="8K">8K</option>
+                                    <option value="4K">4K</option>
+                                    <option value="2K">2K</option>
+                                    <option value="1K">1K</option>
+                                  </select>
+                                </td>
+                              </tr>
+                              <tr>
+                                <td>Normal convention</td>
+                                <td>
+                                  <select
+                                    aria-label="Normal convention"
+                                    value={node.data.megascansNormalConvention || "opengl"}
+                                    onChange={(e) => update({ megascansNormalConvention: e.target.value })}
+                                  >
+                                    <option value="opengl">OpenGL (+Y)</option>
+                                    <option value="directx">DirectX (-Y flip)</option>
+                                  </select>
+                                </td>
+                              </tr>
+                            </>
+                          )}
                           <tr>
                             <td>
                               <span className="field-label">
@@ -2041,12 +2546,13 @@ function Workspace() {
                 )}
 
                 {node.data.operation === "camera" && (() => {
-                  const defaultCam = {
+                  const defaultCam: ViewportCamera = {
                     yaw: 35,
                     pitch: 20,
                     zoom: 1,
                     panX: 0,
                     panY: 0,
+                    projection: "perspective",
                     fov: 45,
                     dofEnabled: false,
                     focusDistance: 5,
@@ -2139,6 +2645,7 @@ function Workspace() {
                           <thead>
                             <tr style={{ textAlign: "left", opacity: 0.75 }}>
                               <th style={{ padding: "4px 6px", borderBottom: "1px solid rgba(255,255,255,0.12)" }}>Name</th>
+                              <th style={{ padding: "4px 6px", borderBottom: "1px solid rgba(255,255,255,0.12)" }}>Proj</th>
                               <th style={{ padding: "4px 6px", borderBottom: "1px solid rgba(255,255,255,0.12)" }}>FoV</th>
                               <th style={{ padding: "4px 6px", borderBottom: "1px solid rgba(255,255,255,0.12)" }}>DoF</th>
                               <th style={{ padding: "4px 6px", borderBottom: "1px solid rgba(255,255,255,0.12)" }}>Focus</th>
@@ -2154,13 +2661,14 @@ function Workspace() {
                           <tbody>
                             {views.length === 0 ? (
                               <tr>
-                                <td colSpan={11} style={{ padding: "8px 6px", opacity: 0.7 }}>
+                                <td colSpan={12} style={{ padding: "8px 6px", opacity: 0.7 }}>
                                   No camera views yet. Click "+ New from current view" to add one.
                                 </td>
                               </tr>
                             ) : (
                               views.map((row) => {
                                 const cam = { ...defaultCam, ...row.camera };
+                                const isOrthoCam = cam.projection === "orthographic";
                                 const isActive = row.id === activeViewId;
                                 return (
                                   <tr key={row.id} style={isActive ? { background: "rgba(90, 170, 255, 0.1)" } : undefined}>
@@ -2175,26 +2683,41 @@ function Workspace() {
                                       />
                                     </td>
                                     <td style={{ padding: "4px 6px", borderBottom: "1px solid rgba(255,255,255,0.06)" }}>
-                                      {numCell(cam.fov, 1, (fov) => patchRow(row.id, { fov }), 5, 170)}
+                                      <select
+                                        value={isOrthoCam ? "orthographic" : "perspective"}
+                                        onChange={(e) =>
+                                          patchRow(row.id, {
+                                            projection: e.target.value === "orthographic" ? "orthographic" : "perspective",
+                                          })
+                                        }
+                                        style={{ ...cellInputStyle, width: 64 }}
+                                      >
+                                        <option value="perspective">Persp</option>
+                                        <option value="orthographic">Ortho</option>
+                                      </select>
                                     </td>
-                                    <td style={{ padding: "4px 6px", borderBottom: "1px solid rgba(255,255,255,0.06)", textAlign: "center" }}>
+                                    <td style={{ padding: "4px 6px", borderBottom: "1px solid rgba(255,255,255,0.06)", opacity: isOrthoCam ? 0.45 : 1 }}>
+                                      {numCell(cam.fov ?? 45, 1, (fov) => patchRow(row.id, { fov }), 5, 170)}
+                                    </td>
+                                    <td style={{ padding: "4px 6px", borderBottom: "1px solid rgba(255,255,255,0.06)", textAlign: "center", opacity: isOrthoCam ? 0.45 : 1 }}>
                                       <input
                                         type="checkbox"
-                                        checked={Boolean(cam.dofEnabled)}
+                                        disabled={isOrthoCam}
+                                        checked={Boolean(cam.dofEnabled) && !isOrthoCam}
                                         onChange={(e) => patchRow(row.id, { dofEnabled: e.target.checked })}
                                       />
                                     </td>
-                                    <td style={{ padding: "4px 6px", borderBottom: "1px solid rgba(255,255,255,0.06)" }}>
-                                      {numCell(cam.focusDistance, 0.1, (focusDistance) => patchRow(row.id, { focusDistance }), 0.01)}
+                                    <td style={{ padding: "4px 6px", borderBottom: "1px solid rgba(255,255,255,0.06)", opacity: isOrthoCam ? 0.45 : 1 }}>
+                                      {numCell(cam.focusDistance ?? 5, 0.1, (focusDistance) => patchRow(row.id, { focusDistance }), 0.01)}
                                     </td>
-                                    <td style={{ padding: "4px 6px", borderBottom: "1px solid rgba(255,255,255,0.06)" }}>
-                                      {numCell(cam.fStop, 0.1, (fStop) => patchRow(row.id, { fStop }), 0.1)}
+                                    <td style={{ padding: "4px 6px", borderBottom: "1px solid rgba(255,255,255,0.06)", opacity: isOrthoCam ? 0.45 : 1 }}>
+                                      {numCell(cam.fStop ?? 5.6, 0.1, (fStop) => patchRow(row.id, { fStop }), 0.1)}
                                     </td>
                                     <td style={{ padding: "4px 6px", borderBottom: "1px solid rgba(255,255,255,0.06)" }}>
                                       {numCell(cam.yaw, 1, (yaw) => patchRow(row.id, { yaw }))}
                                     </td>
                                     <td style={{ padding: "4px 6px", borderBottom: "1px solid rgba(255,255,255,0.06)" }}>
-                                      {numCell(cam.pitch, 1, (pitch) => patchRow(row.id, { pitch }))}
+                                      {numCell(cam.pitch, 1, (pitch) => patchRow(row.id, { pitch }), -90, 90)}
                                     </td>
                                     <td style={{ padding: "4px 6px", borderBottom: "1px solid rgba(255,255,255,0.06)" }}>
                                       {numCell(cam.zoom, 0.05, (zoom) => patchRow(row.id, { zoom }), 0.05)}

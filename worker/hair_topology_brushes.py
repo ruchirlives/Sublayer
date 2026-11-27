@@ -24,6 +24,7 @@ def _build_length_gpu_kernels(wp):
         fwd: wp.vec3,
         r1: wp.vec3,
         drag_unnorm: wp.vec3,
+        is_ortho: int,
         r2: float,
         changed_flag: wp.array(dtype=int),
     ):
@@ -50,7 +51,7 @@ def _build_length_gpu_kernels(wp):
         z_tip = wp.dot(p_tip - eye, fwd)
         if z_tip <= 1e-5:
             return
-        p_end = p_tip + drag_unnorm * z_tip
+        p_end = p_tip + drag_unnorm if is_ortho != 0 else p_tip + drag_unnorm * z_tip
         ext_seg = wp.length(p_end - p_tip)
         if ext_seg <= 1e-6:
             return
@@ -679,16 +680,28 @@ def _apply_lengthen_drag_brush(sess, lengthen_drag, scaled_radius, cam_basis, wp
     up = np.asarray(cam_basis["up"], dtype=np.float64)
     tan_half_fov = float(cam_basis.get("tan_half_fov", 0.4142))
     aspect = float(cam_basis.get("aspect", 1.3333))
+    is_ortho = bool(cam_basis.get("orthographic"))
+    ortho_hh = float(cam_basis.get("ortho_half_height", 1.0))
 
-    sx1 = (nx1 * 2.0 - 1.0) * tan_half_fov * aspect
-    sy1 = (1.0 - ny1 * 2.0) * tan_half_fov
-    r1_unnorm = fwd + right * sx1 + up * sy1
-    r1 = r1_unnorm / max(float(np.linalg.norm(r1_unnorm)), 1e-12)
+    if is_ortho:
+        ox1 = (nx1 * 2.0 - 1.0) * ortho_hh * aspect
+        oy1 = (1.0 - ny1 * 2.0) * ortho_hh
+        ox2 = (nx2 * 2.0 - 1.0) * ortho_hh * aspect
+        oy2 = (1.0 - ny2 * 2.0) * ortho_hh
+        ray_o1 = eye + right * ox1 + up * oy1
+        r1 = fwd / max(float(np.linalg.norm(fwd)), 1e-12)
+        drag_unnorm = right * (ox2 - ox1) + up * (oy2 - oy1)
+    else:
+        ray_o1 = eye
+        sx1 = (nx1 * 2.0 - 1.0) * tan_half_fov * aspect
+        sy1 = (1.0 - ny1 * 2.0) * tan_half_fov
+        r1_unnorm = fwd + right * sx1 + up * sy1
+        r1 = r1_unnorm / max(float(np.linalg.norm(r1_unnorm)), 1e-12)
 
-    sx2 = (nx2 * 2.0 - 1.0) * tan_half_fov * aspect
-    sy2 = (1.0 - ny2 * 2.0) * tan_half_fov
-    r2_unnorm = fwd + right * sx2 + up * sy2
-    drag_unnorm = r2_unnorm - r1_unnorm
+        sx2 = (nx2 * 2.0 - 1.0) * tan_half_fov * aspect
+        sy2 = (1.0 - ny2 * 2.0) * tan_half_fov
+        r2_unnorm = fwd + right * sx2 + up * sy2
+        drag_unnorm = r2_unnorm - r1_unnorm
     r2 = float(scaled_radius * scaled_radius)
 
     if sess.get("vert_starts_wp") is not None and sess.get("counts_wp") is not None:
@@ -702,10 +715,11 @@ def _apply_lengthen_drag_brush(sess, lengthen_drag, scaled_radius, cam_basis, wp
             dim=num_strands,
             inputs=[
                 pos_wp, out_wp, sess["vert_starts_wp"], sess["counts_wp"], sess["pinned_strand_wp"],
-                wp.vec3(float(eye[0]), float(eye[1]), float(eye[2])),
+                wp.vec3(float(ray_o1[0]), float(ray_o1[1]), float(ray_o1[2])),
                 wp.vec3(float(fwd[0]), float(fwd[1]), float(fwd[2])),
                 wp.vec3(float(r1[0]), float(r1[1]), float(r1[2])),
                 wp.vec3(float(drag_unnorm[0]), float(drag_unnorm[1]), float(drag_unnorm[2])),
+                1 if is_ortho else 0,
                 r2, changed_flag,
             ],
             device=device,
@@ -723,9 +737,9 @@ def _apply_lengthen_drag_brush(sess, lengthen_drag, scaled_radius, cam_basis, wp
     starts_np = sess["starts_np"]
     pinned_np = sess["pinned_strand_wp"].numpy()
 
-    to_v = pos_np.astype(np.float64) - eye[None, :]
+    to_v = pos_np.astype(np.float64) - ray_o1[None, :]
     t_along = to_v @ r1
-    closest = eye[None, :] + t_along[:, None] * r1[None, :]
+    closest = ray_o1[None, :] + t_along[:, None] * r1[None, :]
     perp_d2 = np.sum((pos_np.astype(np.float64) - closest) ** 2, axis=1)
 
     hit_vert = (t_along > 0.0) & (perp_d2 <= r2)
@@ -746,10 +760,10 @@ def _apply_lengthen_drag_brush(sess, lengthen_drag, scaled_radius, cam_basis, wp
         c = int(counts_np[s])
         pts = pos_np[v0 : v0 + c]
         p_tip = pts[-1].astype(np.float64)
-        z_tip = float(np.dot(p_tip - eye, fwd))
+        z_tip = float(np.dot(p_tip - ray_o1, fwd))
         if z_tip <= 1e-5:
             continue
-        p_end = (p_tip + drag_unnorm * z_tip).astype(np.float32)
+        p_end = (p_tip + (drag_unnorm if is_ortho else drag_unnorm * z_tip)).astype(np.float32)
         ext_seg = float(np.linalg.norm(p_end - pts[-1]))
         if ext_seg <= 1e-6:
             continue
@@ -803,17 +817,25 @@ def _apply_cut_line_brush(stage, p_str, sess, cut_line, cam_basis, wp, np, devic
     up = np.asarray(cam_basis["up"], dtype=np.float64)
     tan_half_fov = float(cam_basis.get("tan_half_fov", 0.4142))
     aspect = float(cam_basis.get("aspect", 1.3333))
+    is_ortho = bool(cam_basis.get("orthographic"))
+    ortho_hh = max(1e-6, float(cam_basis.get("ortho_half_height", 1.0)))
 
-    def _ray_for(nx, ny):
-        sx = (nx * 2.0 - 1.0) * tan_half_fov * aspect
-        sy = (1.0 - ny * 2.0) * tan_half_fov
-        r = fwd + right * sx + up * sy
-        nrm = float(np.linalg.norm(r))
-        return r / max(nrm, 1e-12)
+    if is_ortho:
+        plane_o = eye + right * ((nx1 * 2.0 - 1.0) * ortho_hh * aspect) + up * ((1.0 - ny1 * 2.0) * ortho_hh)
+        plane_o2 = eye + right * ((nx2 * 2.0 - 1.0) * ortho_hh * aspect) + up * ((1.0 - ny2 * 2.0) * ortho_hh)
+        plane_n = np.cross(plane_o2 - plane_o, fwd)
+    else:
+        def _ray_for(nx, ny):
+            sx = (nx * 2.0 - 1.0) * tan_half_fov * aspect
+            sy = (1.0 - ny * 2.0) * tan_half_fov
+            r = fwd + right * sx + up * sy
+            nrm = float(np.linalg.norm(r))
+            return r / max(nrm, 1e-12)
 
-    r1 = _ray_for(nx1, ny1)
-    r2 = _ray_for(nx2, ny2)
-    plane_n = np.cross(r1, r2)
+        plane_o = eye
+        r1 = _ray_for(nx1, ny1)
+        r2 = _ray_for(nx2, ny2)
+        plane_n = np.cross(r1, r2)
     pn_len = float(np.linalg.norm(plane_n))
     if pn_len < 1e-10:
         return False
@@ -826,7 +848,7 @@ def _apply_cut_line_brush(stage, p_str, sess, cut_line, cam_basis, wp, np, devic
     widths_np = sess.get("widths_np")
     widths_interp = str(sess.get("widths_interp") or "vertex")
 
-    signed_d = (pos_np.astype(np.float64) - eye[None, :]) @ plane_n
+    signed_d = (pos_np.astype(np.float64) - plane_o[None, :]) @ plane_n
 
     new_counts = []
     new_pts_list = []
@@ -860,8 +882,12 @@ def _apply_cut_line_brush(stage, p_str, sess, cut_line, cam_basis, wp, np, devic
                     z_cam = float(np.dot(to_p, fwd))
                     if z_cam <= 1e-5:
                         continue
-                    sx_p = float(np.dot(to_p, right)) / (z_cam * tan_half_fov * aspect)
-                    sy_p = float(np.dot(to_p, up)) / (z_cam * tan_half_fov)
+                    if is_ortho:
+                        sx_p = float(np.dot(to_p, right)) / (ortho_hh * aspect)
+                        sy_p = float(np.dot(to_p, up)) / ortho_hh
+                    else:
+                        sx_p = float(np.dot(to_p, right)) / (z_cam * tan_half_fov * aspect)
+                        sy_p = float(np.dot(to_p, up)) / (z_cam * tan_half_fov)
                     nx_p = (sx_p + 1.0) * 0.5
                     ny_p = (1.0 - sy_p) * 0.5
                     t_seg = ((nx_p - nx1) * dx_2d + (ny_p - ny1) * dy_2d) / seg_len2_2d
@@ -948,13 +974,23 @@ def _apply_draw_lock_brush(stage, p_str, sess, draw_curve, scaled_radius, streng
     if n_in < 2:
         return False
 
-    sx = (pts_2d[:, 0] * 2.0 - 1.0) * tan_half_fov * aspect
-    sy = (1.0 - pts_2d[:, 1] * 2.0) * tan_half_fov
-    rds = fwd[None, :] + right[None, :] * sx[:, None] + up[None, :] * sy[:, None]
-    rd_norms = np.linalg.norm(rds, axis=1, keepdims=True)
-    rds = (rds / np.maximum(rd_norms, 1e-12)).astype(np.float32)
+    is_ortho = bool(cam_basis.get("orthographic"))
+    ortho_hh = max(1e-6, float(cam_basis.get("ortho_half_height", 1.0)))
+    if is_ortho:
+        ox = (pts_2d[:, 0] * 2.0 - 1.0) * ortho_hh * aspect
+        oy = (1.0 - pts_2d[:, 1] * 2.0) * ortho_hh
+        ros = (eye[None, :] + right[None, :] * ox[:, None] + up[None, :] * oy[:, None]).astype(np.float32)
+        fn = fwd / max(float(np.linalg.norm(fwd)), 1e-12)
+        rds = np.broadcast_to(fn.astype(np.float32)[None, :], (n_in, 3)).copy()
+    else:
+        sx = (pts_2d[:, 0] * 2.0 - 1.0) * tan_half_fov * aspect
+        sy = (1.0 - pts_2d[:, 1] * 2.0) * tan_half_fov
+        ros = np.broadcast_to(eye.astype(np.float32)[None, :], (n_in, 3)).copy()
+        rds = fwd[None, :] + right[None, :] * sx[:, None] + up[None, :] * sy[:, None]
+        rd_norms = np.linalg.norm(rds, axis=1, keepdims=True)
+        rds = (rds / np.maximum(rd_norms, 1e-12)).astype(np.float32)
 
-    ro_wp = wp.vec3(float(eye[0]), float(eye[1]), float(eye[2]))
+    ro_wp = wp.array(np.ascontiguousarray(ros, dtype=np.float32), dtype=wp.vec3, device=device)
     rd_wp = wp.array(np.ascontiguousarray(rds, dtype=np.float32), dtype=wp.vec3, device=device)
     out_pos_wp = wp.zeros(n_in, dtype=wp.vec3, device=device)
     out_nrm_wp = wp.zeros(n_in, dtype=wp.vec3, device=device)

@@ -21,6 +21,8 @@ export function updateApplicationProfile(catalog:ApplicationCatalog,baseline:App
 export function parseApplicationCatalog(text:string):ApplicationCatalog {
  const value=JSON.parse(text);
  if(value.version!==1 || !Array.isArray(value.applications))throw new Error("Expected catalog version 1 and applications array");
+ const library=value.megascansLibrary;
+ if(library && (typeof library.libraryRoot!=="string" || !Array.isArray(library.downloadsDirs) || library.downloadsDirs.some((p:unknown)=>typeof p!=="string") || typeof library.socketEnabled!=="boolean" || !Number.isInteger(library.socketPort) || library.socketPort<1024 || library.socketPort>65535))throw new Error("Invalid Megascans / Fab library settings");
  for(const p of value.applications){
   if(!p || ["id","app","applicationVersion","upAxis","executable","importBehavior","exportBehavior"].some(key=>typeof p[key]!=="string") || ["revision","adapterVersion","metersPerUnit","scale"].some(key=>typeof p[key]!=="number") || !p.capabilities || editCategories.some(key=>!p.capabilities[key] || typeof p.capabilities[key].reason!=="string" || !["supported","unsupported","unverified"].includes(p.capabilities[key].status)))throw new Error("Each application needs all profile fields and capability status/reason records. Correct the full JSON below.");
  }

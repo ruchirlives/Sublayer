@@ -1,5 +1,5 @@
 import type { StoredProject } from "./fileRegistry.ts";
-export const toolbarOperations = ["source","metahuman","blender","transform","group","delete","scatter","assetOverride","materialx","material_bind","light","hdri","postfx","hair","cache_edit","character","pose","camera","output","application"];
+export const toolbarOperations = ["source","metahuman","blender","transform","group","delete","scatter","instancer","assetOverride","materialx","material_bind","light","hdri","postfx","hair","cache_edit","character","pose","camera","output","application"];
 export type DropTarget = {kind:"edge"|"node";id:string} | null;
 export function insertToolbarNode(project:StoredProject, node:StoredProject["nodes"][number], target:DropTarget, makeId=()=>crypto.randomUUID()):StoredProject {
   if(!toolbarOperations.includes(node.data.operation) || project.nodes.some(n=>n.id===node.id))throw new Error("Invalid or duplicate inserted node");

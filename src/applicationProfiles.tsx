@@ -7,7 +7,8 @@ import defaults from "../src-tauri/application-defaults.json";
 
 export type Capability={status:"supported"|"unsupported"|"unverified";reason:string};
 export type ApplicationProfile={id:string;revision:number;app:string;applicationVersion:string;adapterVersion:number;upAxis:"Y"|"Z";metersPerUnit:number;scale:number;executable:string;importBehavior:string;exportBehavior:string;capabilities:Record<string,Capability>};
-export type ApplicationCatalog={version:number;applications:ApplicationProfile[]};
+export type MegascansLibrarySettings={libraryRoot:string;downloadsDirs:string[];socketEnabled:boolean;socketPort:number};
+export type ApplicationCatalog={version:number;revision?:number;applications:ApplicationProfile[];megascansLibrary?:MegascansLibrarySettings};
 export type PolicySnapshot={profile:ApplicationProfile;editScope:string[]};
 export function findProfile(catalog:ApplicationCatalog,data:Pick<Data,"app"|"applicationProfileId">){return catalog.applications.find(p=>p.id===data.applicationProfileId);}
 const Context=createContext<{catalog:ApplicationCatalog;path:string;error:string;reload:()=>Promise<void>;save:(value:ApplicationCatalog)=>Promise<void>}>({catalog:{version:1,applications:[]},path:"",error:"",reload:async()=>{},save:async()=>{}});
@@ -17,7 +18,7 @@ export function ApplicationCatalogProvider({children}:{children:ReactNode}){
  const [path,setPath]=useState(""),[error,setError]=useState("");
  async function reload(){try{const value=await invoke<{catalog:ApplicationCatalog;path:string}>("load_application_profiles");setCatalog(value.catalog);setPath(value.path);setError("");}catch(e){setCatalog({version:1,applications:[]});setError(String(e));}}
  useEffect(()=>{if(isTauri())void reload();},[]);
- async function save(value:ApplicationCatalog){await invoke("save_application_profiles",{catalog:value});await reload();}
+ async function save(value:ApplicationCatalog){value={...value,revision:Math.max(value.revision || 1,(catalog.revision || 1)+1)};await invoke("save_application_profiles",{catalog:value});await reload();}
  return <Context.Provider value={{catalog,path,error,reload,save}}>{children}</Context.Provider>;
 }
 export function ApplicationSettings({focusProfileId,focusVisit}:{focusProfileId?:string;focusVisit?:number}){
@@ -28,7 +29,7 @@ export function ApplicationSettings({focusProfileId,focusVisit}:{focusProfileId?
  try{draft=parseApplicationCatalog(text);}catch(e){parseError=String(e);}
  function edit(mutator:(value:ApplicationCatalog)=>void){if(!draft)return;const next=structuredClone(draft);mutator(next);setText(JSON.stringify(next,null,2));setDirty(true);}
  function update(id:string,patch:Partial<ApplicationProfile>){if(!draft)return;setText(JSON.stringify(updateApplicationProfile(draft,state.catalog,id,patch),null,2));setDirty(true);}
- useEffect(()=>{if(focusProfileId)setSelected(focusProfileId);},[focusProfileId,focusVisit]);
+ useEffect(()=>{if(focusProfileId==="megascans-library")document.getElementById("megascans-library")?.scrollIntoView({block:"start"});else if(focusProfileId)setSelected(focusProfileId);},[focusProfileId,focusVisit]);
  const profile=draft?.applications.find(p=>p.id===selected)||draft?.applications[0];
  return <section className="applications-tab">
   <div className="dependency-tools"><div><h1>Applications</h1><p>Shared application-level JSON. Node edit scopes remain in each node; no project-level configuration.</p></div>
@@ -43,6 +44,20 @@ export function ApplicationSettings({focusProfileId,focusVisit}:{focusProfileId?
   {state.error && <p className="missing-file" role="alert">{state.error}</p>}
   {parseError && <p role="alert">{parseError}</p>}
   {draft && <>
+   <section id="megascans-library">
+    <h2>Megascans / Fab library</h2>
+    <p>Use Fab's Download button and format picker in Fab Browser. Sublayer saves the downloaded file directly into the library. Fab has no public download API. External browsers can use watched Downloads folders while a canvas drop is pending.</p>
+    <label>Central library folder<input value={draft.megascansLibrary?.libraryRoot || ""} onChange={e=>edit(v=>{v.megascansLibrary={...defaults.megascansLibrary,...v.megascansLibrary,libraryRoot:e.target.value};})}/></label>
+    <button disabled={!isTauri()} onClick={async()=>{try{const {open}=await import("@tauri-apps/plugin-dialog");const folder=await open({directory:true,multiple:false});if(folder)edit(v=>{v.megascansLibrary={...defaults.megascansLibrary,...v.megascansLibrary,libraryRoot:folder};});}catch(e){setMessage(String(e));}}}>Browse library folder…</button>
+    {(draft.megascansLibrary?.downloadsDirs || []).map((folder,index)=><div key={index}>
+      <input aria-label={`Downloads folder ${index+1}`} value={folder} onChange={e=>edit(v=>{if(v.megascansLibrary)v.megascansLibrary.downloadsDirs[index]=e.target.value;})}/>
+      <button onClick={()=>edit(v=>{v.megascansLibrary?.downloadsDirs.splice(index,1);})}>Remove</button>
+    </div>)}
+    <button disabled={!isTauri()} onClick={async()=>{try{const {open}=await import("@tauri-apps/plugin-dialog");const folder=await open({directory:true,multiple:false});if(folder)edit(v=>{v.megascansLibrary={...defaults.megascansLibrary,...v.megascansLibrary,downloadsDirs:[...(v.megascansLibrary?.downloadsDirs || []),folder]};});}catch(e){setMessage(String(e));}}}>Browse Downloads folder…</button>
+    <label><input type="checkbox" checked={draft.megascansLibrary?.socketEnabled ?? true} onChange={e=>edit(v=>{v.megascansLibrary={...defaults.megascansLibrary,...v.megascansLibrary,socketEnabled:e.target.checked};})}/>Enable Bridge / Fab socket</label>
+    <label>Socket port<NumberInput min={1024} max={65535} step={1} value={draft.megascansLibrary?.socketPort ?? 24981} onChange={e=>edit(v=>{v.megascansLibrary={...defaults.megascansLibrary,...v.megascansLibrary,socketPort:Number(e.target.value)};})}/></label>
+    <button disabled={busy||!isTauri()} onClick={async()=>{setBusy(true);try{await state.save(JSON.parse(text));setDirty(false);setMessage("Saved application settings and restarted the library socket.");}catch(e){setMessage(String(e));}finally{setBusy(false);}}}>Save library settings</button>
+   </section>
    <div className="dependency-grid"><table><thead><tr>{["Profile ID","Application","App version","Revision","Adapter version","Up axis","Meters/unit","Default scale","Executable","Import behavior notes","Export behavior notes","Actions"].map(t=><th key={t}>{t}</th>)}</tr></thead><tbody>
     {draft.applications.map((p,index)=><tr key={index} className={profile?.id===p.id?"profile-active":""}>
      <td><input aria-label={`Profile ID ${index+1}`} value={p.id} onChange={e=>update(p.id,{id:e.target.value})}/></td>
