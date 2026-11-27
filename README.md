@@ -23,7 +23,7 @@ Sublayer is a Windows desktop application built with **Tauri 2**, **React / Type
   - **Marvelous Designer**: Round‑trip workflow that imports clothing meshes (`.obj`/`.fbx`), preserves seam groups and UVs, writes them to a temporary USD stage, allows editing in Sublayer, and exports back to Designer via a generated `.obj`/`.fbx` with retained material assignments. Supports reversible coordinate conversion and preserves original asset links in the project JSON.
   - **Additional Profile Templates**: ZBrush (GoZ).
 
-![Marvelous Designer round‑trip screenshot](file:///C:/Users/Ruchirlives/.gemini/antigravity/brain/6e37e09b-21d2-4f89-8834-1750ffd7af99/.user_uploaded/media_1795803250260_465ca322.jpg)
+![Screenshot](file:///C:/Users/Ruchirlives/.gemini/antigravity/brain/6e37e09b-21d2-4f89-8834-1750ffd7af99/.user_uploaded/media_1795803250260_465ca322.jpg)
 - **Local MCP Server**: `orchflow-mcp` exposes headless USD inspection, stage composition, and rendering over stdio.
 
 ---
