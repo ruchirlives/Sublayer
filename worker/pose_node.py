@@ -4,7 +4,20 @@ import math
 from pxr import Gf, Sdf, Usd, UsdSkel, Vt
 
 
-def _write_pose_trs(output, authored):
+def _find_body_dna_source(skel_prim):
+    if not skel_prim or not skel_prim.IsValid():
+        return None
+    for prim in (skel_prim, skel_prim.GetParent()):
+        if not prim or not prim.IsValid():
+            continue
+        for key in ('sublayer:bodyDnaSource', 'sublayer:dnaSource'):
+            val = prim.GetCustomDataByKey(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+    return None
+
+
+def _write_pose_trs(output, authored, skel_prim=None, matched_names=None):
     translations = []
     rotations = []
     scales = []
@@ -28,6 +41,27 @@ def _write_pose_trs(output, authored):
         translations.append(Gf.Vec3f(float(t[0] + to[0]), float(t[1] + to[1]), float(t[2] + to[2])))
         s = j['scale']
         scales.append(Gf.Vec3h(float(s[0]), float(s[1]), float(s[2])))
+
+    if skel_prim is not None and matched_names:
+        dna_path = _find_body_dna_source(skel_prim)
+        if dna_path:
+            from metahuman_riglogic import get_body_riglogic_solver
+            solver = get_body_riglogic_solver(dna_path)
+            if solver is not None:
+                local_mats = [
+                    UsdSkel.MakeTransform(t, q, s)
+                    for t, q, s in zip(translations, rotations, scales)
+                ]
+                updates = solver.evaluate(matched_names, local_mats)
+                for idx, mat in updates.items():
+                    decomposed = UsdSkel.DecomposeTransform(mat)
+                    if decomposed is not None:
+                        dt, dq, ds = decomposed
+                        translations[idx] = Gf.Vec3f(float(dt[0]), float(dt[1]), float(dt[2]))
+                        im = dq.GetImaginary()
+                        rotations[idx] = Gf.Quatf(float(dq.GetReal()), float(im[0]), float(im[1]), float(im[2]))
+                        scales[idx] = Gf.Vec3h(float(ds[0]), float(ds[1]), float(ds[2]))
+
     output.CreateTranslationsAttr().Set(Vt.Vec3fArray(translations))
     rot_attr = output.CreateRotationsAttr()
     rot_arr = Vt.QuatfArray(rotations)
@@ -35,6 +69,49 @@ def _write_pose_trs(output, authored):
     rot_attr.Set(rot_arr)
     rot_attr.Set(rot_arr, Usd.TimeCode(0.0))
     rot_attr.Set(rot_arr, Usd.TimeCode(1e-4))
+    output.CreateScalesAttr().Set(Vt.Vec3hArray(scales))
+    return True
+
+
+def apply_body_riglogic_to_anim(output, skel_prim, frame=0.0):
+    """Evaluate cached Body RigLogic during interactive live-pose drags."""
+    dna_path = _find_body_dna_source(skel_prim)
+    if not dna_path:
+        return False
+    from metahuman_riglogic import get_body_riglogic_solver
+    solver = get_body_riglogic_solver(dna_path)
+    if solver is None:
+        return False
+    joints = list(output.GetJointsAttr().Get() or [])
+    translations = list(output.GetTranslationsAttr().Get() or [])
+    rot_attr = output.GetRotationsAttr()
+    rotations = list(rot_attr.Get(Usd.TimeCode(frame)) or rot_attr.Get() or [])
+    scales = list(output.GetScalesAttr().Get() or [])
+    n = min(len(joints), len(translations), len(rotations), len(scales))
+    if n == 0:
+        return False
+    local_mats = [
+        UsdSkel.MakeTransform(translations[i], rotations[i], scales[i])
+        for i in range(n)
+    ]
+    updates = solver.evaluate(joints[:n], local_mats)
+    if not updates:
+        return False
+    for idx, mat in updates.items():
+        if 0 <= idx < n:
+            decomposed = UsdSkel.DecomposeTransform(mat)
+            if decomposed is not None:
+                dt, dq, ds = decomposed
+                translations[idx] = Gf.Vec3f(float(dt[0]), float(dt[1]), float(dt[2]))
+                im = dq.GetImaginary()
+                rotations[idx] = Gf.Quatf(float(dq.GetReal()), float(im[0]), float(im[1]), float(im[2]))
+                scales[idx] = Gf.Vec3h(float(ds[0]), float(ds[1]), float(ds[2]))
+    output.CreateTranslationsAttr().Set(Vt.Vec3fArray(translations))
+    rot_arr = Vt.QuatfArray(rotations)
+    rot_attr.Clear()
+    rot_attr.Set(rot_arr)
+    rot_attr.Set(rot_arr, Usd.TimeCode(frame))
+    rot_attr.Set(rot_arr, Usd.TimeCode(frame + 1e-4))
     output.CreateScalesAttr().Set(Vt.Vec3hArray(scales))
     return True
 
@@ -89,7 +166,7 @@ def update_live_pose(node, targets):
         if not matched_joints:
             return False
         output.CreateJointsAttr(matched_names)
-        if not _write_pose_trs(output, matched_joints):
+        if not _write_pose_trs(output, matched_joints, skel_prim=skel_prim, matched_names=matched_names):
             return False
         if skel_prim and skel_prim.IsValid():
             rel = UsdSkel.BindingAPI(skel_prim).GetAnimationSourceRel()
@@ -127,7 +204,7 @@ def apply_pose(stage, node, files, keepalive, reload=False, live_poses=None):
             if entry.get('blendShapes'):
                 output.CreateBlendShapesAttr(entry['blendShapes'])
                 output.CreateBlendShapeWeightsAttr(entry['blendShapeWeights'])
-            if not _write_pose_trs(output, matched_joints):
+            if not _write_pose_trs(output, matched_joints, skel_prim=target, matched_names=matched_names):
                 raise ValueError('Cannot author pose transforms')
             UsdSkel.BindingAPI.Apply(target).CreateAnimationSourceRel().SetTargets([output.GetPath()])
             if live_poses is not None:

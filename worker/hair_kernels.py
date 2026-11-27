@@ -608,6 +608,8 @@ def _build_kernels(wp):
         radius: float,
         strength: float,
         drive_position: int,
+        vert_counts: wp.array(dtype=int),
+        margin: float,
     ):
         s = wp.tid()
         if drive_position == 0:
@@ -616,12 +618,16 @@ def _build_kernels(wp):
         w = strand_brush_w[s]
         if k <= 0 or w <= 1e-6:
             return
-        hero_idx = vert_starts[s] + k
+        v0 = vert_starts[s]
+        c = vert_counts[s]
+        hero_idx = v0 + k
         if inv_mass[hero_idx] <= 0.0:
             return
         p = pos[hero_idx]
         t_p = strand_surface_target[s]
 
+        drag_dir = wp.vec3(0.0, 0.0, 0.0)
+        d_step = float(0.0)
         if wp.length(drag_delta) > 1e-8:
             adj_delta = drag_delta
             if has_collider != 0:
@@ -630,20 +636,103 @@ def _build_kernels(wp):
                     surf_p = wp.mesh_eval_position(collider_id, q.face, q.u, q.v)
                     d_vec = t_p - surf_p
                     d_len = wp.length(d_vec)
-                    if d_len > 1e-6:
+                    if d_len > 1e-6 and d_len * q.sign <= margin * 2.5:
                         n = d_vec / d_len
-                        adj_delta = drag_delta - n * wp.dot(drag_delta, n)
+                        if q.sign < 0.0:
+                            n = -n
+                        dn = wp.dot(drag_delta, n)
+                        if dn < 0.0:
+                            adj_delta = drag_delta - n * dn
+            adj_len = wp.length(adj_delta)
+            if adj_len > 1e-8:
+                drag_dir = adj_delta / adj_len
             delta = adj_delta * (w * wp.min(1.5, strength))
             d_step = wp.length(delta)
             max_step = radius * 0.25
             if d_step > max_step and d_step > 1e-6:
                 delta = delta * (max_step / d_step)
+                d_step = max_step
             t_p = t_p + delta
             strand_surface_target[s] = t_p
 
-        t_p = limit_comb_target(pos[vert_starts[s]], p, t_p, cum_len[hero_idx])
+        t_p = limit_comb_target(pos[v0], p, t_p, cum_len[hero_idx])
         strand_surface_target[s] = t_p
-        if drive_position != 0:
+
+        # Disentangle & straighten vertices along the comb drag path while
+        # preserving exact segment lengths and collider clearance.
+        if d_step > 1e-6 and wp.length_sq(drag_dir) > 0.5 and c >= 3:
+            drag_factor = wp.min(1.0, d_step / wp.max(radius * 0.04, 1e-5))
+            align_w = wp.clamp(w * wp.min(1.5, strength) * 0.45 * drag_factor, 0.0, 0.75)
+            for j in range(1, c):
+                idx = v0 + j
+                if inv_mass[idx] <= 0.0:
+                    continue
+                prev_p = pos[idx - 1]
+                seg_len = wp.max(cum_len[idx] - cum_len[idx - 1], 1e-6)
+                cur_seg = pos[idx] - prev_p
+                cur_len = wp.length(cur_seg)
+                cur_dir = cur_seg / cur_len if cur_len > 1e-8 else drag_dir
+                if j < k:
+                    to_target = t_p - prev_p
+                    to_len = wp.length(to_target)
+                    target_dir = to_target / to_len if to_len > 1e-8 else drag_dir
+                    pre_w = align_w * 0.55
+                    blended = cur_dir * (1.0 - pre_w) + target_dir * pre_w
+                    b_len = wp.length(blended)
+                    new_dir = blended / b_len if b_len > 1e-8 else target_dir
+                    cand = prev_p + new_dir * seg_len
+                elif j == k and drive_position != 0:
+                    raw_cand = p + (t_p - p) * 0.85
+                    to_raw = raw_cand - prev_p
+                    raw_len = wp.length(to_raw)
+                    new_dir = to_raw / raw_len if raw_len > 1e-8 else drag_dir
+                    cand = prev_p + new_dir * seg_len
+                else:
+                    blended = cur_dir * (1.0 - align_w) + drag_dir * align_w
+                    b_len = wp.length(blended)
+                    new_dir = blended / b_len if b_len > 1e-8 else drag_dir
+                    cand = prev_p + new_dir * seg_len
+                if has_collider != 0:
+                    old_v = pos[idx]
+                    cmove = cand - old_v
+                    cmove_len = wp.length(cmove)
+                    if cmove_len > 1e-6:
+                        cmove_dir = cmove / cmove_len
+                        crq = wp.mesh_query_ray(collider_id, old_v, cmove_dir, cmove_len + margin)
+                        if crq.result and crq.t <= cmove_len + margin:
+                            cand = old_v + cmove_dir * wp.max(0.0, crq.t - margin)
+                    # Also prevent segment (prev_p -> cand) from cutting across curved/open collider.
+                    # For j == 1 (root segment), ignore hits right at the root so roots emerging
+                    # from the scalp are never pushed back inside.
+                    svec = cand - prev_p
+                    slen = wp.length(svec)
+                    if slen > 1e-6:
+                        sdir = svec / slen
+                        srq = wp.mesh_query_ray(collider_id, prev_p, sdir, slen)
+                        if srq.result and srq.t <= slen and (j > 1 or srq.t > slen * 0.15):
+                            hit_p = wp.mesh_eval_position(collider_id, srq.face, srq.u, srq.v)
+                            hit_n = wp.mesh_eval_face_normal(collider_id, srq.face)
+                            if wp.dot(hit_n, sdir) > 0.0:
+                                hit_n = -hit_n
+                            cand = hit_p + hit_n * margin
+                    qc = wp.mesh_query_point_sign_normal(collider_id, cand, max_query_dist)
+                    if qc.result:
+                        closest = wp.mesh_eval_position(collider_id, qc.face, qc.u, qc.v)
+                        diff = cand - closest
+                        dist = wp.length(diff)
+                        if dist * qc.sign < margin:
+                            face_n = wp.mesh_eval_face_normal(collider_id, qc.face)
+                            nrm = face_n
+                            if dist > 1e-6:
+                                nrm = diff / dist
+                                if qc.sign < 0.0:
+                                    nrm = -nrm
+                                    if wp.dot(nrm, face_n) < 0.0:
+                                        nrm = face_n
+                            cand = closest + nrm * margin
+                pos[idx] = cand
+                vel[idx] = vel[idx] * 0.25
+        elif drive_position != 0:
             pos[hero_idx] = p + (t_p - p) * 0.85
             vel[hero_idx] = wp.vec3(0.0, 0.0, 0.0)
 
@@ -665,6 +754,8 @@ def _build_kernels(wp):
         radius: float,
         strength: float,
         drive_position: int,
+        vert_counts: wp.array(dtype=int),
+        margin: float,
     ):
         s = wp.tid()
         if drive_position == 0:
@@ -1339,34 +1430,42 @@ def _build_subsample_kernels(wp):
     return cached
 
 
+def _build_smooth_all_kernel(wp):
+    from hair_draw_kernels import _build_smooth_all_kernel as _fn
+    return _fn(wp)
+
+
+def _build_brush_collider_kernel(wp):
+    from hair_draw_kernels import _build_brush_collider_kernel as _fn
+    return _fn(wp)
+
+
 def _build_brush_circle_kernel(wp):
-    cached = getattr(wp, "_orchflow_brush_circle_kernel", None)
-    if cached is not None:
-        return cached
+    from hair_draw_kernels import _build_brush_circle_kernel as _fn
+    return _fn(wp)
 
-    @wp.kernel
-    def draw_brush_circle_kernel(
-        img: wp.array3d(dtype=wp.uint8),
-        h: int,
-        w: int,
-        cx: float,
-        cy: float,
-        r_px: float,
-    ):
-        y, x = wp.tid()
-        if x >= w or y >= h:
-            return
-        dx = float(x) - cx
-        dy = float(y) - cy
-        d = wp.sqrt(dx * dx + dy * dy)
-        if wp.abs(d - r_px) <= 1.25:
-            img[y, x, 0] = wp.uint8(60)
-            img[y, x, 1] = wp.uint8(220)
-            img[y, x, 2] = wp.uint8(255)
-            img[y, x, 3] = wp.uint8(255)
 
-    wp._orchflow_brush_circle_kernel = draw_brush_circle_kernel
-    return draw_brush_circle_kernel
+def _build_draw_lock_kernels(wp):
+    from hair_draw_kernels import _build_draw_lock_kernels as _fn
+    return _fn(wp)
+
+
+def _build_polyline_kernel(wp):
+    from hair_draw_kernels import _build_polyline_kernel as _fn
+    return _fn(wp)
+
+
+def draw_polyline_cuda(dev_u8, h, w, pts_norm):
+    if not pts_norm or len(pts_norm) < 2:
+        return
+    wp, np, device = _ensure_warp()
+    arr = np.asarray(pts_norm, dtype=np.float32).reshape(-1, 2)
+    pts_px = np.empty_like(arr)
+    pts_px[:, 0] = arr[:, 0] * float(w)
+    pts_px[:, 1] = arr[:, 1] * float(h)
+    pts_wp = wp.array(pts_px, dtype=wp.vec2, device=device)
+    kernel = _build_polyline_kernel(wp)
+    wp.launch(kernel, dim=len(pts_px) - 1, inputs=[dev_u8, int(h), int(w), pts_wp, int(len(pts_px))], device=device)
 
 
 def draw_brush_circle_cuda(dev_u8, h, w, nx, ny, radius_px):

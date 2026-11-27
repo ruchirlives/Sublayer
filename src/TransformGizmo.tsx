@@ -103,6 +103,7 @@ export function TransformGizmo({
   height,
   radius,
   anchorTranslation,
+  originOffset,
   interactive,
   onChange,
   onCommit,
@@ -115,6 +116,7 @@ export function TransformGizmo({
   height: number;
   radius: number;
   anchorTranslation?: [number, number, number];
+  originOffset?: [number, number, number];
   interactive: boolean;
   onChange: (next: Transform) => void;
   onCommit?: () => void;
@@ -226,9 +228,9 @@ export function TransformGizmo({
 
     const projectOffset = (offset: Vec3): [number, number] => {
       const worldOffset: Vec3 = [
-        offset[0] + deltaT[0],
-        offset[1] + deltaT[1],
-        offset[2] + deltaT[2],
+        offset[0] + deltaT[0] + (originOffset?.[0] ?? 0),
+        offset[1] + deltaT[1] + (originOffset?.[1] ?? 0),
+        offset[2] + deltaT[2] + (originOffset?.[2] ?? 0),
       ];
       const vx = dot(worldOffset, right) + panOffsetX;
       const vy = dot(worldOffset, cameraUp) + panOffsetY;
@@ -248,7 +250,7 @@ export function TransformGizmo({
       worldUnitsPerPx,
       projectOffset,
     };
-  }, [camera, upAxis, width, height, radius, transform.translation, anchorTranslation]);
+  }, [camera, upAxis, width, height, radius, transform.translation, anchorTranslation, originOffset]);
 
   const rotMat = useMemo(
     () => mat3FromEulerXYZ(transform.rotation as Vec3),

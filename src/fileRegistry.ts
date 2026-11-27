@@ -488,6 +488,25 @@ export type CharacterClothCache = {
   timeOffset: number;
 };
 
+export type CharacterHeadGroom = {
+  id: string;
+  enabled: boolean;
+  sourceMode: "file" | "upstream";
+  dependencyId: string | null;
+  targetQuery: string;
+  attachMode: "joint" | "surface";
+  skeletonPath: string;
+  headJointName: string;
+  preserveRestPosition: boolean;
+  headMeshPath: string;
+  axis: string;
+  frontAxis: string;
+  scale: number;
+  offsetTranslation: [number, number, number];
+  offsetRotation: [number, number, number];
+  offsetScale: [number, number, number];
+};
+
 export type PoseJoint = { name:string; translation:[number,number,number]; rotation:[number,number,number,number]; scale:[number,number,number]; rotationOffset:[number,number,number]; translationOffset:[number,number,number] };
 export type PoseEntry = { id: string; name: string; dependencyId?: string | null; animationPath: string; mode: "pose" | "clip"; poseTime: number; joints?: PoseJoint[]; blendShapes?:string[]; blendShapeWeights?:number[] };
 export type PoseSettings = { mappings: {id: string; enabled?: boolean; skeletonPath: string; entryId: string | null}[]; entries: PoseEntry[] };
@@ -497,6 +516,7 @@ export type CharacterSettings = {
   jointAttachments: CharacterJointAttachment[];
   skeletonBindings: CharacterSkeletonBinding[];
   clothCaches: CharacterClothCache[];
+  headGrooms: CharacterHeadGroom[];
 };
 
 export const defaultCharacterSettings: CharacterSettings = {
@@ -505,12 +525,14 @@ export const defaultCharacterSettings: CharacterSettings = {
   jointAttachments: [],
   skeletonBindings: [],
   clothCaches: [],
+  headGrooms: [],
 };
 
 export type ScatterPrototypeRule = {
   id: string;
   enabled: boolean;
   primPath: string;
+  weight?: number;
 };
 
 export type ScatterSettings = {
@@ -518,14 +540,39 @@ export type ScatterSettings = {
   seed: number;
   distribution: "random" | "grid" | "circle" | "surface";
   areaSize: [number, number, number];
+  areaOffset?: [number, number, number];
+  gridJitter?: number;
+  innerRadiusRatio?: number;
+  circleAlign?: "none" | "outward" | "inward" | "tangent";
+  circleEvenSpacing?: boolean;
+  scaleUniform?: boolean;
   scaleMin: number;
   scaleMax: number;
+  scaleMinVec?: [number, number, number];
+  scaleMaxVec?: [number, number, number];
   randomYaw: boolean;
+  rotationOffset?: [number, number, number];
+  rotationMin?: [number, number, number] | null;
+  rotationMax?: [number, number, number] | null;
   passThrough?: boolean;
   surfacePrimPath?: string;
+  surfaceOffset?: number;
   alignToNormal?: boolean;
+  alignStrength?: number;
+  minSlopeDeg?: number;
   maxSlopeDeg?: number;
+  heightMin?: number | null;
+  heightMax?: number | null;
   minSpacing?: number;
+  colorVariationEnabled?: boolean;
+  colorVariationMode?: "hsv" | "ramp";
+  colorTintBase?: [number, number, number];
+  colorHueJitter?: number;
+  colorSatJitter?: number;
+  colorValJitter?: number;
+  colorRampA?: [number, number, number];
+  colorRampB?: [number, number, number];
+  colorApplyToMaterials?: boolean;
   prototypes?: ScatterPrototypeRule[];
 };
 export const defaultScatter: ScatterSettings = {
@@ -533,14 +580,39 @@ export const defaultScatter: ScatterSettings = {
   seed: 42,
   distribution: "random",
   areaSize: [20, 0, 20],
+  areaOffset: [0, 0, 0],
+  gridJitter: 0,
+  innerRadiusRatio: 0,
+  circleAlign: "none",
+  circleEvenSpacing: false,
+  scaleUniform: true,
   scaleMin: 0.8,
   scaleMax: 1.2,
+  scaleMinVec: [0.8, 0.8, 0.8],
+  scaleMaxVec: [1.2, 1.2, 1.2],
   randomYaw: true,
+  rotationOffset: [0, 0, 0],
+  rotationMin: [0, 0, 0],
+  rotationMax: [0, 360, 0],
   passThrough: false,
   surfacePrimPath: "",
+  surfaceOffset: 0,
   alignToNormal: false,
+  alignStrength: 1,
+  minSlopeDeg: 0,
   maxSlopeDeg: 90,
+  heightMin: null,
+  heightMax: null,
   minSpacing: 0,
+  colorVariationEnabled: false,
+  colorVariationMode: "hsv",
+  colorTintBase: [1, 1, 1],
+  colorHueJitter: 15,
+  colorSatJitter: 0.15,
+  colorValJitter: 0.15,
+  colorRampA: [0.85, 0.95, 0.75],
+  colorRampB: [0.95, 0.75, 0.55],
+  colorApplyToMaterials: true,
   prototypes: [],
 };
 
@@ -676,10 +748,14 @@ export type Data = {
   materialBindings?: MaterialBindingRule[];
   transformTargets?: TransformTargetRule[];
   lightOverrides?: LightOverride[];
+  lightIntensityScale?: number;
   hdri?: HdriSettings;
   postFx?: PostFxSettings;
   hair?: HairSettings;
   cacheEdit?: CacheEditSettings;
+  metahumanLod?: number;
+  metahumanBodyPath?: string;
+  metahumanMaterials?: boolean;
   character?: CharacterSettings | null;
   pose?: PoseSettings | null;
   camera?: ViewportCamera | null;
@@ -711,6 +787,7 @@ export type Data = {
   scale: number;
   appExecutable?: string;
   nativeProject: string;
+  mdBridgePath?: string;
   publishedPath: string;
   assetDependencyIds?: string[];
   transform?: Transform;
@@ -719,11 +796,13 @@ export type Data = {
 export type StageNode = Node<Data, "stage">;
 export type StoredData = Omit<
   Data,
-  "path" | "nativeProject" | "publishedPath" | "appExecutable"
+  "path" | "metahumanBodyPath" | "nativeProject" | "mdBridgePath" | "publishedPath" | "appExecutable"
 > & {
   appExecutableDependencyId?: string | null;
   inputDependencyId: string | null;
+  metahumanBodyDependencyId?: string | null;
   nativeProjectDependencyId: string | null;
+  mdBridgeDependencyId?: string | null;
   publishedDependencyId: string | null;
 };
 export type ViewportCamera = {
@@ -827,15 +906,19 @@ export function storeProject(
     return result.ids[0] || null;
   }
   const stored = nodes.map((node) => {
-    const { path, nativeProject, publishedPath, appExecutable, ...data } = node.data;
+    const { path, metahumanBodyPath, nativeProject, publishedPath, appExecutable, ...data } = node.data;
     return {
       ...node,
       data: {
         ...data,
         assetDependencyIds: data.assetDependencyIds || [],
-        inputDependencyId: register(path, "usd"),
+        inputDependencyId: register(path, data.operation === "metahuman" ? "asset" : "usd"),
+        ...(data.operation === "metahuman" && metahumanBodyPath
+          ? { metahumanBodyDependencyId: register(metahumanBodyPath, "asset") }
+          : {}),
         appExecutableDependencyId: register(appExecutable || "", "executable"),
         nativeProjectDependencyId: register(nativeProject, "nativeProject"),
+        mdBridgeDependencyId: register(node.data.mdBridgePath || "", "asset"),
         publishedDependencyId: register(publishedPath, "usd"),
       },
     };
@@ -852,8 +935,10 @@ export function expandProject(project: StoredProject): {
     nodes: project.nodes.map((node) => {
       const {
         inputDependencyId,
+        metahumanBodyDependencyId,
         appExecutableDependencyId,
         nativeProjectDependencyId,
+        mdBridgeDependencyId,
         publishedDependencyId,
         ...data
       } = node.data;
@@ -862,8 +947,10 @@ export function expandProject(project: StoredProject): {
         data: {
           ...data,
           path: path(inputDependencyId),
+          metahumanBodyPath: path(metahumanBodyDependencyId),
           appExecutable: path(appExecutableDependencyId),
           nativeProject: path(nativeProjectDependencyId),
+          mdBridgePath: path(mdBridgeDependencyId),
           publishedPath: path(publishedDependencyId),
         },
       };
@@ -882,9 +969,12 @@ export function referencedBy(project: StoredProject, dependencyId: string) {
       .filter((n) =>
         [
           ...(n.data.pose?.entries || []).map(e => e.dependencyId),
+          ...(n.data.character?.clothCaches || []).map(c => c.dependencyId),
+          ...(n.data.character?.headGrooms || []).filter(g => g.sourceMode === "file").map(g => g.dependencyId),
           ...materialTextures(n.data.materialX),
           ...(n.data.materialXRules || []).flatMap(r => materialTextures(r.material)),
               n.data.inputDependencyId,
+              n.data.metahumanBodyDependencyId,
           n.data.nativeProjectDependencyId,
           n.data.appExecutableDependencyId,
           n.data.publishedDependencyId,
@@ -983,9 +1073,30 @@ export function relinkDependency(
                   : n.data.manualBaseline.handoffDependencyId,
             }
           : n.data.manualBaseline,
+        ...(n.data.character
+          ? {
+              character: {
+                ...n.data.character,
+                clothCaches: (n.data.character.clothCaches || []).map((cc) =>
+                  cc.dependencyId === id ? { ...cc, dependencyId: target } : cc,
+                ),
+                headGrooms: (n.data.character.headGrooms || []).map((hg) =>
+                  hg.dependencyId === id ? { ...hg, dependencyId: target } : hg,
+                ),
+              },
+            }
+          : {}),
         materialX: relinkMaterialTextures(n.data.materialX, id, target),
         inputDependencyId:
           n.data.inputDependencyId === id ? target : n.data.inputDependencyId,
+        ...(n.data.metahumanBodyDependencyId !== undefined
+          ? {
+              metahumanBodyDependencyId:
+                n.data.metahumanBodyDependencyId === id
+                  ? target
+                  : n.data.metahumanBodyDependencyId,
+            }
+          : {}),
         appExecutableDependencyId: n.data.appExecutableDependencyId === id ? target : n.data.appExecutableDependencyId,
         nativeProjectDependencyId:
           n.data.nativeProjectDependencyId === id
@@ -1075,9 +1186,11 @@ export function editNodeData(
 ): StoredProject {
   let next = project;
   for (const [view, field, kind] of [
-    ["path", "inputDependencyId", "usd"],
+    ["path", "inputDependencyId", (patch.operation ?? project.nodes.find(n => n.id === nodeId)?.data.operation) === "metahuman" ? "asset" : "usd"],
+    ["metahumanBodyPath", "metahumanBodyDependencyId", "asset"],
     ["appExecutable", "appExecutableDependencyId", "executable"],
     ["nativeProject", "nativeProjectDependencyId", "nativeProject"],
+    ["mdBridgePath", "mdBridgeDependencyId", "asset"],
     ["publishedPath", "publishedDependencyId", "usd"],
   ] as const) {
     if (!(view in patch)) continue;
@@ -1100,7 +1213,9 @@ export function editNodeData(
           ...materialTextures(n.data.materialX),
           ...(n.data.materialXRules || []).flatMap(r => materialTextures(r.material)),
               n.data.inputDependencyId,
+              n.data.metahumanBodyDependencyId,
               n.data.nativeProjectDependencyId,
+              n.data.mdBridgeDependencyId,
           n.data.appExecutableDependencyId,
               n.data.publishedDependencyId,
               ...(n.data.assetDependencyIds || []),
@@ -1118,7 +1233,7 @@ export function editNodeData(
           next = {
             ...next,
             dependencies: next.dependencies.map((d) =>
-              d.id === oldId ? { ...d, path } : d,
+              d.id === oldId ? { ...d, path, kind } : d,
             ),
           };
         } else {
@@ -1138,7 +1253,9 @@ export function editNodeData(
   const {
     appExecutable: _executable,
     path: _path,
+    metahumanBodyPath: _bodyPath,
     nativeProject: _native,
+    mdBridgePath: _mdBridge,
     publishedPath: _published,
     ...settings
   } = patch;
@@ -1171,7 +1288,7 @@ export function graphPreview(
     if (needed.has(id)) continue;
     needed.add(id);
     const node = project.nodes.find(n => n.id === id);
-    if (node?.data.operation !== "application" || node?.data.liveAdjustment || (id === targetNodeId && applicationInput))
+    if (node?.data.operation !== "application" || node?.data.liveAdjustment || node?.data.mdBridgeDependencyId || (id === targetNodeId && applicationInput))
       queue.push(...(incoming.get(id) || []));
   }
   const nodes = project.nodes
@@ -1180,8 +1297,19 @@ export function graphPreview(
       id: n.id,
       operation: applicationInput && n.id === targetNodeId ? (n.data.inputDependencyId ? "source" : "output") : n.data.operation,
       inputDependencyId: n.data.inputDependencyId,
+      ...(n.data.operation === "metahuman"
+        ? {
+            metahumanLod: n.data.metahumanLod ?? 0,
+            metahumanMaterials: n.data.metahumanMaterials !== false,
+            ...(n.data.metahumanBodyDependencyId
+              ? { metahumanBodyDependencyId: n.data.metahumanBodyDependencyId }
+              : {}),
+          }
+        : {}),
       publishedDependencyId: applicationInput && n.id === targetNodeId ? null : n.data.publishedDependencyId,
       nativeProjectDependencyId: n.data.nativeProjectDependencyId,
+      mdBridgeDependencyId: applicationInput && n.id === targetNodeId ? null : n.data.mdBridgeDependencyId,
+      applicationMetersPerUnit: n.data.applicationMetersPerUnit,
       blenderSelections: n.data.blenderSelections,
       blenderScene: n.data.blenderScene,
       blenderMaterialMode: n.data.blenderMaterialMode,
@@ -1199,7 +1327,7 @@ export function graphPreview(
       ...(n.data.operation==="scatter" ? {scatter: n.data.scatter || defaultScatter}:{}),
       ...(n.data.operation==="group" && n.data.groupName ? {groupName: n.data.groupName}:{}),
       ...(n.data.operation==="material_bind" ? {materialBindings:n.data.materialBindings || []}:{}),
-      ...(n.data.operation==="light" ? {lightOverrides:n.data.lightOverrides || []}:{}),
+      ...(n.data.operation==="light" ? {lightOverrides:n.data.lightOverrides || [], ...(typeof n.data.lightIntensityScale === "number" && n.data.lightIntensityScale > 0 ? {lightIntensityScale: n.data.lightIntensityScale} : {})}:{}),
       ...(n.data.operation==="hdri" && n.data.hdri ? {hdri: n.data.hdri}:{}),
       ...(n.data.operation==="postfx" ? {postFx: n.data.postFx || defaultPostFx}:{}),
       ...(n.data.operation==="hair" && n.data.hair ? {hair: n.data.hair}:{}),
@@ -1229,8 +1357,10 @@ export function graphPreview(
     nodes
       .flatMap((n) => [
         n.inputDependencyId,
+        n.metahumanBodyDependencyId,
         n.publishedDependencyId,
         n.nativeProjectDependencyId,
+        n.mdBridgeDependencyId,
         ...n.assetOverrides.map(o => o.replacementDependencyId),
         ...materialTextures(n.materialX),
         n.liveAdjustment?.editedDependencyId,
@@ -1239,6 +1369,7 @@ export function graphPreview(
         n.hdri?.textureDependencyId,
         ...(n.pose?.entries || []).map(e => e.dependencyId),
         ...(n.character?.clothCaches || []).map(c => c.dependencyId),
+        ...(n.character?.headGrooms || []).filter(g => g.sourceMode === "file").map(g => g.dependencyId),
         ...(n.materialXRules || []).flatMap(r => materialTextures(r.material)),
       ])
       .filter(Boolean),

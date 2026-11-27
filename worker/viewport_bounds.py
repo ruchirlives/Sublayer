@@ -10,6 +10,22 @@ def transform_gizmo_translation(graph, node_id=None):
     target_id = node_id if node_id is not None else graph.get("targetNodeId")
     if not target_id:
         return None, None
+    if isinstance(target_id, str) and target_id.startswith("groom:"):
+        parts = target_id.split(":", 2)
+        if len(parts) == 3:
+            char_node_id, groom_id = parts[1], parts[2]
+            for node in graph.get("nodes") or []:
+                if isinstance(node, dict) and node.get("id") == char_node_id and node.get("operation") == "character":
+                    for hg in (node.get("character") or {}).get("headGrooms") or []:
+                        if isinstance(hg, dict) and hg.get("id") == groom_id and hg.get("enabled", True):
+                            translation = hg.get("offsetTranslation")
+                            if isinstance(translation, list) and len(translation) == 3 and all(
+                                isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+                                for v in translation
+                            ):
+                                return target_id, [float(v) for v in translation]
+                            return target_id, [0.0, 0.0, 0.0]
+        return None, None
     for node in graph.get("nodes") or []:
         if isinstance(node, dict) and node.get("id") == target_id and node.get("operation") == "transform":
             translation = (node.get("transform") or {}).get("translation")

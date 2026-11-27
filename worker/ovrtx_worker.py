@@ -1317,6 +1317,59 @@ class OvrtxViewport:
             sys.stderr.write(f"Ovrtx incremental hair update failed; rebuilding scene: {error}\n")
             return False
 
+    @staticmethod
+    def _extract_mesh_tris(mesh_prim, tc):
+        mesh = UsdGeom.Mesh(mesh_prim)
+        fvc_vt = mesh.GetFaceVertexCountsAttr().Get(tc)
+        fvi_vt = mesh.GetFaceVertexIndicesAttr().Get(tc)
+        if not fvc_vt or not fvi_vt:
+            return None
+        counts = np.asarray(fvc_vt, dtype=np.int64)
+        indices = np.asarray(fvi_vt, dtype=np.int64)
+        if np.all(counts == 3):
+            tris = indices.reshape(-1, 3)
+        elif np.all(counts == 4):
+            quads = indices.reshape(-1, 4)
+            tris = np.vstack((quads[:, [0, 1, 2]], quads[:, [0, 2, 3]]))
+        else:
+            tri_list = []
+            off = 0
+            for c in counts:
+                if c >= 3:
+                    i0 = indices[off]
+                    for k in range(1, c - 1):
+                        tri_list.append((i0, indices[off + k], indices[off + k + 1]))
+                off += c
+            if not tri_list:
+                return None
+            tris = np.asarray(tri_list, dtype=np.int64)
+        left_handed = mesh.GetOrientationAttr().Get() == UsdGeom.Tokens.leftHanded
+        return (tris, left_handed)
+
+    @staticmethod
+    def _compute_smooth_vertex_normals(pts_vt, topo):
+        if topo is None:
+            return None
+        from pxr import Vt
+        tris, left_handed = topo
+        pts = np.asarray(pts_vt, dtype=np.float32)
+        if pts.ndim != 2 or pts.shape[0] == 0:
+            return None
+        p0 = pts[tris[:, 0]]
+        p1 = pts[tris[:, 1]]
+        p2 = pts[tris[:, 2]]
+        fn = np.cross(p1 - p0, p2 - p0)
+        if left_handed:
+            fn = -fn
+        nrm = np.zeros_like(pts, dtype=np.float32)
+        np.add.at(nrm, tris[:, 0], fn)
+        np.add.at(nrm, tris[:, 1], fn)
+        np.add.at(nrm, tris[:, 2], fn)
+        lens = np.linalg.norm(nrm, axis=1, keepdims=True)
+        safe = np.where(lens > 1e-8, lens, 1.0)
+        nrm = np.where(lens > 1e-8, nrm / safe, np.array([0.0, 1.0, 0.0], dtype=np.float32))
+        return Vt.Vec3fArray.FromNumpy(nrm)
+
     def _cache_stage_skel_bindings(self, stage, sample_frame):
         from pxr import UsdSkel
         tc = Usd.TimeCode(sample_frame)
@@ -1335,7 +1388,8 @@ class OvrtxViewport:
                         if mp and mp.IsValid() and mp.IsA(UsdGeom.Mesh):
                             rest_pts = UsdGeom.Mesh(mp).GetPointsAttr().Get(tc)
                             if rest_pts is not None and len(rest_pts) > 0:
-                                meshes.append((str(mp.GetPath()), skq, rest_pts))
+                                topo = self._extract_mesh_tris(mp, tc)
+                                meshes.append((str(mp.GetPath()), skq, rest_pts, topo))
                     if sq:
                         bindings_by_skel[str(skel.GetPath())] = (sq, meshes)
         self._ovrtx_skel_cache = sc
@@ -1357,24 +1411,29 @@ class OvrtxViewport:
                 if not meshes:
                     continue
                 skin_xforms = sq.ComputeSkinningTransforms(tc)
-                for mpath_str, skq, rest_pts in meshes:
+                for mpath_str, skq, rest_pts, topo in meshes:
                     pts = Vt.Vec3fArray(rest_pts)
                     if skq.ComputeSkinnedPoints(skin_xforms, pts, tc):
-                        self._initial_pose_points.append((mpath_str, pts))
+                        nrm = self._compute_smooth_vertex_normals(pts, topo)
+                        self._initial_pose_points.append((mpath_str, pts, nrm))
                         over_m = stage.OverridePrim(Sdf.Path(mpath_str))
-                        UsdGeom.Mesh(over_m).CreatePointsAttr().Set(pts)
+                        mesh_api = UsdGeom.Mesh(over_m)
+                        mesh_api.CreatePointsAttr().Set(pts)
+                        if nrm is not None:
+                            mesh_api.CreateNormalsAttr().Set(nrm)
+                            mesh_api.SetNormalsInterpolation(UsdGeom.Tokens.vertex)
                         UsdSkel.BindingAPI(over_m).CreateSkeletonRel().SetTargets([])
         return bake_layer
 
     def _strip_skel_from_flat(self, flat):
         bindings = getattr(self, "_ovrtx_skel_bindings", None) or {}
         for _skel_path, (_sq, meshes) in bindings.items():
-            for mpath_str, _skq, _rest_pts in meshes:
+            for mpath_str, _skq, _rest_pts, _topo in meshes:
                 ps = flat.GetPrimAtPath(mpath_str)
                 if not ps:
                     continue
                 for prop_name in list(ps.properties.keys()):
-                    if prop_name == "points" or prop_name.startswith("skel:") or prop_name.startswith("primvars:skel:"):
+                    if prop_name in ("points", "normals", "primvars:normals") or prop_name.startswith("skel:") or prop_name.startswith("primvars:skel:"):
                         del ps.properties[prop_name]
                 api = ps.GetInfo("apiSchemas")
                 if api:
@@ -1392,11 +1451,17 @@ class OvrtxViewport:
 
     def _swap_pose_overlay(self, updates, apply_changes=True):
         ov_layer = Sdf.Layer.CreateAnonymous("ovrtx_pose_overlay.usdc")
-        for mpath_str, pts_vt in updates:
+        for item in updates:
+            mpath_str, pts_vt = item[0], item[1]
+            nrm_vt = item[2] if len(item) > 2 else None
             spec = Sdf.CreatePrimInLayer(ov_layer, Sdf.Path(mpath_str))
             spec.specifier = Sdf.SpecifierOver
             attr = Sdf.AttributeSpec(spec, "points", Sdf.ValueTypeNames.Point3fArray)
             attr.default = pts_vt
+            if nrm_vt is not None:
+                nattr = Sdf.AttributeSpec(spec, "normals", Sdf.ValueTypeNames.Normal3fArray)
+                nattr.default = nrm_vt
+                nattr.SetInfo("interpolation", UsdGeom.Tokens.vertex)
         scratch_dir = os.path.dirname(self.temp_usd_path) if self.temp_usd_path else (
             os.environ.get("ORCHFLOW_OVRTX_SCRATCH") or os.path.join(tempfile.gettempdir(), "orchflow_ovrtx_scratch")
         )
@@ -1447,10 +1512,11 @@ class OvrtxViewport:
             if not meshes:
                 continue
             skin_xforms = sq.ComputeSkinningTransforms(tc)
-            for mpath_str, skq, rest_pts in meshes:
+            for mpath_str, skq, rest_pts, topo in meshes:
                 pts = Vt.Vec3fArray(rest_pts)
                 if skq.ComputeSkinnedPoints(skin_xforms, pts, tc):
-                    updates.append((mpath_str, pts))
+                    nrm = self._compute_smooth_vertex_normals(pts, topo)
+                    updates.append((mpath_str, pts, nrm))
         if updates:
             self._swap_pose_overlay(updates, apply_changes=True)
         return True
@@ -1476,21 +1542,37 @@ class OvrtxViewport:
             return False
 
     def _write_postfx_to_ovstage(self, old_cfg, new_cfg):
-        """Write changed non-token PostFX attributes directly to /Render/RenderProduct_Viewport.
-        Returns True if all differences were written in-place, False if a token changed or write failed.
+        """Write changed PostFX attributes directly to /Render/RenderProduct_Viewport without recompiling the scene.
+        Scalar/bool/color changes use direct ovstage.write_attribute; token changes use a 1-prim overlay delta.
         """
         if self.stage is None:
             return False
         old_specs = {name: (kind, val) for name, kind, val in build_postfx_attr_specs(old_cfg)}
         new_specs = build_postfx_attr_specs(new_cfg)
         changed_specs = []
+        has_token_change = False
         for name, kind, val in new_specs:
             if old_specs.get(name) != (kind, val):
                 if kind == "token":
-                    return False
+                    has_token_change = True
                 changed_specs.append((name, kind, val))
         if not changed_specs:
             return True
+        if has_token_change:
+            try:
+                overlay = Sdf.Layer.CreateAnonymous("postfx_token_delta.usda")
+                if self.overlay_path and os.path.isfile(self.overlay_path):
+                    prev_overlay = Sdf.Layer.FindOrOpen(self.overlay_path)
+                    if prev_overlay is not None:
+                        overlay.TransferContent(prev_overlay)
+                tmp_stage = Usd.Stage.Open(overlay)
+                prod = UsdRender.Product.Define(tmp_stage, "/Render/RenderProduct_Viewport")
+                apply_postfx_to_render_product(prod.GetPrim(), new_cfg if new_cfg is not None else {})
+                self._apply_material_delta(overlay)
+                return True
+            except Exception as err:
+                sys.stderr.write(f"Ovrtx PostFX overlay update failed; rebuilding scene: {err}\n")
+                return False
         try:
             self.ordinal += 1
             with ovstage.PathDictionary(self.stage) as paths:
@@ -1523,6 +1605,40 @@ class OvrtxViewport:
         except Exception as err:
             sys.stderr.write(f"Ovrtx fast PostFX update failed; rebuilding scene: {err}\n")
             return False
+
+    def _try_fast_groom_delta(self, prev_graph, new_graph, sample_frame):
+        """Apply rigid Head Groom transform-only updates via a tiny USD overlay without recompiling."""
+        if not prev_graph or not new_graph or self.stage is None:
+            return None
+        live_grooms = getattr(self, "live_grooms", None)
+        if not live_grooms:
+            return None
+        changed = usd_graph.groom_xform_only_changes(prev_graph, new_graph, live_grooms)
+        if not changed:
+            return None
+        prim_updates = usd_graph.apply_live_groom_xforms(changed, live_grooms)
+        if not prim_updates:
+            return None
+        delta = Sdf.Layer.CreateAnonymous("ovrtx_groom_xform_delta.usda")
+        from pxr import Vt
+        for prim_path, tc_mats in prim_updates:
+            spec = Sdf.CreatePrimInLayer(delta, Sdf.Path(prim_path))
+            spec.specifier = Sdf.SpecifierOver
+            order_attr = Sdf.AttributeSpec(spec, "xformOpOrder", Sdf.ValueTypeNames.TokenArray, Sdf.VariabilityUniform)
+            order_attr.default = Vt.TokenArray(["xformOp:transform"])
+            mat_attr = Sdf.AttributeSpec(spec, "xformOp:transform", Sdf.ValueTypeNames.Matrix4d)
+            if len(tc_mats) == 1 and tc_mats[0][0] == Usd.TimeCode.Default():
+                mat_attr.default = tc_mats[0][1]
+            else:
+                for tc, mat in tc_mats:
+                    if tc == Usd.TimeCode.Default():
+                        mat_attr.default = mat
+                    else:
+                        delta.SetTimeSample(mat_attr.path, float(tc.GetValue()), mat)
+        delta_path = self._apply_material_delta(delta)
+        if getattr(self, "_initial_pose_points", None):
+            self._swap_pose_overlay(self._initial_pose_points, apply_changes=True)
+        return delta_path
 
     def _try_fast_postfx_delta(self, prev_graph, new_graph):
         """Write PostFX-only scalar/bool/color updates directly to /Render/RenderProduct_Viewport in ovstage."""
@@ -1728,6 +1844,12 @@ class OvrtxViewport:
 
         width = max(16, int(request.get("width", 800)))
         height = max(16, int(request.get("height", 600)))
+        if request.get("nativePopup") and self.native_popup is not None and self.native_popup.is_open():
+            cs = getattr(self.native_popup, "_canvas_size", None)
+            if isinstance(cs, (tuple, list)) and len(cs) == 2:
+                pw, ph = int(cs[0] or 0), int(cs[1] or 0)
+                if pw >= 64 and ph >= 64:
+                    width, height = pw, ph
         interactive = bool(request.get("interactive", False))
         render_mode = request.get("ovrtxMode", "realtime")
         if not isinstance(render_mode, str) or render_mode not in _RENDER_MODES:
@@ -1736,14 +1858,18 @@ class OvrtxViewport:
         if (
             request.get("popupHoverOnly")
             and request.get("nativePopup")
+            and not request.get("hairBrush")
+            and not request.get("cacheBrush")
             and self.native_popup is not None
             and self.native_popup.is_open()
             and getattr(self, "_popup_clean_u8", None) is not None
             and getattr(self, "_popup_clean_meta", None) is not None
+            and self._popup_clean_meta[1] == width
+            and self._popup_clean_meta[0] == height
         ):
             try:
                 import warp as wp
-                from hair_kernels import draw_brush_circle_cuda
+                from hair_kernels import draw_brush_circle_cuda, draw_polyline_cuda
                 clean_u8 = self._popup_clean_u8
                 ah, aw, sp = self._popup_clean_meta
                 if getattr(self, "_popup_draw_u8", None) is None or self._popup_draw_u8.shape != clean_u8.shape:
@@ -1753,6 +1879,9 @@ class OvrtxViewport:
                 popup_status = request.get("popupStatus")
                 if isinstance(popup_status, str) and popup_status:
                     self.native_popup.set_status(popup_status)
+                popup_draw_curve = request.get("popupDrawCurve")
+                if isinstance(popup_draw_curve, list) and len(popup_draw_curve) >= 2:
+                    draw_polyline_cuda(self._popup_draw_u8, ah, aw, popup_draw_curve)
                 r_px = float(request.get("popupBrushRadiusPx", 0.0) or 0.0)
                 if r_px > 1.0:
                     hnx, hny = self.native_popup.last_hover_norm()
@@ -1838,6 +1967,7 @@ class OvrtxViewport:
             if (
                 groom_frame is not None and groom_frame[0] == usd_graph.groom_frame_view(request)
                 and not request.get("pick") and not request.get("hairBrush")
+                and not (groom_frame[1].get("encoding") == "popup" and not request.get("popupSkipImage"))
             ):
                 self._last_interactive = interactive
                 return reuse_presented_image({
@@ -1934,6 +2064,9 @@ class OvrtxViewport:
                 # (temp_usd_path is not re-exported during fast cache_edit / cloth sim steps).
                 if point_updates:
                     self._write_hair_points_to_ovstage(point_updates)
+                skel_bindings = getattr(self, "_ovrtx_skel_bindings", None)
+                if skel_bindings:
+                    self._apply_live_pose_to_ovstage(list(skel_bindings.keys()), req_frame)
                 self.last_graph_hash = graph_hash
                 self.last_suffix = scene_suffix
                 self.last_update_kind = "frame-reopen"
@@ -1949,6 +2082,10 @@ class OvrtxViewport:
             if prev_postfx == target_postfx or self._write_postfx_to_ovstage(prev_postfx, target_postfx):
                 if cached["delta_path"] != self.overlay_path:
                     self._apply_material_delta_path(cached["delta_path"])
+                cached_pose_pts = cached.get("initial_pose_points")
+                if cached_pose_pts:
+                    self._initial_pose_points = cached_pose_pts
+                    self._swap_pose_overlay(cached_pose_pts, apply_changes=True)
                 self._last_postfx_cfg = target_postfx
                 self.current_usd_stage = cached["current_usd_stage"]
                 self.last_outline_key = outline_key
@@ -1959,6 +2096,7 @@ class OvrtxViewport:
                 self.graph_stats = cached["graph_stats"]
                 self.mx_rule_selections = cached.get("mx_rule_selections", {})
                 self.live_poses = cached.get("live_poses", {})
+                self.live_grooms = cached.get("live_grooms", {})
                 self._ovrtx_skel_bindings = cached.get("ovrtx_skel_bindings")
                 self._ovrtx_skel_cache = cached.get("ovrtx_skel_cache")
                 self.last_graph_hash = graph_hash
@@ -1977,8 +2115,14 @@ class OvrtxViewport:
             and self.last_graph is not None
             and graph is not None
         ):
-            fast_delta = None if self.live_groom_modified else self._try_fast_materialx_delta(self.last_graph, graph)
-            if fast_delta is not None:
+            if self._try_fast_postfx_delta(self.last_graph, graph):
+                self.last_outline_key = outline_key
+                self.last_graph_hash = graph_hash
+                self.last_static_scene_key = static_scene_key
+                self.last_graph = graph
+                self.last_update_kind = "postfx-delta"
+                scene_changed = False
+            elif (fast_delta := (None if self.live_groom_modified else self._try_fast_materialx_delta(self.last_graph, graph))) is not None:
                 delta_path = self._apply_material_delta(fast_delta)
                 self.last_outline_key = outline_key
                 self.last_graph_hash = graph_hash
@@ -1995,8 +2139,10 @@ class OvrtxViewport:
                     "graph_stats": self.graph_stats,
                     "mx_rule_selections": self.mx_rule_selections,
                     "live_poses": getattr(self, "live_poses", {}),
+                    "live_grooms": getattr(self, "live_grooms", {}),
                     "ovrtx_skel_bindings": getattr(self, "_ovrtx_skel_bindings", None),
                     "ovrtx_skel_cache": getattr(self, "_ovrtx_skel_cache", None),
+                    "initial_pose_points": getattr(self, "_initial_pose_points", None),
                 }
                 scene_changed = False
             elif self._try_fast_hair_delta(self.last_graph, graph, float(request.get("frame", 0)), editable_hair_id):
@@ -2023,12 +2169,27 @@ class OvrtxViewport:
                 self.last_update_kind = "pose-delta"
                 scene_changed = False
                 camera_changed = True
-            elif self._try_fast_postfx_delta(self.last_graph, graph):
+            elif (groom_delta_path := self._try_fast_groom_delta(self.last_graph, graph, float(request.get("frame", 0)))) is not None:
                 self.last_outline_key = outline_key
                 self.last_graph_hash = graph_hash
                 self.last_static_scene_key = static_scene_key
                 self.last_graph = graph
-                self.last_update_kind = "postfx-delta"
+                self.last_update_kind = "groom-xform-delta"
+                self.stage_pool[graph_hash] = {
+                    "delta_path": groom_delta_path,
+                    "current_usd_stage": self.current_usd_stage,
+                    "material_diagnostics": self.material_diagnostics,
+                    "material_fallbacks": self.material_fallbacks,
+                    "material_keepalive": self.material_keepalive,
+                    "graph_stages": self.graph_stages,
+                    "graph_stats": self.graph_stats,
+                    "mx_rule_selections": self.mx_rule_selections,
+                    "live_poses": getattr(self, "live_poses", {}),
+                    "live_grooms": getattr(self, "live_grooms", {}),
+                    "ovrtx_skel_bindings": getattr(self, "_ovrtx_skel_bindings", None),
+                    "ovrtx_skel_cache": getattr(self, "_ovrtx_skel_cache", None),
+                    "initial_pose_points": getattr(self, "_initial_pose_points", None),
+                }
                 scene_changed = False
         if size_changed and not scene_changed and self.last_width is not None and (
             self.overlay_path or not self.temp_usd_path or not os.path.isfile(self.temp_usd_path)
@@ -2038,10 +2199,12 @@ class OvrtxViewport:
             phase("compiling USD graph", timeout=300)
             compiled_mx_selections = {}
             self.live_poses = {}
+            self.live_grooms = {}
             self._ovrtx_skel_bindings = None
             if graph:
                 stage, self.graph_stages, self.graph_stats = usd_graph.compile_graph(
-                    graph, request.get("reload", False), live_poses=self.live_poses, mx_selections_out=compiled_mx_selections,
+                    graph, request.get("reload", False), live_poses=self.live_poses, live_grooms=self.live_grooms,
+                    mx_selections_out=compiled_mx_selections,
                     interactive_hair=editable_hair_id is not None,
                 )
                 preview = usd_graph.open_hair_preview_stage(stage, graph)
@@ -2202,24 +2365,31 @@ class OvrtxViewport:
             # Prevent transmissive shells from casting opaque shadows inward in Realtime RTX (and thick dielectrics in PT).
             # Note: thin_walled surfaces in PathTracing already pass light physically without doNotCastShadows (which would double-light them).
             from pxr import UsdShade
+            mat_trans_cache = {}
             for prim in stage.Traverse():
                 if not prim.IsA(UsdGeom.Mesh):
                     continue
                 mat, _ = UsdShade.MaterialBindingAPI(prim).ComputeBoundMaterial()
                 if not mat:
                     continue
-                is_transmissive = False
-                is_thin_walled = False
-                for sp in Usd.PrimRange(mat.GetPrim()):
-                    if not sp.IsA(UsdShade.Shader):
-                        continue
-                    sh = UsdShade.Shader(sp)
-                    tr_inp = sh.GetInput("transmission")
-                    if tr_inp and (tr_inp.Get() or 0) > 0.5:
-                        is_transmissive = True
-                    tw_inp = sh.GetInput("thin_walled")
-                    if tw_inp and bool(tw_inp.Get()):
-                        is_thin_walled = True
+                mat_path = mat.GetPath()
+                cached_flags = mat_trans_cache.get(mat_path)
+                if cached_flags is None:
+                    is_transmissive = False
+                    is_thin_walled = False
+                    for sp in Usd.PrimRange(mat.GetPrim()):
+                        if not sp.IsA(UsdShade.Shader):
+                            continue
+                        sh = UsdShade.Shader(sp)
+                        tr_inp = sh.GetInput("transmission")
+                        if tr_inp and (tr_inp.Get() or 0) > 0.5:
+                            is_transmissive = True
+                        tw_inp = sh.GetInput("thin_walled")
+                        if tw_inp and bool(tw_inp.Get()):
+                            is_thin_walled = True
+                    cached_flags = (is_transmissive, is_thin_walled)
+                    mat_trans_cache[mat_path] = cached_flags
+                is_transmissive, is_thin_walled = cached_flags
                 if is_transmissive and (render_mode == "realtime" or not is_thin_walled):
                     UsdGeom.PrimvarsAPI(prim).CreatePrimvar("doNotCastShadows", Sdf.ValueTypeNames.Bool, UsdGeom.Tokens.constant).Set(True)
             phase("flattening private USD preview")
@@ -2250,6 +2420,8 @@ class OvrtxViewport:
                 if delta is not None:
                     try:
                         delta_path = self._apply_material_delta(delta)
+                        if getattr(self, "_initial_pose_points", None):
+                            self._swap_pose_overlay(self._initial_pose_points, apply_changes=True)
                         if prev_postfx_cfg != postfx_cfg:
                             if not self._write_postfx_to_ovstage(prev_postfx_cfg, postfx_cfg):
                                 raise RuntimeError("PostFX live attribute sync failed")
@@ -2275,8 +2447,10 @@ class OvrtxViewport:
                     "graph_stats": self.graph_stats,
                     "mx_rule_selections": self.mx_rule_selections,
                     "live_poses": getattr(self, "live_poses", {}),
+                    "live_grooms": getattr(self, "live_grooms", {}),
                     "ovrtx_skel_bindings": getattr(self, "_ovrtx_skel_bindings", None),
                     "ovrtx_skel_cache": getattr(self, "_ovrtx_skel_cache", None),
+                    "initial_pose_points": getattr(self, "_initial_pose_points", None),
                 }
             else:
                 base_key = None
@@ -2284,9 +2458,10 @@ class OvrtxViewport:
                     base_nodes = [
                         n for n in graph.get("nodes", [])
                         if (n.get("operation") or (n.get("data") or {}).get("operation"))
-                        in ("source", "blender", "application")
+                        in ("source", "blender", "application", "metahuman")
                     ]
-                    base_key = json.dumps(base_nodes, sort_keys=True) + scene_suffix
+                    if base_nodes:
+                        base_key = json.dumps(base_nodes, sort_keys=True) + scene_suffix
                 preserve_camera = (
                     not request.get("reload")
                     and base_key is not None
@@ -2312,7 +2487,12 @@ class OvrtxViewport:
                 old_overlay_path = self.overlay_path
                 old_temp_path = self.temp_usd_path
                 self._flush_stage_pool()
-                if self.stage is not None and self.last_graph_hash is not None:
+                if self.stage is not None and (
+                    self.last_graph_hash is not None
+                    or self.ordinal > 0
+                    or self.overlay_handle is not None
+                    or getattr(self, "_pose_overlay_handle", None) is not None
+                ):
                     try:
                         self.renderer.detach_ovstage()
                     except Exception:
@@ -2372,8 +2552,10 @@ class OvrtxViewport:
                     "graph_stats": self.graph_stats,
                     "mx_rule_selections": self.mx_rule_selections,
                     "live_poses": getattr(self, "live_poses", {}),
+                    "live_grooms": getattr(self, "live_grooms", {}),
                     "ovrtx_skel_bindings": getattr(self, "_ovrtx_skel_bindings", None),
                     "ovrtx_skel_cache": getattr(self, "_ovrtx_skel_cache", None),
+                    "initial_pose_points": getattr(self, "_initial_pose_points", None),
                 }
 
         live_pose = request.get("livePose")
@@ -2415,6 +2597,8 @@ class OvrtxViewport:
                                 rot_attr.Set(rot_arr)
                                 rot_attr.Set(rot_arr, Usd.TimeCode(req_frame))
                                 rot_attr.Set(rot_arr, Usd.TimeCode(req_frame + 1e-4))
+                                import pose_node as _pn
+                                _pn.apply_body_riglogic_to_anim(output, self.current_usd_stage.GetPrimAtPath(lp_skel), req_frame)
                             self._apply_live_pose_to_ovstage([lp_skel], req_frame)
                             camera_changed = True
                             self.last_update_kind = "live-pose"
@@ -2485,6 +2669,9 @@ class OvrtxViewport:
             phase("resizing NVIDIA viewport", timeout=120)
             # Recreating the ovrtx renderer on resize avoids omni.rtx GPU pagefaults
             # triggered by mutating RenderProduct.resolution on a live ovstage.
+            # Export to a fresh temp path so ovstage's internal SdfLayer cache never
+            # reuses the stale resolution from the previous filename.
+            old_resized_path = self.temp_usd_path
             temp_layer = Sdf.Layer.FindOrOpen(self.temp_usd_path)
             if temp_layer is not None:
                 rp = temp_layer.GetPrimAtPath("/Render/RenderProduct_Viewport")
@@ -2492,8 +2679,18 @@ class OvrtxViewport:
                     rp.properties["resolution"].default = Gf.Vec2i(width, height)
                 if rp and render_mode == "pathTracing" and target_spp > 1 and "omni:rtx:pt:samplesPerPixel" in rp.properties:
                     rp.properties["omni:rtx:pt:samplesPerPixel"].default = 1
-                temp_layer.Save()
+                new_resized_path = export_preview_snapshot(temp_layer)
+                self.temp_usd_path = new_resized_path
+                if self.base_layer is not None:
+                    rp_b = self.base_layer.GetPrimAtPath("/Render/RenderProduct_Viewport")
+                    if rp_b and "resolution" in rp_b.properties:
+                        rp_b.properties["resolution"].default = Gf.Vec2i(width, height)
                 del temp_layer
+                if old_resized_path and old_resized_path != new_resized_path and os.path.isfile(old_resized_path):
+                    try:
+                        os.remove(old_resized_path)
+                    except OSError:
+                        pass
             if self.stage is not None:
                 try:
                     self.stage.destroy()
@@ -2507,6 +2704,8 @@ class OvrtxViewport:
                     pass
                 self.renderer = None
             self._ensure_initialized()
+            self.overlay_handle = None
+            self._pose_overlay_handle = None
             self.ordinal = 1
             ovstage.population.open_usd(
                 self.stage,
@@ -2514,12 +2713,35 @@ class OvrtxViewport:
                 ordinal=self.ordinal,
                 time=float(request.get("frame", 0)) / (self.current_usd_stage.GetTimeCodesPerSecond() if self.current_usd_stage else 24.0),
             )
+            reattached_overlay = False
+            if self.overlay_path and os.path.isfile(self.overlay_path):
+                self.overlay_handle = ovstage.population.add_usd_reference(self.stage, self.overlay_path, "/")
+                reattached_overlay = True
+            pose_path = getattr(self, "_pose_overlay_path", None)
+            if pose_path and os.path.isfile(pose_path):
+                self._pose_overlay_handle = ovstage.population.add_usd_reference(self.stage, pose_path, "/")
+                reattached_overlay = True
+            if reattached_overlay:
+                ovstage.population.apply_usd_changes(self.stage, ordinal=self.ordinal)
             self.stage.compute_hierarchy(
                 self.ordinal,
                 self.ordinal,
                 model=ovstage.HierarchyComputationModel.CPU_INCREMENTAL,
             )
             self.stage.advance_write_floor(self.ordinal).wait()
+            if self.current_usd_stage is not None and "hair_sim" in sys.modules:
+                _hs = sys.modules["hair_sim"]
+                _active_sessions = getattr(_hs, "_ACTIVE_SIM_SESSIONS", None) or {}
+                if _active_sessions:
+                    _live_hair_updates = []
+                    for _p_str, _sess in _active_sessions.items():
+                        _prim = self.current_usd_stage.GetPrimAtPath(_p_str)
+                        if _prim and _prim.IsValid() and _prim.IsA(UsdGeom.BasisCurves):
+                            _pts_np = _hs._session_local_points(_sess, np)
+                            if _pts_np is not None and len(_pts_np) > 0:
+                                _live_hair_updates.append((_p_str, _pts_np))
+                    if _live_hair_updates:
+                        self._write_hair_points_to_ovstage(_live_hair_updates)
             self._pt_spp_at_one = (render_mode == "pathTracing" and target_spp > 1)
             self._pt_max_bounces = 8
             self._pt_stall_count = 0
@@ -2790,6 +3012,7 @@ class OvrtxViewport:
                     self.pending_groom_frame = None
                     self.live_groom_modified = True
                 if hair_topology_changed:
+                    from pxr import Gf as _Gf_t, Sdf as _Sdf_t, UsdShade as _UsdShade_t, Vt as _Vt_t
                     base_stage = Usd.Stage.Open(self.base_layer) if self.base_layer is not None else self.current_usd_stage
                     if self.base_layer is not None and base_stage is not None:
                         for src_prim in self.current_usd_stage.Traverse():
@@ -2797,7 +3020,26 @@ class OvrtxViewport:
                                 continue
                             dst_prim = base_stage.GetPrimAtPath(src_prim.GetPath())
                             if not dst_prim or not dst_prim.IsValid():
-                                continue
+                                dst_prim = UsdGeom.BasisCurves.Define(base_stage, src_prim.GetPath()).GetPrim()
+                                UsdGeom.Xformable(dst_prim).SetResetXformStack(True)
+                                _dst_bc = UsdGeom.BasisCurves(dst_prim)
+                                _dst_bc.CreateTypeAttr().Set(UsdGeom.Tokens.cubic)
+                                _dst_bc.CreateBasisAttr().Set(UsdGeom.Tokens.bspline)
+                                _dst_bc.CreateWrapAttr().Set(UsdGeom.Tokens.pinned)
+                                _dst_bc.SetWidthsInterpolation(
+                                    UsdGeom.BasisCurves(src_prim).GetWidthsInterpolation() or UsdGeom.Tokens.vertex
+                                )
+                                dc_primvar = UsdGeom.PrimvarsAPI(dst_prim).CreatePrimvar(
+                                    "displayColor", _Sdf_t.ValueTypeNames.Color3fArray, UsdGeom.Tokens.constant
+                                )
+                                dc_primvar.Set(_Vt_t.Vec3fArray([_Gf_t.Vec3f(0.14, 0.08, 0.05)]))
+                                _mat = _UsdShade_t.Material.Define(base_stage, "/Scene/_OrchFlowCreatedHairMat")
+                                _sh = _UsdShade_t.Shader.Define(base_stage, "/Scene/_OrchFlowCreatedHairMat/Surface")
+                                _sh.CreateIdAttr("UsdPreviewSurface")
+                                _sh.CreateInput("diffuseColor", _Sdf_t.ValueTypeNames.Color3f).Set(_Gf_t.Vec3f(0.14, 0.08, 0.05))
+                                _sh.CreateInput("roughness", _Sdf_t.ValueTypeNames.Float).Set(0.42)
+                                _mat.CreateSurfaceOutput().ConnectToSource(_sh.ConnectableAPI(), "surface")
+                                _UsdShade_t.MaterialBindingAPI.Apply(dst_prim).Bind(_mat)
                             sc = UsdGeom.BasisCurves(src_prim)
                             dc = UsdGeom.BasisCurves(dst_prim)
                             c_val = sc.GetCurveVertexCountsAttr().Get()
@@ -2807,8 +3049,22 @@ class OvrtxViewport:
                                 dc.CreateCurveVertexCountsAttr().Set(c_val)
                             if p_val is not None:
                                 dc.CreatePointsAttr().Set(p_val)
+                                try:
+                                    import numpy as _np_ext
+                                    _pa = _np_ext.asarray(p_val, dtype=_np_ext.float32)
+                                    if len(_pa) > 0:
+                                        dc.CreateExtentAttr().Set(_Vt_t.Vec3fArray([
+                                            _Gf_t.Vec3f(*_pa.min(axis=0).tolist()),
+                                            _Gf_t.Vec3f(*_pa.max(axis=0).tolist()),
+                                        ]))
+                                except Exception:
+                                    pass
                             if w_val is not None:
                                 dc.CreateWidthsAttr().Set(w_val)
+                    if self.base_layer is not None:
+                        rp_b = self.base_layer.GetPrimAtPath("/Render/RenderProduct_Viewport")
+                        if rp_b and "resolution" in rp_b.properties:
+                            rp_b.properties["resolution"].default = _Gf_t.Vec2i(width, height)
                     target_stage = base_stage if base_stage is not None else self.current_usd_stage
                     self._update_camera(target_stage, request, width, height)
                     flat = self.base_layer if self.base_layer is not None else target_stage.Flatten()
@@ -2837,6 +3093,10 @@ class OvrtxViewport:
                         ordinal=self.ordinal,
                         time=float(request.get("frame", 0)) / self.current_usd_stage.GetTimeCodesPerSecond(),
                     )
+                    pose_path = getattr(self, "_pose_overlay_path", None)
+                    if pose_path and os.path.isfile(pose_path):
+                        self._pose_overlay_handle = ovstage.population.add_usd_reference(self.stage, pose_path, "/")
+                        ovstage.population.apply_usd_changes(self.stage, ordinal=self.ordinal)
                     self.stage.compute_hierarchy(
                         self.ordinal,
                         self.ordinal,
@@ -3012,6 +3272,7 @@ class OvrtxViewport:
                      or need_pt_spp_raise or request.get("pick") or self._pending_camera_sync)
             and previous_brush_frame is not None
             and previous_brush_frame[0] == usd_graph.groom_frame_view(request)
+            and not (previous_brush_frame[1].get("encoding") == "popup" and not request.get("popupSkipImage"))
         ):
             self._last_interactive = interactive
             total_ms = (time.perf_counter() - t_scene_start) * 1000
@@ -3192,7 +3453,7 @@ class OvrtxViewport:
             sys.path.insert(0, _wdir)
         if use_native_popup:
             try:
-                from hair_kernels import draw_brush_circle_cuda, render_var_to_cuda_u8
+                from hair_kernels import draw_brush_circle_cuda, draw_polyline_cuda, render_var_to_cuda_u8
                 from native_cuda_viewport import NativeCudaViewport
                 parent_hwnd = int(request.get("popupParentHwnd") or 0)
                 prect = request.get("popupRect") if isinstance(request.get("popupRect"), dict) else {}
@@ -3225,6 +3486,9 @@ class OvrtxViewport:
                         else:
                             wp.copy(self._popup_clean_u8, dev_u8)
                         self._popup_clean_meta = (actual_height, actual_width, stream_ptr)
+                        popup_draw_curve = request.get("popupDrawCurve")
+                        if isinstance(popup_draw_curve, list) and len(popup_draw_curve) >= 2:
+                            draw_polyline_cuda(dev_u8, actual_height, actual_width, popup_draw_curve)
                         r_px = float(request.get("popupBrushRadiusPx", 0.0) or 0.0)
                         if r_px > 1.0:
                             hnx, hny = self.native_popup.last_hover_norm()
@@ -3336,6 +3600,19 @@ class OvrtxViewport:
                 "center": list(self.camera_anchor[0]), "radius": self.camera_anchor[1],
                 "translation": list(self.camera_anchor_translation or [0.0, 0.0, 0.0]),
                 "transformTarget": self.camera_anchor_target,
+                "gizmoOffset": (
+                    [
+                        float(g_entry["head_world_pos"][0] - self.camera_anchor[0][0]),
+                        float(g_entry["head_world_pos"][1] - self.camera_anchor[0][1]),
+                        float(g_entry["head_world_pos"][2] - self.camera_anchor[0][2]),
+                    ]
+                    if isinstance(self.camera_anchor_target, str)
+                    and self.camera_anchor_target.startswith("groom:")
+                    and len(self.camera_anchor_target.split(":", 2)) == 3
+                    and (g_entry := getattr(self, "live_grooms", {}).get(tuple(self.camera_anchor_target.split(":", 2)[1:])))
+                    and g_entry.get("head_world_pos")
+                    else None
+                ),
                 "unitScale": (1.0 / max(1e-6, float(UsdGeom.GetStageMetersPerUnit(self.current_usd_stage) or 1.0))) if self.current_usd_stage else 1.0,
             } if self.camera_fit_key[0] else None,
             "cameraSync": self._pending_camera_sync,
@@ -3480,7 +3757,10 @@ def dispatch(request):
         vp.last_graph_hash = None
         vp.pending_groom_graph = None
         vp.pending_groom_frame = None
+        vp.last_brush_upload = None
+        vp.last_brush_frame = None
         vp.prepared_hair_node_id = None
+        vp.live_groom_modified = False
         vp._flush_stage_pool()
         return {"reset": True}
 

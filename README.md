@@ -12,6 +12,7 @@ Sublayer is a Windows desktop application built with **Tauri 2**, **React / Type
   - Interactive orbit/pan/dolly, transform & camera gizmos, prim selection/isolation, scene overview, and GPU cache controls (`Reload stage`, `Flush GPU`).
 - **Materials & Shading**: `MaterialX` authoring (Standard Surface with `UsdPreviewSurface` fallback, procedural shading rules, `.mtlx` export) and `Material Bind` nodes, with selective Auto/Scene/Solid material preview diagnostics for missing shader assets.
 - **Hair, Cloth & Character Tools**: `Hair` node (NVIDIA Warp GPU physics simulation and guide-based interactive grooming), `Cache Sculptor` (`cache_edit` for cloth physics brushing and full-garment GPU cloth simulation), and `Character` nodes.
+- **MetaHuman DNA source**: Select a head or body `.dna` and LOD. Epic OpenRigLogic reads legacy and UE 5.6+ DNA into anonymous USD meshes with UV seams, normals, skeleton rest/bind transforms, skin weights and sparse blend shapes. Original DNA stays linked in the registry. Facial RigLogic/body correctives are not evaluated; textures, materials, grooms and clothes are separate assets.
 - **Pose node & Live Pose Editing**: Map upstream skeletons to loaded USD animations or poses in an inspector table, edit poses directly with the interactive viewport pose editor, and stream real-time `livePose` delta updates in Omniverse RTX. Switch entries, bypass individual mappings, play clips, or sample a fixed pose frame. Compatible joint names are required; no automatic retargeting. External animation assets stay linked in place.
 - **Lighting, Cameras & PostFX**: `Light` (with physical light units), `HDRI`, `Camera`, and `PostFX` nodes (tone mapping including ACES, Hable Filmic, Heji-Hable ALU, Reinhard, and Iray, plus color grading and per-channel RGB controls).
 - **DCC & Application Round Trips**:
@@ -78,6 +79,23 @@ Omniverse RTX runs in a separate isolated Python environment (`.venv-ovrtx`) to 
 
 2. Install the `ovrtx`, `ovstage`, and OpenUSD (`pxr`) packages into `.venv-ovrtx` according to your Omniverse RTX SDK distribution.
 3. Point `ORCHFLOW_OVRTX_ROOT` to the external Omniverse RTX runtime directory containing `runtime.json` (defaults to `I:/AI/OrchFlow-renderers/ovrtx`).
+
+#### Optional: MetaHuman DNA reader
+
+The MetaHuman node uses Epic's [OpenRigLogic stable 5.8 reader](https://github.com/EpicGames/OpenRigLogic/tree/5.8), pinned by `scripts/setup-metahuman.ps1`. It handles both legacy DNA and the DNA 2.5 files exported by newer MetaHuman Creator. Older DNA Calibration bindings are supported for legacy files only; they cannot read UE 5.6+ DNA.
+
+Build bindings for the **same Python major/minor version as the USD worker**. With Visual Studio 2022 C++, CMake and SWIG 4+ installed:
+
+```powershell
+.\scripts\setup-metahuman.ps1 -PythonExe .\.venv-imaging\Scripts\python.exe `
+  -SwigExe 'path/to/swig.exe' -SwigLib 'path/to/swig/library'
+```
+
+The helper keeps its source/build/runtime under `I:/AI`, installs the reader and shared library together, and leaves DNA assets untouched. Default development discovery uses `I:/AI/OpenRigLogic-runtime/py<major.minor>/lib`. For other locations, set `ORCHFLOW_DNA_ROOT` to the runtime base or binding directory; installed app discovery also checks `%LOCALAPPDATA%/Sublayer/runtimes/dna/py<major.minor>/lib`. Restart Sublayer after installation. Readers are external dependencies, not bundled with the app.
+
+Choose **MetaHuman** from the node toolbar, **Browse DNA**, and select an available LOD (0 is highest detail). Use separate nodes for head and body; combining stages does not weld the neck or merge the rigs. The current importer preserves Maya-style left/up/front coordinates and recorded translation/rotation units, and reports unsupported coordinate conventions. Graph wrapping performs the usual geometric conversion into scene meters.
+
+Import covers neutral geometry and editable USD blend-shape targets, not RigLogic GUI/raw-control evaluation, body RBF/swing-twist correctives, animated material maps, or automatic character assembly. DNA does not contain the complete textured character. Link materials/textures and grooms separately. Unsupported/corrupt DNA and unavailable runtimes fail explicitly.
 
 #### 4. Build, Launch & Bundle
 

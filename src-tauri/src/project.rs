@@ -192,6 +192,8 @@ pub struct ScatterPrototypeRule {
     #[serde(default = "default_true")]
     pub enabled: bool,
     pub prim_path: String,
+    #[serde(default = "default_one")]
+    pub weight: f64,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -204,22 +206,72 @@ pub struct ScatterSettings {
     pub distribution: String,
     #[serde(default = "default_scatter_area")]
     pub area_size: [f64; 3],
+    #[serde(default)]
+    pub area_offset: [f64; 3],
+    #[serde(default)]
+    pub grid_jitter: f64,
+    #[serde(default)]
+    pub inner_radius_ratio: f64,
+    #[serde(default = "default_scatter_circle_align")]
+    pub circle_align: String,
+    #[serde(default)]
+    pub circle_even_spacing: bool,
+    #[serde(default = "default_true")]
+    pub scale_uniform: bool,
     #[serde(default = "default_scatter_scale_min")]
     pub scale_min: f64,
     #[serde(default = "default_scatter_scale_max")]
     pub scale_max: f64,
+    #[serde(default = "default_scatter_scale_min_vec")]
+    pub scale_min_vec: [f64; 3],
+    #[serde(default = "default_scatter_scale_max_vec")]
+    pub scale_max_vec: [f64; 3],
     #[serde(default = "default_scatter_random_yaw")]
     pub random_yaw: bool,
+    #[serde(default)]
+    pub rotation_offset: [f64; 3],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation_min: Option<[f64; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation_max: Option<[f64; 3]>,
     #[serde(default)]
     pub pass_through: bool,
     #[serde(default)]
     pub surface_prim_path: String,
     #[serde(default)]
+    pub surface_offset: f64,
+    #[serde(default)]
     pub align_to_normal: bool,
+    #[serde(default = "default_one")]
+    pub align_strength: f64,
+    #[serde(default)]
+    pub min_slope_deg: f64,
     #[serde(default = "default_scatter_max_slope_deg")]
     pub max_slope_deg: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height_min: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height_max: Option<f64>,
     #[serde(default)]
     pub min_spacing: f64,
+    #[serde(default)]
+    pub color_variation_enabled: bool,
+    #[serde(default = "default_scatter_color_mode")]
+    pub color_variation_mode: String,
+    #[serde(default = "default_one_color")]
+    pub color_tint_base: [f64; 3],
+    #[serde(default = "default_scatter_hue_jitter")]
+    pub color_hue_jitter: f64,
+    #[serde(default = "default_scatter_sv_jitter")]
+    pub color_sat_jitter: f64,
+    #[serde(default = "default_scatter_sv_jitter")]
+    pub color_val_jitter: f64,
+    #[serde(default = "default_scatter_ramp_a")]
+    pub color_ramp_a: [f64; 3],
+    #[serde(default = "default_scatter_ramp_b")]
+    pub color_ramp_b: [f64; 3],
+    #[serde(default = "default_true")]
+    pub color_apply_to_materials: bool,
     #[serde(default)]
     pub prototypes: Vec<ScatterPrototypeRule>,
 }
@@ -232,6 +284,9 @@ fn default_scatter_seed() -> u64 {
 fn default_scatter_distribution() -> String {
     "random".to_string()
 }
+fn default_scatter_circle_align() -> String {
+    "none".to_string()
+}
 fn default_scatter_area() -> [f64; 3] {
     [20.0, 0.0, 20.0]
 }
@@ -241,11 +296,32 @@ fn default_scatter_scale_min() -> f64 {
 fn default_scatter_scale_max() -> f64 {
     1.2
 }
+fn default_scatter_scale_min_vec() -> [f64; 3] {
+    [0.8, 0.8, 0.8]
+}
+fn default_scatter_scale_max_vec() -> [f64; 3] {
+    [1.2, 1.2, 1.2]
+}
 fn default_scatter_random_yaw() -> bool {
     true
 }
 fn default_scatter_max_slope_deg() -> f64 {
     90.0
+}
+fn default_scatter_color_mode() -> String {
+    "hsv".to_string()
+}
+fn default_scatter_hue_jitter() -> f64 {
+    15.0
+}
+fn default_scatter_sv_jitter() -> f64 {
+    0.15
+}
+fn default_scatter_ramp_a() -> [f64; 3] {
+    [0.85, 0.95, 0.75]
+}
+fn default_scatter_ramp_b() -> [f64; 3] {
+    [0.95, 0.75, 0.55]
 }
 
 #[derive(Serialize, Deserialize)]
@@ -263,6 +339,8 @@ pub struct NodeData {
     pub material_bindings: Option<Vec<MaterialBindingRule>>,
     #[serde(default)]
     pub light_overrides: Option<Vec<LightOverride>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub light_intensity_scale: Option<f64>,
     #[serde(default)]
     pub delete_paths: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -308,6 +386,8 @@ pub struct NodeData {
     pub input_dependency_id: Option<String>,
     #[serde(default)]
     pub native_project_dependency_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub md_bridge_dependency_id: Option<String>,
     #[serde(default)]
     pub published_dependency_id: Option<String>,
     #[serde(default)]
@@ -342,6 +422,12 @@ pub struct NodeData {
     pub cache_edit: Option<CacheEditSettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub character: Option<CharacterSettings>,
+    #[serde(default)]
+    pub metahuman_lod: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metahuman_body_dependency_id: Option<String>,
+    #[serde(default = "default_true")]
+    pub metahuman_materials: bool,
     #[serde(default)]
     pub pose: Option<PoseSettings>,
     #[serde(default)]
@@ -518,6 +604,50 @@ pub struct CharacterClothCache {
     pub time_offset: f64,
 }
 
+fn default_groom_source_mode() -> String {
+    "file".into()
+}
+
+fn default_groom_attach_mode() -> String {
+    "joint".into()
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CharacterHeadGroom {
+    pub id: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_groom_source_mode")]
+    pub source_mode: String,
+    #[serde(default)]
+    pub dependency_id: Option<String>,
+    #[serde(default)]
+    pub target_query: String,
+    #[serde(default = "default_groom_attach_mode")]
+    pub attach_mode: String,
+    #[serde(default)]
+    pub skeleton_path: String,
+    #[serde(default)]
+    pub head_joint_name: String,
+    #[serde(default = "default_true")]
+    pub preserve_rest_position: bool,
+    #[serde(default)]
+    pub head_mesh_path: String,
+    #[serde(default = "default_preserve_axis")]
+    pub axis: String,
+    #[serde(default = "default_preserve_axis")]
+    pub front_axis: String,
+    #[serde(default = "default_one")]
+    pub scale: f64,
+    #[serde(default)]
+    pub offset_translation: [f64; 3],
+    #[serde(default)]
+    pub offset_rotation: [f64; 3],
+    #[serde(default = "default_unit_scale")]
+    pub offset_scale: [f64; 3],
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CharacterSettings {
@@ -531,6 +661,8 @@ pub struct CharacterSettings {
     pub skeleton_bindings: Vec<CharacterSkeletonBinding>,
     #[serde(default)]
     pub cloth_caches: Vec<CharacterClothCache>,
+    #[serde(default)]
+    pub head_grooms: Vec<CharacterHeadGroom>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
@@ -1631,6 +1763,7 @@ impl Project {
                 || ![
                     "source",
                     "blender",
+                    "metahuman",
                     "application",
                     "transform",
                     "output",
@@ -1664,13 +1797,60 @@ impl Project {
                 return Err("Invalid axis, scale, or position".into());
             }
             if let Some(id) = &n.data.input_dependency_id {
-                check(id, &DependencyKind::Usd)?;
+                check(
+                    id,
+                    if n.data.operation == "metahuman" {
+                        &DependencyKind::Asset
+                    } else {
+                        &DependencyKind::Usd
+                    },
+                )?;
+                if n.data.operation == "metahuman"
+                    && dependencies[id.as_str()] != &DependencyKind::Asset
+                {
+                    return Err("MetaHuman DNA input must be registered as an asset".into());
+                }
+                if n.data.operation == "metahuman"
+                    && !self
+                        .dependencies
+                        .iter()
+                        .find(|d| &d.id == id)
+                        .unwrap()
+                        .path
+                        .to_ascii_lowercase()
+                        .ends_with(".dna")
+                {
+                    return Err("MetaHuman input must be a .dna asset".into());
+                }
+            }
+            if let Some(id) = &n.data.metahuman_body_dependency_id {
+                check(id, &DependencyKind::Asset)?;
+                if dependencies[id.as_str()] != &DependencyKind::Asset {
+                    return Err("MetaHuman body DNA input must be registered as an asset".into());
+                }
+                if !self
+                    .dependencies
+                    .iter()
+                    .find(|d| &d.id == id)
+                    .unwrap()
+                    .path
+                    .to_ascii_lowercase()
+                    .ends_with(".dna")
+                {
+                    return Err("MetaHuman body input must be a .dna asset".into());
+                }
+            }
+            if n.data.metahuman_lod > 31 {
+                return Err("MetaHuman LOD must be between 0 and 31".into());
             }
             if let Some(id) = &n.data.published_dependency_id {
                 check(id, &DependencyKind::Usd)?;
             }
             if let Some(id) = &n.data.native_project_dependency_id {
                 check(id, &DependencyKind::NativeProject)?;
+            }
+            if let Some(id) = &n.data.md_bridge_dependency_id {
+                check(id, &DependencyKind::Asset)?;
             }
             if let Some(id) = &n.data.app_executable_dependency_id {
                 check(id, &DependencyKind::Executable)?;
@@ -1697,20 +1877,85 @@ impl Project {
                         "Scatter distribution must be random, grid, circle, or surface".into(),
                     );
                 }
+                if !["none", "outward", "inward", "tangent"]
+                    .contains(&scatter.circle_align.as_str())
+                {
+                    return Err(
+                        "Scatter circleAlign must be none, outward, inward, or tangent".into(),
+                    );
+                }
+                if !["hsv", "ramp"].contains(&scatter.color_variation_mode.as_str()) {
+                    return Err("Scatter colorVariationMode must be hsv or ramp".into());
+                }
+                let bad_color_var = scatter
+                    .color_tint_base
+                    .iter()
+                    .chain(scatter.color_ramp_a.iter())
+                    .chain(scatter.color_ramp_b.iter())
+                    .any(|v| !v.is_finite() || !(0.0..=1.0).contains(v))
+                    || !scatter.color_hue_jitter.is_finite()
+                    || !(0.0..=180.0).contains(&scatter.color_hue_jitter)
+                    || !scatter.color_sat_jitter.is_finite()
+                    || !(0.0..=1.0).contains(&scatter.color_sat_jitter)
+                    || !scatter.color_val_jitter.is_finite()
+                    || !(0.0..=1.0).contains(&scatter.color_val_jitter);
+                if bad_color_var {
+                    return Err("Invalid scatter color variation parameters".into());
+                }
+                let bad_scale_vec = (0..3).any(|i| {
+                    !scatter.scale_min_vec[i].is_finite()
+                        || !scatter.scale_max_vec[i].is_finite()
+                        || scatter.scale_min_vec[i] <= 0.0
+                        || scatter.scale_max_vec[i] < scatter.scale_min_vec[i]
+                });
+                let bad_rot_range = match (scatter.rotation_min, scatter.rotation_max) {
+                    (Some(rmin), Some(rmax)) => (0..3)
+                        .any(|i| !rmin[i].is_finite() || !rmax[i].is_finite() || rmax[i] < rmin[i]),
+                    (Some(r), None) | (None, Some(r)) => r.iter().any(|v| !v.is_finite()),
+                    (None, None) => false,
+                };
+                let bad_height = match (scatter.height_min, scatter.height_max) {
+                    (Some(hmin), Some(hmax)) => {
+                        !hmin.is_finite() || !hmax.is_finite() || hmax < hmin
+                    }
+                    (Some(h), None) | (None, Some(h)) => !h.is_finite(),
+                    (None, None) => false,
+                };
                 if scatter.area_size.iter().any(|v| !v.is_finite() || *v < 0.0)
+                    || scatter.area_offset.iter().any(|v| !v.is_finite())
+                    || !scatter.grid_jitter.is_finite()
+                    || !(0.0..=1.0).contains(&scatter.grid_jitter)
+                    || !scatter.inner_radius_ratio.is_finite()
+                    || !(0.0..=1.0).contains(&scatter.inner_radius_ratio)
                     || !scatter.scale_min.is_finite()
                     || !scatter.scale_max.is_finite()
                     || scatter.scale_min <= 0.0
                     || scatter.scale_max < scatter.scale_min
+                    || bad_scale_vec
+                    || scatter.rotation_offset.iter().any(|v| !v.is_finite())
+                    || bad_rot_range
+                    || !scatter.surface_offset.is_finite()
+                    || !scatter.align_strength.is_finite()
+                    || !(0.0..=1.0).contains(&scatter.align_strength)
+                    || !scatter.min_slope_deg.is_finite()
+                    || !(0.0..=180.0).contains(&scatter.min_slope_deg)
                     || !scatter.max_slope_deg.is_finite()
                     || !(0.0..=180.0).contains(&scatter.max_slope_deg)
+                    || scatter.max_slope_deg < scatter.min_slope_deg
+                    || bad_height
                     || !scatter.min_spacing.is_finite()
                     || scatter.min_spacing < 0.0
                 {
-                    return Err("Invalid scatter area, slope, spacing, or scale bounds".into());
+                    return Err(
+                        "Invalid scatter area, slope, height, spacing, rotation, or scale bounds"
+                            .into(),
+                    );
                 }
                 if scatter.prototypes.len() > 1000
-                    || scatter.prototypes.iter().any(|p| p.id.trim().is_empty())
+                    || scatter
+                        .prototypes
+                        .iter()
+                        .any(|p| p.id.trim().is_empty() || !p.weight.is_finite() || p.weight < 0.0)
                 {
                     return Err("Invalid scatter prototype list".into());
                 }
@@ -1992,6 +2237,37 @@ impl Project {
                             }
                         }
                     }
+                    let mut hg_ids = HashSet::new();
+                    if ch.head_grooms.len() > 256 {
+                        return Err("Too many character head groom entries".into());
+                    }
+                    for hg in &ch.head_grooms {
+                        if hg.id.is_empty()
+                            || !hg_ids.insert(&hg.id)
+                            || !["file", "upstream"].contains(&hg.source_mode.as_str())
+                            || !["joint", "surface"].contains(&hg.attach_mode.as_str())
+                            || hg.target_query.len() > 512
+                            || hg.head_mesh_path.len() > 512
+                            || !hg.scale.is_finite()
+                            || hg.scale <= 0.0
+                            || !["preserve", "Y", "-Y", "Z", "-Z", "X", "-X"]
+                                .contains(&hg.axis.as_str())
+                            || !["preserve", "Y", "-Y", "Z", "-Z", "X", "-X"]
+                                .contains(&hg.front_axis.as_str())
+                            || hg.offset_translation.iter().any(|v| !v.is_finite())
+                            || hg.offset_rotation.iter().any(|v| !v.is_finite())
+                            || hg.offset_scale.iter().any(|v| !v.is_finite() || *v == 0.0)
+                        {
+                            return Err("Invalid character head groom settings".into());
+                        }
+                        if hg.source_mode == "file" {
+                            if let Some(did) = &hg.dependency_id {
+                                if !did.is_empty() {
+                                    check(did, &DependencyKind::Usd)?;
+                                }
+                            }
+                        }
+                    }
                 }
             }
             if n.data.operation == "material_bind" {
@@ -2234,6 +2510,11 @@ impl Project {
                 }
             }
             if n.data.operation == "light" {
+                if let Some(s) = n.data.light_intensity_scale {
+                    if !s.is_finite() || s <= 0.0 {
+                        return Err("Invalid light intensity scale".into());
+                    }
+                }
                 let mut light_ids = HashSet::new();
                 if let Some(overrides) = &n.data.light_overrides {
                     const VALID_LIGHT_TYPES: &[&str] = &[
@@ -2502,6 +2783,34 @@ pub fn load(path: &str) -> Result<Project, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn metahuman_asset_lod_and_domain_graph_round_trip() {
+        let mut p = project();
+        p.nodes[0].data.operation = "metahuman".into();
+        p.nodes[0].data.metahuman_lod = 2;
+        let id = p.nodes[0].data.input_dependency_id.clone().unwrap();
+        let dep = p.dependencies.iter_mut().find(|d| d.id == id).unwrap();
+        dep.kind = DependencyKind::Asset;
+        dep.path = "I:/characters/offline.dna".into();
+        p.validate().unwrap();
+        let restored = Project::from_value(serde_json::to_value(&p).unwrap()).unwrap();
+        assert_eq!(restored.nodes[0].data.metahuman_lod, 2);
+        let graph = crate::application::evaluation_graph(&restored, &p.nodes[0].id, false).unwrap();
+        assert_eq!(graph["nodes"][0]["metahumanLod"], 2);
+        assert_eq!(
+            graph["dependencies"][0]["path"],
+            "I:/characters/offline.dna"
+        );
+        p.nodes[0].data.metahuman_lod = 32;
+        assert!(p.validate().is_err());
+        p.nodes[0].data.metahuman_lod = 0;
+        p.dependencies.iter_mut().find(|d| d.id == id).unwrap().kind = DependencyKind::Usd;
+        assert!(p.validate().is_err());
+        let dep = p.dependencies.iter_mut().find(|d| d.id == id).unwrap();
+        dep.kind = DependencyKind::Asset;
+        dep.path = "I:/characters/wrong.mhb".into();
+        assert!(p.validate().is_err());
+    }
     #[test]
     fn materialx_parameters_and_texture_dependencies_validate() {
         let mut p = Project::from_value(legacy()).unwrap();
@@ -2885,6 +3194,77 @@ mod tests {
         let graph = crate::application::evaluation_graph(&p, &p.nodes[0].id, false).unwrap();
         assert_eq!(graph["nodes"][0]["pose"]["mappings"][0]["entryId"], "clip");
         p.nodes[0].data.pose.as_mut().unwrap().mappings[0].entry_id = Some("missing".into());
+        assert!(p.validate().is_err());
+    }
+
+    #[test]
+    fn character_head_grooms_validate_and_round_trip() {
+        let mut p = project();
+        let dep_id = p.nodes[0].data.input_dependency_id.clone();
+        p.nodes[0].data.operation = "character".into();
+        p.nodes[0].data.character = Some(CharacterSettings {
+            base_skeleton_path: "/Scene/Char/Skeleton".into(),
+            animation_overrides: vec![],
+            joint_attachments: vec![],
+            skeleton_bindings: vec![],
+            cloth_caches: vec![],
+            head_grooms: vec![
+                CharacterHeadGroom {
+                    id: "hg-1".into(),
+                    enabled: true,
+                    source_mode: "file".into(),
+                    dependency_id: dep_id.clone(),
+                    target_query: "".into(),
+                    attach_mode: "joint".into(),
+                    skeleton_path: "".into(),
+                    head_joint_name: "head".into(),
+                    preserve_rest_position: true,
+                    head_mesh_path: "".into(),
+                    axis: "preserve".into(),
+                    front_axis: "preserve".into(),
+                    scale: 1.0,
+                    offset_translation: [0.0, 0.0, 0.0],
+                    offset_rotation: [0.0, 0.0, 0.0],
+                    offset_scale: [1.0, 1.0, 1.0],
+                },
+                CharacterHeadGroom {
+                    id: "hg-2".into(),
+                    enabled: true,
+                    source_mode: "upstream".into(),
+                    dependency_id: None,
+                    target_query: "*Eyebrows*".into(),
+                    attach_mode: "surface".into(),
+                    skeleton_path: "".into(),
+                    head_joint_name: "".into(),
+                    preserve_rest_position: true,
+                    head_mesh_path: "/Scene/Char/head_lod0_mesh".into(),
+                    axis: "preserve".into(),
+                    front_axis: "preserve".into(),
+                    scale: 1.0,
+                    offset_translation: [0.0, 0.0, 0.0],
+                    offset_rotation: [0.0, 0.0, 0.0],
+                    offset_scale: [1.0, 1.0, 1.0],
+                },
+            ],
+        });
+        p.validate().unwrap();
+        let saved = serde_json::to_value(&p).unwrap();
+        let restored = Project::from_value(saved).unwrap();
+        assert_eq!(restored.nodes[0].data.character, p.nodes[0].data.character);
+        let graph = crate::application::evaluation_graph(&p, &p.nodes[0].id, false).unwrap();
+        assert_eq!(
+            graph["nodes"][0]["character"]["headGrooms"][0]["id"],
+            "hg-1"
+        );
+
+        // Invalid attach_mode rejected
+        p.nodes[0].data.character.as_mut().unwrap().head_grooms[0].attach_mode = "invalid".into();
+        assert!(p.validate().is_err());
+
+        // Missing file dependency rejected
+        p.nodes[0].data.character.as_mut().unwrap().head_grooms[0].attach_mode = "joint".into();
+        p.nodes[0].data.character.as_mut().unwrap().head_grooms[0].dependency_id =
+            Some("missing-dep".into());
         assert!(p.validate().is_err());
     }
 }

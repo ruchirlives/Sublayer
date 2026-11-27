@@ -896,3 +896,328 @@ def _apply_cut_line_brush(stage, p_str, sess, cut_line, cam_basis, wp, np, devic
     return True
 
 
+def _build_scene_draw_mesh(stage, wp, np, device, Usd, UsdGeom):
+    """Build a Warp raycast mesh from all visible UsdGeom.Mesh prims (including instance proxies and UsdSkel)."""
+    from hair_colliders import _build_merged_collider_mesh, _build_skel_context
+
+    mesh_prims = []
+    for prim in Usd.PrimRange.Stage(stage, Usd.TraverseInstanceProxies()):
+        if not prim.IsActive() or not prim.IsA(UsdGeom.Mesh):
+            continue
+        if UsdGeom.Imageable(prim).ComputeVisibility() == UsdGeom.Tokens.invisible:
+            continue
+        mesh_prims.append(prim)
+    if not mesh_prims:
+        return None
+    skel_ctx = _build_skel_context(stage)
+    c_pts, c_tris, _ = _build_merged_collider_mesh(
+        mesh_prims,
+        Usd.TimeCode.Default(),
+        UsdGeom.XformCache(),
+        np.array([-1e9, -1e9, -1e9], dtype=np.float32),
+        np.array([1e9, 1e9, 1e9], dtype=np.float32),
+        np,
+        skel_ctx=skel_ctx,
+    )
+    if c_pts is None or c_tris is None or len(c_tris) == 0:
+        return None
+    return wp.Mesh(
+        points=wp.array(c_pts, dtype=wp.vec3, device=device),
+        indices=wp.array(c_tris.reshape(-1), dtype=int, device=device),
+    )
+
+
+def _apply_draw_lock_brush(stage, p_str, sess, draw_curve, scaled_radius, strength, cam_basis, wp, np, device, Vt, UsdGeom, tip_pct=25.0, density=None):
+    """Create a sculpted lock of hair strands along a screen-space drag curve projected onto a 3D object."""
+    if not draw_curve or len(draw_curve) < 2:
+        return False
+    from pxr import Usd
+    from hair_draw_kernels import _build_draw_lock_kernels
+
+    raycast_kernel, project_outside_kernel, drape_kernel = _build_draw_lock_kernels(wp)
+
+    eye = np.asarray(cam_basis["origin"], dtype=np.float64)
+    fwd = np.asarray(cam_basis["forward"], dtype=np.float64)
+    right = np.asarray(cam_basis["right"], dtype=np.float64)
+    up = np.asarray(cam_basis["up"], dtype=np.float64)
+    tan_half_fov = float(cam_basis.get("tan_half_fov", 0.4142))
+    aspect = float(cam_basis.get("aspect", 1.3333))
+
+    pts_2d = np.asarray(draw_curve, dtype=np.float64).reshape(-1, 2)
+    n_in = len(pts_2d)
+    if n_in < 2:
+        return False
+
+    sx = (pts_2d[:, 0] * 2.0 - 1.0) * tan_half_fov * aspect
+    sy = (1.0 - pts_2d[:, 1] * 2.0) * tan_half_fov
+    rds = fwd[None, :] + right[None, :] * sx[:, None] + up[None, :] * sy[:, None]
+    rd_norms = np.linalg.norm(rds, axis=1, keepdims=True)
+    rds = (rds / np.maximum(rd_norms, 1e-12)).astype(np.float32)
+
+    ro_wp = wp.vec3(float(eye[0]), float(eye[1]), float(eye[2]))
+    rd_wp = wp.array(np.ascontiguousarray(rds, dtype=np.float32), dtype=wp.vec3, device=device)
+    out_pos_wp = wp.zeros(n_in, dtype=wp.vec3, device=device)
+    out_nrm_wp = wp.zeros(n_in, dtype=wp.vec3, device=device)
+    out_t_wp = wp.zeros(n_in, dtype=float, device=device)
+    out_hit_wp = wp.zeros(n_in, dtype=int, device=device)
+    max_ray_d = max(float(sess.get("max_query_dist", 100.0)) * 50.0, 1000.0)
+
+    def _raycast_mesh(mesh_obj):
+        out_hit_wp.zero_()
+        wp.launch(
+            raycast_kernel,
+            dim=n_in,
+            inputs=[mesh_obj.id, ro_wp, rd_wp, max_ray_d, out_pos_wp, out_nrm_wp, out_t_wp, out_hit_wp],
+            device=device,
+        )
+        hf = out_hit_wp.numpy()
+        return hf, np.nonzero(hf)[0]
+
+    wp_collider = sess.get("wp_collider") or sess.get("_brush_scene_collider")
+    hit_flag = None
+    hit_indices = np.zeros(0, dtype=np.int64)
+    if wp_collider is not None:
+        hit_flag, hit_indices = _raycast_mesh(wp_collider)
+
+    # Fall back to all visible scene meshes (including instance proxies & posed UsdSkel)
+    # when the hair collider is absent or only covers a sub-region of the scene.
+    if len(hit_indices) < 2 and not sess.get("_brush_scene_collider_checked"):
+        scene_mesh = _build_scene_draw_mesh(stage, wp, np, device, Usd, UsdGeom)
+        sess["_brush_scene_collider_checked"] = True
+        if scene_mesh is not None:
+            sess["_brush_scene_collider"] = scene_mesh
+            wp_collider = scene_mesh
+            hit_flag, hit_indices = _raycast_mesh(wp_collider)
+
+    # Mouse must drag over a 3D object (at least 2 curve samples must hit the mesh).
+    if wp_collider is None or len(hit_indices) < 2:
+        return False
+
+    hit_pos = out_pos_wp.numpy()
+    hit_nrm = out_nrm_wp.numpy()
+    hit_t = out_t_wp.numpy()
+
+    unit_scale = float(sess.get("unit_scale", 1.0))
+    margin = max(float(sess.get("scaled_margin", 0.002 * unit_scale)), 0.0015 * unit_scale)
+    max_query_dist = float(sess.get("max_query_dist", 0.5 * unit_scale))
+
+    first_h = int(hit_indices[0])
+    last_t = float(hit_t[first_h])
+    last_nrm = hit_nrm[first_h].copy()
+    if float(np.linalg.norm(last_nrm)) < 1e-5:
+        last_nrm = (-rds[first_h]).astype(np.float32)
+
+    raw_3d = []
+    raw_nrms = []
+    min_step = 1e-4 * unit_scale
+    for i in range(first_h, n_in):
+        if hit_flag[i]:
+            p = hit_pos[i] + hit_nrm[i] * margin
+            n = hit_nrm[i]
+            if float(np.linalg.norm(n)) < 1e-5:
+                n = last_nrm
+            last_t = float(hit_t[i])
+            last_nrm = n
+        else:
+            p = (eye.astype(np.float32) + rds[i] * last_t)
+            n = last_nrm
+        if not raw_3d or float(np.linalg.norm(p - raw_3d[-1])) >= min_step:
+            raw_3d.append(p.astype(np.float32))
+            raw_nrms.append(n.astype(np.float32))
+
+    if len(raw_3d) < 2:
+        return False
+
+    raw_3d_np = np.stack(raw_3d, axis=0)
+    raw_nrms_np = np.stack(raw_nrms, axis=0)
+    seg_lens = np.linalg.norm(raw_3d_np[1:] - raw_3d_np[:-1], axis=1)
+    total_len = float(seg_lens.sum())
+    if total_len < 1e-3 * unit_scale:
+        return False
+
+    num_strands = int(sess["num_strands"])
+    total_verts = int(sess["total_verts"])
+    counts_np = sess["counts_np"]
+    pos_np = sess["pos_wp"].numpy() if total_verts > 0 else np.zeros((0, 3), dtype=np.float32)
+    pinned_np = sess["pinned_strand_wp"].numpy() if num_strands > 0 else np.zeros(0, dtype=np.int32)
+    widths_np = sess.get("widths_np")
+    widths_interp = str(sess.get("widths_interp") or "vertex")
+
+    if len(counts_np) > 0:
+        k_verts = int(np.clip(int(np.median(counts_np)), 8, 32))
+    else:
+        k_verts = 14
+
+    cum_raw = np.concatenate(([0.0], np.cumsum(seg_lens)))
+    sample_s = np.linspace(0.0, total_len, k_verts, dtype=np.float32)
+    center = np.stack([np.interp(sample_s, cum_raw, raw_3d_np[:, ax]) for ax in range(3)], axis=1).astype(np.float32)
+    c_nrms = np.stack([np.interp(sample_s, cum_raw, raw_nrms_np[:, ax]) for ax in range(3)], axis=1).astype(np.float32)
+    c_nrms /= np.maximum(np.linalg.norm(c_nrms, axis=1, keepdims=True), 1e-6)
+
+    # Gentle smoothing on interior centerline points to remove mouse jitter while keeping root & tip
+    for _ in range(2):
+        if k_verts >= 3:
+            center[1:-1] = 0.25 * center[:-2] + 0.50 * center[1:-1] + 0.25 * center[2:]
+
+    # Ensure centerline clears the 3D collider
+    center_wp = wp.array(np.ascontiguousarray(center, dtype=np.float32), dtype=wp.vec3, device=device)
+    wp.launch(project_outside_kernel, dim=k_verts, inputs=[wp_collider.id, center_wp, max_query_dist, margin], device=device)
+    center = center_wp.numpy()
+
+    # Build smooth parallel-transport (Bishop) frame along the centerline
+    tangents = np.zeros_like(center)
+    tangents[:-1] = center[1:] - center[:-1]
+    tangents[-1] = center[-1] - center[-2]
+    tangents /= np.maximum(np.linalg.norm(tangents, axis=1, keepdims=True), 1e-6)
+
+    normals = np.zeros_like(center)
+    binormals = np.zeros_like(center)
+    n0 = c_nrms[0] - tangents[0] * float(np.dot(c_nrms[0], tangents[0]))
+    if float(np.linalg.norm(n0)) < 1e-5:
+        ref = np.array([0.0, 1.0, 0.0], dtype=np.float32) if abs(tangents[0, 1]) < 0.9 else np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        n0 = ref - tangents[0] * float(np.dot(ref, tangents[0]))
+    n0 /= max(float(np.linalg.norm(n0)), 1e-6)
+    normals[0] = n0
+    binormals[0] = np.cross(tangents[0], normals[0])
+    binormals[0] /= max(float(np.linalg.norm(binormals[0])), 1e-6)
+
+    for j in range(1, k_verts):
+        # Blend transported normal with surface normal so lock stays aligned to 3D object
+        nj = normals[j - 1] * 0.65 + c_nrms[j] * 0.35
+        nj = nj - tangents[j] * float(np.dot(nj, tangents[j]))
+        n_len = float(np.linalg.norm(nj))
+        if n_len < 1e-5:
+            nj = normals[j - 1]
+        else:
+            nj /= n_len
+        normals[j] = nj
+        bj = np.cross(tangents[j], nj)
+        b_len = float(np.linalg.norm(bj))
+        binormals[j] = bj / max(b_len, 1e-6)
+
+    if density is not None:
+        n_spawn = max(8, min(400, int(round(float(density)))))
+    else:
+        n_spawn = max(48, min(200, int(round(120.0 * max(0.35, float(strength))))))
+    # Match lock root half-width 1:1 to cursor radius, tapering down to tip_pct% at the tip.
+    lock_half_w = max(float(scaled_radius), 0.004 * unit_scale)
+    lock_half_h = lock_half_w * 0.22
+    tip_ratio = max(0.0, min(1.0, float(tip_pct) / 100.0))
+
+    seed_val = int(abs(
+        center[0, 0] * 1000.0 + center[0, 1] * 317.0 + center[-1, 2] * 97.0 + float(num_strands) * 13.0
+    )) & 0xFFFFFFFF
+    rng = np.random.default_rng(seed_val)
+
+    u_t = np.linspace(0.0, 1.0, k_verts, dtype=np.float32)
+
+    # Golden-angle stratified distribution across the elliptical lock cross-section
+    # matching cursor radius at root and tapering smoothly down to tip_pct% at tip.
+    golden = 2.39996323
+    lock_pts = np.empty((n_spawn, k_verts, 3), dtype=np.float32)
+    lock_nrms = np.empty((n_spawn, k_verts, 3), dtype=np.float32)
+    lock_offs = np.empty((n_spawn, k_verts), dtype=np.float32)
+    taper_curve = (1.0 - (1.0 - tip_ratio) * (u_t ** 1.35)).astype(np.float32)
+    for i in range(n_spawn):
+        frac = (i + 0.5) / float(n_spawn)
+        rad = float(np.sqrt(frac)) * (0.90 + 0.10 * float(rng.random()))
+        ang = i * golden + float(rng.uniform(-0.18, 0.18))
+        ub = float(np.cos(ang)) * rad
+        un = abs(float(np.sin(ang))) * rad  # outward thickness layer above surface
+        # Stagger/break up each strand's root start position along the lock tangent
+        # (slightly more feathered near the outer edges) to avoid a hard straight hairline.
+        edge_bias = 0.35 + 0.65 * (ub * ub)
+        u_start = float(rng.uniform(0.0, 0.08)) * edge_bias
+        u_end = min(1.0, max(u_start + 0.25, 0.86 + 0.14 * float(rng.random())))
+        u_s = u_start + u_t * (u_end - u_start)
+        c_i = np.stack([np.interp(u_s, u_t, center[:, ax]) for ax in range(3)], axis=1).astype(np.float32)
+        t_i = np.stack([np.interp(u_s, u_t, tangents[:, ax]) for ax in range(3)], axis=1).astype(np.float32)
+        b_i = np.stack([np.interp(u_s, u_t, binormals[:, ax]) for ax in range(3)], axis=1).astype(np.float32)
+        n_i = np.stack([np.interp(u_s, u_t, normals[:, ax]) for ax in range(3)], axis=1).astype(np.float32)
+        root_t_jitter = float(rng.uniform(-0.35, 0.35)) * min(lock_half_w, total_len * 0.08)
+        root_fade = np.maximum(0.0, 1.0 - u_t * 3.0).astype(np.float32)[:, None]
+        phase = float(rng.uniform(0.0, 2.0 * np.pi))
+        wave = (0.04 * lock_half_w * np.sin(u_t * 2.0 * np.pi + phase) * u_t * taper_curve).astype(np.float32)
+        b_off = (ub * lock_half_w * taper_curve + wave)[:, None]
+        n_off = (un * lock_half_h * taper_curve)
+        lock_pts[i] = c_i + t_i * (root_t_jitter * root_fade) + b_i * b_off + n_i * n_off[:, None]
+        lock_nrms[i] = n_i
+        # Roots sit directly on the scalp (0 offset); body lifts naturally by margin + layered thickness
+        offs_i = margin + n_off
+        offs_i[0] = 0.0
+        lock_offs[i] = offs_i
+
+    # Drape EVERY strand vertex onto the 3D object surface via outward->inward raycast.
+    # Works on both open (e.g. MetaHuman head) and closed meshes so strands never hide under the skin.
+    flat_pts = np.ascontiguousarray(lock_pts.reshape(-1, 3), dtype=np.float32)
+    flat_nrms = np.ascontiguousarray(lock_nrms.reshape(-1, 3), dtype=np.float32)
+    flat_offs = np.ascontiguousarray(lock_offs.reshape(-1), dtype=np.float32)
+    pts_wp = wp.array(flat_pts, dtype=wp.vec3, device=device)
+    nrms_wp = wp.array(flat_nrms, dtype=wp.vec3, device=device)
+    offs_wp = wp.array(flat_offs, dtype=float, device=device)
+    drape_lift = max(lock_half_w * 1.6, 0.12 * unit_scale)
+    wp.launch(
+        drape_kernel,
+        dim=len(flat_pts),
+        inputs=[wp_collider.id, pts_wp, nrms_wp, offs_wp, drape_lift, int(k_verts), float(max_query_dist)],
+        device=device,
+    )
+    lock_pts = pts_wp.numpy().reshape(n_spawn, k_verts, 3)
+
+    added_counts = np.full(n_spawn, k_verts, dtype=np.int32)
+    added_pts = lock_pts.reshape(-1, 3).astype(np.float32)
+    added_pinned = np.zeros(n_spawn, dtype=np.int32)
+
+    new_counts = np.concatenate([counts_np, added_counts]) if len(counts_np) > 0 else added_counts
+    new_pos = np.concatenate([pos_np, added_pts], axis=0) if total_verts > 0 else added_pts
+    new_pinned = np.concatenate([pinned_np, added_pinned]) if len(pinned_np) > 0 else added_pinned
+
+    # Natural tapered strand widths
+    if widths_np is not None and len(widths_np) > 0:
+        med_w = float(np.median(widths_np))
+        if widths_interp == "uniform":
+            added_w = np.full(n_spawn, med_w, dtype=np.float32)
+        else:
+            strand_w = (med_w * (1.25 - 0.75 * (u_t ** 1.35))).astype(np.float32)
+            added_w = np.tile(strand_w, n_spawn)
+        new_widths = np.concatenate([widths_np, added_w])
+    else:
+        base_w = 0.0005 * unit_scale
+        strand_w = (base_w * (1.0 - 0.65 * (u_t ** 1.35))).astype(np.float32)
+        new_widths = np.tile(strand_w, n_spawn)
+        sess["widths_interp"] = "vertex"
+
+    if sess.get("_bootstrap_only"):
+        prim = stage.GetPrimAtPath(p_str)
+        if prim and prim.IsValid():
+            from pxr import Gf, Sdf, UsdShade
+            UsdGeom.Xformable(prim).SetResetXformStack(True)
+            curves = UsdGeom.BasisCurves(prim)
+            curves.CreateTypeAttr().Set(UsdGeom.Tokens.cubic)
+            curves.CreateBasisAttr().Set(UsdGeom.Tokens.bspline)
+            curves.CreateWrapAttr().Set(UsdGeom.Tokens.pinned)
+            curves.CreateCurveVertexCountsAttr().Set(Vt.IntArray.FromNumpy(new_counts))
+            curves.CreatePointsAttr().Set(Vt.Vec3fArray.FromNumpy(new_pos))
+            if new_widths is not None:
+                curves.CreateWidthsAttr().Set(Vt.FloatArray.FromNumpy(new_widths))
+                curves.SetWidthsInterpolation(UsdGeom.Tokens.vertex)
+            p_min = new_pos.min(axis=0)
+            p_max = new_pos.max(axis=0)
+            curves.CreateExtentAttr().Set(Vt.Vec3fArray([Gf.Vec3f(*p_min.tolist()), Gf.Vec3f(*p_max.tolist())]))
+            dc = UsdGeom.PrimvarsAPI(prim).CreatePrimvar("displayColor", Sdf.ValueTypeNames.Color3fArray, UsdGeom.Tokens.constant)
+            dc.Set(Vt.Vec3fArray([Gf.Vec3f(0.14, 0.08, 0.05)]))
+            if not UsdShade.MaterialBindingAPI(prim).ComputeBoundMaterial()[0]:
+                mat = UsdShade.Material.Define(stage, "/Scene/_OrchFlowCreatedHairMat")
+                sh = UsdShade.Shader.Define(stage, "/Scene/_OrchFlowCreatedHairMat/Surface")
+                sh.CreateIdAttr("UsdPreviewSurface")
+                sh.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(0.14, 0.08, 0.05))
+                sh.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.42)
+                mat.CreateSurfaceOutput().ConnectToSource(sh.ConnectableAPI(), "surface")
+                UsdShade.MaterialBindingAPI.Apply(prim).Bind(mat)
+        return True
+
+    _rebuild_session_topology(stage, p_str, sess, new_counts, new_pos, new_pinned, new_widths, wp, np, device, Vt, UsdGeom)
+    return True
+
+
+

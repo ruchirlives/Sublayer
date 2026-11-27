@@ -45,7 +45,7 @@ import {
   type StoredProject,
   type ViewportSettings,
 } from "./fileRegistry";
-import { insertToolbarNode, toolbarOperations, type DropTarget } from "./graphInsertion";
+import { detachNodeFromEdges, insertExistingNodeOnEdge, insertToolbarNode, toolbarOperations, type DropTarget } from "./graphInsertion";
 import { previewTarget } from "./previewTarget";
 import { NativeViewport } from "./NativeViewport";
 import { ApplicationCatalogProvider, ApplicationSettings, useApplicationCatalog } from "./applicationProfiles";
@@ -57,6 +57,7 @@ import { LightInspector } from "./LightInspector";
 const HairInspector = lazy(() => import("./HairInspector").then((m) => ({ default: m.HairInspector })));
 const CacheEditInspector = lazy(() => import("./CacheEditInspector").then((m) => ({ default: m.CacheEditInspector })));
 const PoseInspector = lazy(() => import("./PoseInspector").then((m) => ({ default: m.PoseInspector })));
+const MetahumanInspector = lazy(() => import("./MetahumanInspector").then(m => ({default:m.MetahumanInspector})));
 const CharacterInspector = lazy(() => import("./CharacterInspector").then((m) => ({ default: m.CharacterInspector })));
 const BlenderInspector = lazy(() => import("./BlenderInspector").then((m) => ({ default: m.BlenderInspector })));
 import { TransformInspector } from "./TransformInspector";
@@ -401,6 +402,7 @@ function Workspace() {
   const { catalog } = useApplicationCatalog();
   const [settingsTarget,setSettingsTarget]=useState({id:"",visit:0});
   const [nodeContextMenu, setNodeContextMenu] = useState<{ nodeId: string; x: number; y: number } | null>(null);
+  const [edgeContextMenu, setEdgeContextMenu] = useState<{ edgeId: string; x: number; y: number } | null>(null);
   const [activeTab,setActiveTab]=useState<"canvas"|"applications">("canvas");
   const [nodes, setNodes] = useNodesState<StageNode>(seed);
   const [edges, setEdges] = useEdgesState<Edge>([]);
@@ -571,7 +573,7 @@ function Workspace() {
   const previewNode = pinnedNode || node;
   const previewId = previewNode?.id || "";
   const [applicationPreviews, setApplicationPreviews] = useState<Record<string,"handoff"|"published"|"input">>({});
-  const previewMode = applicationPreviews[previewId] || (previewNode?.data.liveAdjustment ? "published" : "handoff");
+  const previewMode = applicationPreviews[previewId] || (previewNode?.data.liveAdjustment || previewNode?.data.mdBridgePath ? "published" : "handoff");
   const activePreviewMode = pinnedNode && previewMode === "input" ? "handoff" : previewMode;
   const target = useMemo(
     () => previewTarget(projectModel, previewId, activePreviewMode),
@@ -598,9 +600,11 @@ function Workspace() {
   const [primSelection,setPrimSelection]=useState({key:"",path:""});
   const [isolatedPrim, setIsolatedPrim] = useState<string | null>(null);
   const [hiddenPrims, setHiddenPrims] = useState<string[]>([]);
+  const [activeGroomGizmo, setActiveGroomGizmo] = useState<{ nodeId: string; groomId: string } | null>(null);
   const selectedPrim=primSelection.key===sceneKey?primSelection.path:"";
   const flowInstance=useRef<ReactFlowInstance<StageNode,Edge>|null>(null);
   const [dropTarget,setDropTarget]=useState<DropTarget>(null);
+  const altDragRef = useRef<{ nodeId: string; detached: boolean } | null>(null);
   const [lastProjectPath, setLastProjectPath] = useState<string | null>(() => {
     try {
       return localStorage.getItem(LAST_PROJECT_STORAGE_KEY);
@@ -646,6 +650,26 @@ function Workspace() {
       /* ignore storage errors */
     }
   }, [themeId]);
+  function pointerCoords(event: MouseEvent | TouchEvent | React.MouseEvent | React.TouchEvent): { x: number; y: number } | null {
+    if ("clientX" in event) return { x: event.clientX, y: event.clientY };
+    const touch = event.touches[0] || event.changedTouches[0];
+    return touch ? { x: touch.clientX, y: touch.clientY } : null;
+  }
+  function edgeUnderPointer(event: MouseEvent | TouchEvent | React.MouseEvent | React.TouchEvent, excludeNodeId: string): DropTarget {
+    const pt = pointerCoords(event);
+    if (!pt) return null;
+    const els = document.elementsFromPoint(pt.x, pt.y);
+    for (const el of els) {
+      const edgeEl = el instanceof Element ? el.closest(".react-flow__edge") : null;
+      const edgeId = edgeEl?.getAttribute("data-id");
+      if (!edgeId) continue;
+      const edge = projectRef.current.edges.find((e) => e.id === edgeId);
+      if (edge && edge.source !== excludeNodeId && edge.target !== excludeNodeId) {
+        return { kind: "edge", id: edgeId };
+      }
+    }
+    return null;
+  }
   function targetAt(element:EventTarget|null):DropTarget {
     if(!(element instanceof Element))return null;
     const node=element.closest(".react-flow__node");
@@ -672,7 +696,7 @@ function Workspace() {
     const position=flowInstance.current?.screenToFlowPosition({x:event.clientX,y:event.clientY});
     if(!position)return;
     const id=crypto.randomUUID();
-    const label=operation === "materialx"?"MaterialX":operation === "material_bind"?"Material Bind":operation === "light"?"Light":operation === "hdri"?"HDRI":operation === "postfx"?"PostFX":operation === "hair"?"Hair":operation === "cache_edit"?"Cache Sculptor":operation === "character"?"Character":operation === "camera"?"Camera":operation === "blender"?"Blender":operation === "assetOverride"?"Asset Override":operation === "source"?"Source stage":operation[0].toUpperCase()+operation.slice(1);
+    const label=operation === "materialx"?"MaterialX":operation === "material_bind"?"Material Bind":operation === "light"?"Light":operation === "hdri"?"HDRI":operation === "postfx"?"PostFX":operation === "hair"?"Hair":operation === "cache_edit"?"Cache Sculptor":operation === "character"?"Character":operation === "camera"?"Camera":operation === "metahuman"?"MetaHuman":operation === "blender"?"Blender":operation === "assetOverride"?"Asset Override":operation === "source"?"Source stage":operation[0].toUpperCase()+operation.slice(1);
     const defaultCamera = { yaw: 35, pitch: 20, zoom: 1, panX: 0, panY: 0, fov: 45, dofEnabled: false, focusDistance: 5, fStop: 5.6 };
     const initialCamera = { ...defaultCamera, ...(projectRef.current.viewport?.camera ?? {}) };
     const added=storeProject([{...seed[0],id,position,data:{...seed[0].data,label,operation,transform:structuredClone(identityTransform),...(operation === "application" ? defaultApplicationFields() : {}),...(operation === "postfx" ? { postFx: structuredClone(defaultPostFx) } : {}),...(operation === "cache_edit" ? { cacheEdit: structuredClone(defaultCacheEditSettings) } : {}),...(operation === "character" ? { character: structuredClone(defaultCharacterSettings) } : {}),...(operation === "camera" ? { cameraViews: [{ id: crypto.randomUUID(), name: "Camera 1", camera: initialCamera }] } : {})}}],[],[]).nodes[0];
@@ -694,7 +718,7 @@ function Workspace() {
         data: {
           ...seed[0].data,
           label:
-            operation === "materialx" ? "MaterialX" : operation === "material_bind" ? "Material Bind" : operation === "light" ? "Light" : operation === "hdri" ? "HDRI" : operation === "postfx" ? "PostFX" : operation === "hair" ? "Hair" : operation === "cache_edit" ? "Cache Sculptor" : operation === "character" ? "Character" : operation === "camera" ? "Camera" : operation === "blender" ? "Blender" : operation === "source"
+            operation === "materialx" ? "MaterialX" : operation === "material_bind" ? "Material Bind" : operation === "light" ? "Light" : operation === "hdri" ? "HDRI" : operation === "postfx" ? "PostFX" : operation === "hair" ? "Hair" : operation === "cache_edit" ? "Cache Sculptor" : operation === "character" ? "Character" : operation === "camera" ? "Camera" : operation === "metahuman" ? "MetaHuman" : operation === "blender" ? "Blender" : operation === "source"
               ? "Source stage"
               : operation === "transform"
                 ? "Transform"
@@ -1015,7 +1039,7 @@ function Workspace() {
                 const d = n.data;
                 const op = d.operation;
                 let settings: Record<string, unknown> | undefined;
-                if (op === "light") settings = { lightOverrides: d.lightOverrides ?? [] };
+                if (op === "light") settings = { lightOverrides: d.lightOverrides ?? [], scale: d.scale ?? 1, lightIntensityScale: d.lightIntensityScale ?? 1 };
                 else if (op === "hdri") settings = { hdri: d.hdri ?? null };
                 else if (op === "postfx") settings = { postFx: d.postFx ?? null };
                 else if (op === "materialx") settings = d.materialXRules ? { materialXRules: d.materialXRules } : { materialX: d.materialX ?? null };
@@ -1179,7 +1203,7 @@ function Workspace() {
             onDragStart={e=>{setGraphModeRequest(n=>n+1);e.dataTransfer.setData("application/orchflow-node",operation);e.dataTransfer.effectAllowed="copy";}}
             onDragEnd={()=>setDropTarget(null)} onClick={()=>addNode(operation)}>
             <span className="drag-grip" aria-hidden="true" />
-            ＋ {operation === "materialx"?"MaterialX":operation === "material_bind"?"Material Bind":operation === "light"?"Light":operation === "hdri"?"HDRI":operation === "postfx"?"PostFX":operation === "hair"?"Hair":operation === "cache_edit"?"Cache Sculptor":operation === "character"?"Character":operation === "camera"?"Camera":operation === "blender"?"Blender":operation === "assetOverride"?"Asset Override":operation[0].toUpperCase()+operation.slice(1)}
+            ＋ {operation === "materialx"?"MaterialX":operation === "material_bind"?"Material Bind":operation === "light"?"Light":operation === "hdri"?"HDRI":operation === "postfx"?"PostFX":operation === "hair"?"Hair":operation === "cache_edit"?"Cache Sculptor":operation === "character"?"Character":operation === "camera"?"Camera":operation === "metahuman"?"MetaHuman":operation === "blender"?"Blender":operation === "assetOverride"?"Asset Override":operation[0].toUpperCase()+operation.slice(1)}
           </button>)}
           <span className="nav-divider" aria-hidden="true" />
           <button className="nav-action nav-action-danger" disabled={busy || (!nodes.length && !dependencies.length)}
@@ -1400,23 +1424,78 @@ function Workspace() {
                 },
                 onCommit:()=>history.current.endGroup(),
               }:null}
-              transformGizmo={
-                node?.data.operation === "transform"
-                  ? {
-                      nodeId: node.id,
-                      transform: node.data.transform || identityTransform,
-                      onChange: (nextTransform) =>
+              transformGizmo={(() => {
+                if (node?.data.operation === "transform") {
+                  return {
+                    nodeId: node.id,
+                    transform: node.data.transform || identityTransform,
+                    onChange: (nextTransform) =>
+                      applyProject(
+                        editNodeData(projectRef.current, node.id, {
+                          transform: nextTransform,
+                        }),
+                        "Transform gizmo",
+                        "transform-gizmo",
+                      ),
+                    onCommit: () => history.current.endGroup(),
+                  };
+                }
+                if (activeGroomGizmo) {
+                  const charNode = projectModel.nodes.find(
+                    (n) => n.id === activeGroomGizmo.nodeId && n.data.operation === "character",
+                  );
+                  const groomRule = charNode?.data.character?.headGrooms?.find(
+                    (hg) => hg.id === activeGroomGizmo.groomId && hg.enabled && hg.attachMode === "joint",
+                  );
+                  if (charNode && groomRule) {
+                    return {
+                      nodeId: `groom:${charNode.id}:${groomRule.id}`,
+                      transform: {
+                        translation: groomRule.offsetTranslation,
+                        rotation: groomRule.offsetRotation,
+                        scale: groomRule.offsetScale,
+                      },
+                      onChange: (nextTransform) => {
+                        const curChar = projectRef.current.nodes.find((n) => n.id === charNode.id)?.data.character;
+                        if (!curChar) return;
+                        const prevScale = groomRule.offsetScale;
+                        const sChanged =
+                          Math.abs(nextTransform.scale[0] - prevScale[0]) > 1e-6
+                            ? nextTransform.scale[0]
+                            : Math.abs(nextTransform.scale[1] - prevScale[1]) > 1e-6
+                              ? nextTransform.scale[1]
+                              : Math.abs(nextTransform.scale[2] - prevScale[2]) > 1e-6
+                                ? nextTransform.scale[2]
+                                : nextTransform.scale[0];
+                        const uniformScale: [number, number, number] = [
+                          Math.max(0.0001, sChanged),
+                          Math.max(0.0001, sChanged),
+                          Math.max(0.0001, sChanged),
+                        ];
+                        const nextHeadGrooms = (curChar.headGrooms || []).map((hg) =>
+                          hg.id === groomRule.id
+                            ? {
+                                ...hg,
+                                offsetTranslation: nextTransform.translation,
+                                offsetRotation: nextTransform.rotation,
+                                offsetScale: uniformScale,
+                              }
+                            : hg,
+                        );
                         applyProject(
-                          editNodeData(projectRef.current, node.id, {
-                            transform: nextTransform,
+                          editNodeData(projectRef.current, charNode.id, {
+                            character: { ...curChar, headGrooms: nextHeadGrooms },
                           }),
-                          "Transform gizmo",
-                          "transform-gizmo",
-                        ),
+                          "Move head groom",
+                          `groom-gizmo:${charNode.id}:${groomRule.id}`,
+                        );
+                      },
                       onCommit: () => history.current.endGroup(),
-                    }
-                  : null
-              }
+                    };
+                  }
+                }
+                return null;
+              })()}
               isolatedPrim={isolatedPrim}
               onIsolatedPrimChange={setIsolatedPrim}
               hiddenPrims={hiddenPrims}
@@ -1463,16 +1542,72 @@ function Workspace() {
                 }}
                 onNodeClick={(_, n) => {
                   setNodeContextMenu(null);
+                  setEdgeContextMenu(null);
                   select(n.id);
                   setInspection(null);
                 }}
+                onNodeDragStart={(event, n) => {
+                  altDragRef.current = event.altKey ? { nodeId: n.id, detached: false } : null;
+                }}
+                onNodeDrag={(event, n) => {
+                  const activeAlt = event.altKey || altDragRef.current?.nodeId === n.id;
+                  if (!activeAlt) {
+                    if (dropTarget) setDropTarget(null);
+                    return;
+                  }
+                  if (event.altKey && (!altDragRef.current || (altDragRef.current.nodeId === n.id && !altDragRef.current.detached))) {
+                    const detached = detachNodeFromEdges(projectRef.current, n.id);
+                    if (detached !== projectRef.current) {
+                      applyProject(detached, "Detach node", `alt-drag:${n.id}`);
+                      setStatus("Detached node and reconnected upstream/downstream links.");
+                    }
+                    altDragRef.current = { nodeId: n.id, detached: true };
+                  }
+                  if (event.altKey) {
+                    const nextTarget = edgeUnderPointer(event, n.id);
+                    setDropTarget((prev) =>
+                      JSON.stringify(prev) === JSON.stringify(nextTarget) ? prev : nextTarget,
+                    );
+                  } else if (dropTarget) {
+                    setDropTarget(null);
+                  }
+                }}
+                onNodeDragStop={(event, n) => {
+                  const targetEdge = event.altKey
+                    ? edgeUnderPointer(event, n.id) || (dropTarget?.kind === "edge" ? dropTarget : null)
+                    : dropTarget?.kind === "edge" && altDragRef.current?.nodeId === n.id
+                      ? dropTarget
+                      : null;
+                  setDropTarget(null);
+                  if (targetEdge?.kind === "edge" && (event.altKey || altDragRef.current?.nodeId === n.id)) {
+                    const inserted = insertExistingNodeOnEdge(projectRef.current, n.id, targetEdge.id);
+                    if (inserted !== projectRef.current) {
+                      applyProject(inserted, "Insert node into edge");
+                      setStatus("Inserted node into edge.");
+                    }
+                  }
+                  altDragRef.current = null;
+                }}
                 onNodeContextMenu={(event, n) => {
                   event.preventDefault();
+                  setEdgeContextMenu(null);
                   select(n.id);
                   setInspection(null);
                   setNodeContextMenu({ nodeId: n.id, x: event.clientX, y: event.clientY });
                 }}
-                onPaneClick={() => setNodeContextMenu(null)}
+                onEdgeContextMenu={(event, edge) => {
+                  event.preventDefault();
+                  setNodeContextMenu(null);
+                  setEdgeContextMenu({ edgeId: edge.id, x: event.clientX, y: event.clientY });
+                }}
+                onEdgeClick={() => {
+                  setNodeContextMenu(null);
+                  setEdgeContextMenu(null);
+                }}
+                onPaneClick={() => {
+                  setNodeContextMenu(null);
+                  setEdgeContextMenu(null);
+                }}
                 onConnect={(c) => {
                   const reaches = (
                     id: string,
@@ -1500,6 +1635,58 @@ function Workspace() {
                 <Controls />
               </ReactFlow>
             </PinContext.Provider>
+            {edgeContextMenu && (() => {
+              const targetEdge = edges.find((e) => e.id === edgeContextMenu.edgeId);
+              if (!targetEdge) return null;
+              const srcLabel = nodes.find((n) => n.id === targetEdge.source)?.data.label || targetEdge.source;
+              const dstLabel = nodes.find((n) => n.id === targetEdge.target)?.data.label || targetEdge.target;
+              return (
+                <div
+                  className="node-context-backdrop"
+                  onClick={() => setEdgeContextMenu(null)}
+                  onContextMenu={(e) => {
+                    e.preventDefault();
+                    setEdgeContextMenu(null);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Escape") setEdgeContextMenu(null);
+                  }}
+                >
+                  <div
+                    className="node-context-menu"
+                    role="menu"
+                    aria-label={`Link actions for ${srcLabel} to ${dstLabel}`}
+                    style={{
+                      left: Math.min(edgeContextMenu.x, window.innerWidth - 220),
+                      top: Math.min(edgeContextMenu.y, window.innerHeight - 120),
+                    }}
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <div className="node-context-header">{srcLabel} → {dstLabel}</div>
+                    <button
+                      type="button"
+                      className="node-context-item danger"
+                      role="menuitem"
+                      onClick={() => {
+                        const current = projectRef.current;
+                        applyProject(
+                          {
+                            ...current,
+                            edges: current.edges.filter((e) => e.id !== targetEdge.id),
+                          },
+                          "Remove link",
+                          "delete",
+                        );
+                        setEdgeContextMenu(null);
+                        setStatus(`Removed link (${srcLabel} → ${dstLabel}).`);
+                      }}
+                    >
+                      Remove link
+                    </button>
+                  </div>
+                </div>
+              );
+            })()}
             {nodeContextMenu && (() => {
               const targetNode = nodes.find((n) => n.id === nodeContextMenu.nodeId);
               if (!targetNode) return null;
@@ -1518,6 +1705,7 @@ function Workspace() {
                 ["hair", "Hair"],
                 ["cache_edit", "Cache Sculptor"],
                 ["character", "Character"],
+                ["metahuman", "MetaHuman"],
                 ["pose", "Pose"],
                 ["camera", "Camera"],
                 ["delete", "Delete prims"],
@@ -1766,6 +1954,7 @@ function Workspace() {
                       </table>
                     </>}
                     {node.data.operation === "application" && <NativeProjectPanel projectName={projectName} onConfigure={()=>{setSettingsTarget(v=>({id:node.data.applicationProfileId || "",visit:v.visit+1}));setActiveTab("applications");}} key={node.id} project={projectModel} nodeId={node.id} data={node.data}
+                      onMdBridgePulled={()=>setApplicationPreviews(p=>({...p,[node.id]:"published"}))}
                       onChange={patch => applyProject(editNodeData(projectRef.current, node.id, patch),"Edit node",`field:${node.id}:${Object.keys(patch).join()}`)} onLive={(edited,result)=>{applyProject(recordLiveAdjustment(projectRef.current,node.id,edited,result));setApplicationPreviews(p=>({...p,[node.id]:"published"}));}} onPublished={(edited,result)=>{applyProject(recordPublication(projectRef.current,node.id,edited,result));setApplicationPreviews(p=>({...p,[node.id]:"published"}));}} onBaseline={result=>applyProject(recordManualBaseline(projectRef.current,node.id,result))} onQuickstartCreated={(original,prepared)=>commitQuickstart(node.id,original,prepared)} onNativeCreated={created=>{const next=recordNativeCreation(projectRef.current,node.id,created);applyProject(next);return next;}} onHandoff={created=>{const next=recordHandoff(projectRef.current,node.id,created);applyProject(next);setApplicationPreviews(p=>({...p,[node.id]:"handoff"}));return next;}} onStatus={reportStatus}/>}
 
                     {node.data.operation === "source" && <>
@@ -1811,6 +2000,9 @@ function Workspace() {
                     project={projectModel}
                     nodeId={node.id}
                     overrides={node.data.lightOverrides}
+                    globalScale={node.data.scale}
+                    intensityScale={node.data.lightIntensityScale}
+                    onScalesChange={(patch) => update(patch)}
                     getViewportCameraTransform={() => viewportCameraTransformRef.current}
                     onStatus={reportStatus}
                     onChange={(lightOverrides) => update({ lightOverrides })}
@@ -2138,10 +2330,33 @@ function Workspace() {
                         }
                       }}
                       onStatus={reportStatus}
+                      activeGroomGizmoId={
+                        activeGroomGizmo?.nodeId === node.id ? activeGroomGizmo.groomId : null
+                      }
+                      onToggleGroomGizmo={(groomId) => {
+                        setActiveGroomGizmo((cur) => {
+                          const turningOn = !(cur?.nodeId === node.id && cur.groomId === groomId);
+                          if (turningOn) setSceneMode(true);
+                          return turningOn ? { nodeId: node.id, groomId } : null;
+                        });
+                      }}
                     />
                   </Suspense>
                 )}
 
+                {node.data.operation === "metahuman" && (
+                  <Suspense fallback={<p>Loading MetaHuman inspector...</p>}>
+                    <MetahumanInspector
+                      key={node.id}
+                      path={node.data.path}
+                      bodyPath={node.data.metahumanBodyPath || ""}
+                      lod={node.data.metahumanLod ?? 0}
+                      materials={node.data.metahumanMaterials !== false}
+                      onChange={update}
+                      onStatus={reportStatus}
+                    />
+                  </Suspense>
+                )}
                 {node.data.operation === "blender" && (
                   <Suspense fallback={<p className="hint">Loading Blender inspector...</p>}>
                     <BlenderInspector

@@ -52,6 +52,29 @@ const inputStyle: React.CSSProperties = {
   fontFamily: "monospace",
 };
 
+function rgbToHex(rgb: [number, number, number]): string {
+  return (
+    "#" +
+    rgb
+      .map((c) =>
+        Math.max(0, Math.min(255, Math.round(c * 255)))
+          .toString(16)
+          .padStart(2, "0"),
+      )
+      .join("")
+  );
+}
+
+function hexToRgb(hex: string): [number, number, number] {
+  const clean = hex.replace(/^#/, "");
+  if (clean.length !== 6) return [1, 1, 1];
+  const r = parseInt(clean.slice(0, 2), 16);
+  const g = parseInt(clean.slice(2, 4), 16);
+  const b = parseInt(clean.slice(4, 6), 16);
+  if (!Number.isFinite(r) || !Number.isFinite(g) || !Number.isFinite(b)) return [1, 1, 1];
+  return [r / 255, g / 255, b / 255];
+}
+
 export function ScatterInspector({
   project,
   nodeId,
@@ -66,6 +89,33 @@ export function ScatterInspector({
   const s = value || defaultScatter;
   const prototypes = s.prototypes || [];
   const hasInputs = project.edges.some((e) => e.target === nodeId);
+
+  const areaOffset: [number, number, number] = s.areaOffset ?? [0, 0, 0];
+  const scaleUniform = s.scaleUniform ?? true;
+  const scaleMinVec: [number, number, number] = s.scaleMinVec ?? [s.scaleMin, s.scaleMin, s.scaleMin];
+  const scaleMaxVec: [number, number, number] = s.scaleMaxVec ?? [s.scaleMax, s.scaleMax, s.scaleMax];
+  const rotationOffset: [number, number, number] = s.rotationOffset ?? [0, 0, 0];
+  const rotationMin: [number, number, number] =
+    s.rotationMin ?? [0, 0, 0];
+  const rotationMax: [number, number, number] =
+    s.rotationMax ?? (s.randomYaw ? [0, 360, 0] : [0, 0, 0]);
+  const minSlopeDeg = s.minSlopeDeg ?? 0;
+  const maxSlopeDeg = s.maxSlopeDeg ?? 90;
+  const alignStrength = s.alignStrength ?? 1;
+  const surfaceOffset = s.surfaceOffset ?? 0;
+  const gridJitter = s.gridJitter ?? 0;
+  const innerRadiusRatio = s.innerRadiusRatio ?? 0;
+  const circleAlign = s.circleAlign ?? "none";
+  const circleEvenSpacing = Boolean(s.circleEvenSpacing);
+  const colorVariationEnabled = Boolean(s.colorVariationEnabled);
+  const colorVariationMode = s.colorVariationMode ?? "hsv";
+  const colorTintBase: [number, number, number] = s.colorTintBase ?? [1, 1, 1];
+  const colorHueJitter = s.colorHueJitter ?? 15;
+  const colorSatJitter = s.colorSatJitter ?? 0.15;
+  const colorValJitter = s.colorValJitter ?? 0.15;
+  const colorRampA: [number, number, number] = s.colorRampA ?? [0.85, 0.95, 0.75];
+  const colorRampB: [number, number, number] = s.colorRampB ?? [0.95, 0.75, 0.55];
+  const colorApplyToMaterials = s.colorApplyToMaterials ?? true;
 
   const [pickerOpen, setPickerOpen] = useState(false);
   const [search, setSearch] = useState("");
@@ -85,6 +135,7 @@ export function ScatterInspector({
       id: crypto.randomUUID(),
       enabled: true,
       primPath,
+      weight: 1,
     };
     patchScatter({ prototypes: [...prototypes, next] });
   }
@@ -294,6 +345,7 @@ export function ScatterInspector({
               <tr style={{ background: "#162329" }}>
                 <th style={{ ...thStyle, width: 30, textAlign: "center" }}>On</th>
                 <th style={thStyle}>Prim Path</th>
+                <th style={{ ...thStyle, width: 54 }} title="Relative spawn probability weight">Wt</th>
                 <th style={{ ...thStyle, width: 28 }}></th>
               </tr>
             </thead>
@@ -301,7 +353,7 @@ export function ScatterInspector({
               {prototypes.length === 0 ? (
                 <tr>
                   <td
-                    colSpan={3}
+                    colSpan={4}
                     style={{
                       padding: 8,
                       color: "#687b84",
@@ -334,6 +386,20 @@ export function ScatterInspector({
                         onChange={(e) =>
                           updateRow(row.id, { primPath: e.target.value })
                         }
+                      />
+                    </td>
+                    <td style={tdStyle}>
+                      <NumberInput
+                        style={{ ...inputStyle, textAlign: "right", padding: "3px 4px" }}
+                        aria-label={`Weight for ${row.primPath || "prototype"}`}
+                        value={row.weight ?? 1}
+                        min={0}
+                        step={0.1}
+                        onChange={(e) => {
+                          const w = Number(e.target.value);
+                          if (Number.isFinite(w))
+                            updateRow(row.id, { weight: Math.max(0, w) });
+                        }}
                       />
                     </td>
                     <td style={{ ...tdStyle, textAlign: "center" }}>
@@ -415,16 +481,98 @@ export function ScatterInspector({
             />
           </label>
           <label>
-            Max slope (°)
+            Slope Min / Max (°)
+            <div className="vector-inputs">
+              <NumberInput
+                value={minSlopeDeg}
+                min={0}
+                max={180}
+                step={5}
+                onChange={(e) => {
+                  const deg = Number(e.target.value);
+                  if (Number.isFinite(deg)) {
+                    const clamped = Math.max(0, Math.min(180, deg));
+                    patchScatter({
+                      minSlopeDeg: clamped,
+                      maxSlopeDeg: Math.max(clamped, maxSlopeDeg),
+                    });
+                  }
+                }}
+              />
+              <NumberInput
+                value={maxSlopeDeg}
+                min={0}
+                max={180}
+                step={5}
+                onChange={(e) => {
+                  const deg = Number(e.target.value);
+                  if (Number.isFinite(deg)) {
+                    const clamped = Math.max(minSlopeDeg, Math.min(180, deg));
+                    patchScatter({ maxSlopeDeg: clamped });
+                  }
+                }}
+              />
+            </div>
+          </label>
+          <label>
+            <span className="field-label">
+              Altitude Min / Max (m)
+              <InspectorHint text="Optional world elevation range along the stage up-axis. Leave blank for no limit." />
+            </span>
+            <div className="vector-inputs">
+              <input
+                type="number"
+                step={0.5}
+                placeholder="No min"
+                value={s.heightMin ?? ""}
+                onChange={(e) => {
+                  const raw = e.target.value.trim();
+                  if (!raw) {
+                    patchScatter({ heightMin: null });
+                    return;
+                  }
+                  const v = Number(raw);
+                  if (Number.isFinite(v)) {
+                    patchScatter({
+                      heightMin: v,
+                      heightMax:
+                        s.heightMax != null && s.heightMax < v ? v : s.heightMax ?? null,
+                    });
+                  }
+                }}
+              />
+              <input
+                type="number"
+                step={0.5}
+                placeholder="No max"
+                value={s.heightMax ?? ""}
+                onChange={(e) => {
+                  const raw = e.target.value.trim();
+                  if (!raw) {
+                    patchScatter({ heightMax: null });
+                    return;
+                  }
+                  const v = Number(raw);
+                  if (Number.isFinite(v)) {
+                    patchScatter({
+                      heightMax: s.heightMin != null && v < s.heightMin ? s.heightMin : v,
+                    });
+                  }
+                }}
+              />
+            </div>
+          </label>
+          <label>
+            <span className="field-label">
+              Surface offset (m)
+              <InspectorHint text="Offset instances along the surface normal. Negative values sink instances into the terrain; positive values lift them." />
+            </span>
             <NumberInput
-              value={s.maxSlopeDeg ?? 90}
-              min={0}
-              max={180}
-              step={5}
+              value={surfaceOffset}
+              step={0.05}
               onChange={(e) => {
-                const deg = Number(e.target.value);
-                if (Number.isFinite(deg))
-                  patchScatter({ maxSlopeDeg: Math.max(0, Math.min(180, deg)) });
+                const v = Number(e.target.value);
+                if (Number.isFinite(v)) patchScatter({ surfaceOffset: v });
               }}
             />
           </label>
@@ -436,100 +584,541 @@ export function ScatterInspector({
             />
             Align to surface normal
           </label>
+          {s.alignToNormal && (
+            <label>
+              Align strength (0–1)
+              <NumberInput
+                value={alignStrength}
+                min={0}
+                max={1}
+                step={0.05}
+                onChange={(e) => {
+                  const v = Number(e.target.value);
+                  if (Number.isFinite(v))
+                    patchScatter({ alignStrength: Math.max(0, Math.min(1, v)) });
+                }}
+              />
+            </label>
+          )}
         </>
       ) : (
+        <>
+          <label>
+            Area X / Y / Z
+            <div className="vector-inputs">
+              <NumberInput
+                value={s.areaSize[0]}
+                min={0}
+                step={1}
+                onChange={(e) => {
+                  const x = Number(e.target.value);
+                  if (Number.isFinite(x))
+                    patchScatter({
+                      areaSize: [Math.max(0, x), s.areaSize[1], s.areaSize[2]],
+                    });
+                }}
+              />
+              <NumberInput
+                value={s.areaSize[1]}
+                min={0}
+                step={1}
+                onChange={(e) => {
+                  const y = Number(e.target.value);
+                  if (Number.isFinite(y))
+                    patchScatter({
+                      areaSize: [s.areaSize[0], Math.max(0, y), s.areaSize[2]],
+                    });
+                }}
+              />
+              <NumberInput
+                value={s.areaSize[2]}
+                min={0}
+                step={1}
+                onChange={(e) => {
+                  const z = Number(e.target.value);
+                  if (Number.isFinite(z))
+                    patchScatter({
+                      areaSize: [s.areaSize[0], s.areaSize[1], Math.max(0, z)],
+                    });
+                }}
+              />
+            </div>
+          </label>
+          <label>
+            Center offset X / Y / Z
+            <div className="vector-inputs">
+              {[0, 1, 2].map((axis) => (
+                <NumberInput
+                  key={axis}
+                  value={areaOffset[axis]}
+                  step={0.5}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    if (Number.isFinite(v)) {
+                      const next: [number, number, number] = [...areaOffset];
+                      next[axis] = v;
+                      patchScatter({ areaOffset: next });
+                    }
+                  }}
+                />
+              ))}
+            </div>
+          </label>
+          {s.distribution === "grid" && (
+            <label>
+              <span className="field-label">
+                Grid jitter (0–1)
+                <InspectorHint text="Adds random horizontal offset within each grid cell for more organic placement." />
+              </span>
+              <NumberInput
+                value={gridJitter}
+                min={0}
+                max={1}
+                step={0.05}
+                onChange={(e) => {
+                  const v = Number(e.target.value);
+                  if (Number.isFinite(v))
+                    patchScatter({ gridJitter: Math.max(0, Math.min(1, v)) });
+                }}
+              />
+            </label>
+          )}
+          {s.distribution === "circle" && (
+            <>
+              <label>
+                <span className="field-label">
+                  Inner radius ratio (0–1)
+                  <InspectorHint text="Creates a ring/annulus clearing in the center. Set to 1.0 to place instances directly on the circle perimeter." />
+                </span>
+                <NumberInput
+                  value={innerRadiusRatio}
+                  min={0}
+                  max={1}
+                  step={0.05}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    if (Number.isFinite(v))
+                      patchScatter({ innerRadiusRatio: Math.max(0, Math.min(1, v)) });
+                  }}
+                />
+              </label>
+              <label>
+                <span className="field-label">
+                  Arc alignment
+                  <InspectorHint text="Orients each instance relative to the circle or ellipse arc. Combines with Base rotation and Random min/max below." />
+                </span>
+                <select
+                  value={circleAlign}
+                  onChange={(e) => {
+                    const next = e.target.value as "none" | "outward" | "inward" | "tangent";
+                    const isDefaultFullYaw =
+                      circleAlign === "none" &&
+                      next !== "none" &&
+                      rotationMin[0] === 0 &&
+                      rotationMin[1] === 0 &&
+                      rotationMin[2] === 0 &&
+                      rotationMax[0] === 0 &&
+                      rotationMax[1] === 360 &&
+                      rotationMax[2] === 0;
+                    patchScatter({
+                      circleAlign: next,
+                      ...(isDefaultFullYaw
+                        ? {
+                            randomYaw: false,
+                            rotationMin: [0, 0, 0],
+                            rotationMax: [0, 0, 0],
+                          }
+                        : {}),
+                    });
+                  }}
+                >
+                  <option value="none">None</option>
+                  <option value="outward">Perpendicular (Outward)</option>
+                  <option value="inward">Perpendicular (Inward)</option>
+                  <option value="tangent">Tangent (Along arc)</option>
+                </select>
+              </label>
+              <label className="checkbox-row">
+                <input
+                  type="checkbox"
+                  checked={circleEvenSpacing}
+                  onChange={(e) => patchScatter({ circleEvenSpacing: e.target.checked })}
+                />
+                Evenly spaced around circle
+              </label>
+            </>
+          )}
+        </>
+      )}
+      {s.distribution !== "grid" && (
         <label>
-          Area X / Y / Z
+          Min spacing
+          <NumberInput
+            value={s.minSpacing ?? 0}
+            min={0}
+            step={0.5}
+            onChange={(e) => {
+              const sp = Number(e.target.value);
+              if (Number.isFinite(sp)) patchScatter({ minSpacing: Math.max(0, sp) });
+            }}
+          />
+        </label>
+      )}
+
+      <label className="checkbox-row">
+        <input
+          type="checkbox"
+          checked={scaleUniform}
+          onChange={(e) => patchScatter({ scaleUniform: e.target.checked })}
+        />
+        Uniform scale
+      </label>
+      {scaleUniform ? (
+        <label>
+          Scale Min / Max
           <div className="vector-inputs">
             <NumberInput
-              value={s.areaSize[0]}
-              min={0}
-              step={1}
+              value={s.scaleMin}
+              min={0.01}
+              step={0.05}
               onChange={(e) => {
-                const x = Number(e.target.value);
-                if (Number.isFinite(x))
+                const scaleMin = Number(e.target.value);
+                if (Number.isFinite(scaleMin)) {
+                  const clamped = Math.max(0.01, scaleMin);
                   patchScatter({
-                    areaSize: [Math.max(0, x), s.areaSize[1], s.areaSize[2]],
+                    scaleMin: clamped,
+                    scaleMax: Math.max(clamped, s.scaleMax),
                   });
+                }
               }}
             />
             <NumberInput
-              value={s.areaSize[1]}
-              min={0}
-              step={1}
+              value={s.scaleMax}
+              min={0.01}
+              step={0.05}
               onChange={(e) => {
-                const y = Number(e.target.value);
-                if (Number.isFinite(y))
-                  patchScatter({
-                    areaSize: [s.areaSize[0], Math.max(0, y), s.areaSize[2]],
-                  });
-              }}
-            />
-            <NumberInput
-              value={s.areaSize[2]}
-              min={0}
-              step={1}
-              onChange={(e) => {
-                const z = Number(e.target.value);
-                if (Number.isFinite(z))
-                  patchScatter({
-                    areaSize: [s.areaSize[0], s.areaSize[1], Math.max(0, z)],
-                  });
+                const scaleMax = Number(e.target.value);
+                if (Number.isFinite(scaleMax))
+                  patchScatter({ scaleMax: Math.max(s.scaleMin, scaleMax) });
               }}
             />
           </div>
         </label>
+      ) : (
+        <>
+          <label>
+            Scale Min X / Y / Z
+            <div className="vector-inputs">
+              {[0, 1, 2].map((axis) => (
+                <NumberInput
+                  key={axis}
+                  value={scaleMinVec[axis]}
+                  min={0.01}
+                  step={0.05}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    if (Number.isFinite(v)) {
+                      const clamped = Math.max(0.01, v);
+                      const nextMin: [number, number, number] = [...scaleMinVec];
+                      const nextMax: [number, number, number] = [...scaleMaxVec];
+                      nextMin[axis] = clamped;
+                      nextMax[axis] = Math.max(clamped, nextMax[axis]);
+                      patchScatter({ scaleMinVec: nextMin, scaleMaxVec: nextMax });
+                    }
+                  }}
+                />
+              ))}
+            </div>
+          </label>
+          <label>
+            Scale Max X / Y / Z
+            <div className="vector-inputs">
+              {[0, 1, 2].map((axis) => (
+                <NumberInput
+                  key={axis}
+                  value={scaleMaxVec[axis]}
+                  min={0.01}
+                  step={0.05}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    if (Number.isFinite(v)) {
+                      const nextMax: [number, number, number] = [...scaleMaxVec];
+                      nextMax[axis] = Math.max(scaleMinVec[axis], v);
+                      patchScatter({ scaleMaxVec: nextMax });
+                    }
+                  }}
+                />
+              ))}
+            </div>
+          </label>
+        </>
       )}
-      <label>
-        Min spacing
-        <NumberInput
-          value={s.minSpacing ?? 0}
-          min={0}
-          step={0.5}
-          onChange={(e) => {
-            const sp = Number(e.target.value);
-            if (Number.isFinite(sp)) patchScatter({ minSpacing: Math.max(0, sp) });
-          }}
-        />
-      </label>
-      <label>
-        Scale Min / Max
-        <div className="vector-inputs">
-          <NumberInput
-            value={s.scaleMin}
-            min={0.01}
-            step={0.05}
-            onChange={(e) => {
-              const scaleMin = Number(e.target.value);
-              if (Number.isFinite(scaleMin)) {
-                const clamped = Math.max(0.01, scaleMin);
+
+      <details open style={{ marginTop: 4 }}>
+        <summary className="field-label" style={{ cursor: "pointer", userSelect: "none" }}>
+          Rotation (°)
+        </summary>
+        <div style={{ display: "grid", gap: 6, marginTop: 6 }}>
+          <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+            <button
+              type="button"
+              style={{ fontSize: 10, padding: "2px 6px" }}
+              onClick={() =>
                 patchScatter({
-                  scaleMin: clamped,
-                  scaleMax: Math.max(clamped, s.scaleMax),
-                });
+                  randomYaw: true,
+                  rotationMin: [0, 0, 0],
+                  rotationMax: [0, 360, 0],
+                })
               }
-            }}
-          />
-          <NumberInput
-            value={s.scaleMax}
-            min={0.01}
-            step={0.05}
-            onChange={(e) => {
-              const scaleMax = Number(e.target.value);
-              if (Number.isFinite(scaleMax))
-                patchScatter({ scaleMax: Math.max(s.scaleMin, scaleMax) });
-            }}
-          />
+            >
+              Yaw 360°
+            </button>
+            <button
+              type="button"
+              style={{ fontSize: 10, padding: "2px 6px" }}
+              onClick={() =>
+                patchScatter({
+                  randomYaw: true,
+                  rotationMin: [-15, 0, -15],
+                  rotationMax: [15, 360, 15],
+                })
+              }
+            >
+              Tilt ±15°
+            </button>
+            <button
+              type="button"
+              style={{ fontSize: 10, padding: "2px 6px" }}
+              onClick={() =>
+                patchScatter({
+                  randomYaw: true,
+                  rotationMin: [0, 0, 0],
+                  rotationMax: [360, 360, 360],
+                })
+              }
+            >
+              Full 3D
+            </button>
+            <button
+              type="button"
+              style={{ fontSize: 10, padding: "2px 6px" }}
+              onClick={() =>
+                patchScatter({
+                  randomYaw: false,
+                  rotationOffset: [0, 0, 0],
+                  rotationMin: [0, 0, 0],
+                  rotationMax: [0, 0, 0],
+                })
+              }
+            >
+              Reset
+            </button>
+          </div>
+          <label>
+            Base rotation X / Y / Z
+            <div className="vector-inputs">
+              {[0, 1, 2].map((axis) => (
+                <NumberInput
+                  key={axis}
+                  value={rotationOffset[axis]}
+                  step={5}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    if (Number.isFinite(v)) {
+                      const next: [number, number, number] = [...rotationOffset];
+                      next[axis] = v;
+                      patchScatter({ rotationOffset: next });
+                    }
+                  }}
+                />
+              ))}
+            </div>
+          </label>
+          <label>
+            Random min X / Y / Z
+            <div className="vector-inputs">
+              {[0, 1, 2].map((axis) => (
+                <NumberInput
+                  key={axis}
+                  value={rotationMin[axis]}
+                  step={5}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    if (Number.isFinite(v)) {
+                      const nextMin: [number, number, number] = [...rotationMin];
+                      const nextMax: [number, number, number] = [...rotationMax];
+                      nextMin[axis] = v;
+                      nextMax[axis] = Math.max(v, nextMax[axis]);
+                      patchScatter({
+                        rotationMin: nextMin,
+                        rotationMax: nextMax,
+                        randomYaw: nextMax[1] > nextMin[1],
+                      });
+                    }
+                  }}
+                />
+              ))}
+            </div>
+          </label>
+          <label>
+            Random max X / Y / Z
+            <div className="vector-inputs">
+              {[0, 1, 2].map((axis) => (
+                <NumberInput
+                  key={axis}
+                  value={rotationMax[axis]}
+                  step={5}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    if (Number.isFinite(v)) {
+                      const nextMin: [number, number, number] = [...rotationMin];
+                      const nextMax: [number, number, number] = [...rotationMax];
+                      nextMax[axis] = v;
+                      nextMin[axis] = Math.min(nextMin[axis], v);
+                      patchScatter({
+                        rotationMin: nextMin,
+                        rotationMax: nextMax,
+                        randomYaw: nextMax[1] > nextMin[1],
+                      });
+                    }
+                  }}
+                />
+              ))}
+            </div>
+          </label>
         </div>
-      </label>
-      <label className="checkbox-row">
-        <input
-          type="checkbox"
-          checked={s.randomYaw}
-          onChange={(e) => patchScatter({ randomYaw: e.target.checked })}
-        />
-        Random yaw rotation
-      </label>
+      </details>
+
+      <details style={{ marginTop: 4 }} open={colorVariationEnabled}>
+        <summary className="field-label" style={{ cursor: "pointer", userSelect: "none" }}>
+          Color variation (Primvar)
+          <InspectorHint text="Authors per-instance primvars:displayColor and primvars:scatterRandom on the PointInstancer. Supported in Hydra Storm and Omniverse RTX." />
+        </summary>
+        <div style={{ display: "grid", gap: 6, marginTop: 6 }}>
+          <label className="checkbox-row">
+            <input
+              type="checkbox"
+              checked={colorVariationEnabled}
+              onChange={(e) =>
+                patchScatter({ colorVariationEnabled: e.target.checked })
+              }
+            />
+            Enable per-instance color variation
+          </label>
+          {colorVariationEnabled && (
+            <>
+              <label>
+                Mode
+                <select
+                  value={colorVariationMode}
+                  onChange={(e) =>
+                    patchScatter({
+                      colorVariationMode: e.target.value as "hsv" | "ramp",
+                    })
+                  }
+                >
+                  <option value="hsv">HSV tint jitter</option>
+                  <option value="ramp">Color A → B ramp</option>
+                </select>
+              </label>
+              {colorVariationMode === "hsv" ? (
+                <>
+                  <label>
+                    Base tint
+                    <input
+                      type="color"
+                      value={rgbToHex(colorTintBase)}
+                      onChange={(e) =>
+                        patchScatter({ colorTintBase: hexToRgb(e.target.value) })
+                      }
+                    />
+                  </label>
+                  <label>
+                    Hue ± (°) / Sat ± / Val ±
+                    <div className="vector-inputs">
+                      <NumberInput
+                        value={colorHueJitter}
+                        min={0}
+                        max={180}
+                        step={5}
+                        onChange={(e) => {
+                          const v = Number(e.target.value);
+                          if (Number.isFinite(v))
+                            patchScatter({
+                              colorHueJitter: Math.max(0, Math.min(180, v)),
+                            });
+                        }}
+                      />
+                      <NumberInput
+                        value={colorSatJitter}
+                        min={0}
+                        max={1}
+                        step={0.05}
+                        onChange={(e) => {
+                          const v = Number(e.target.value);
+                          if (Number.isFinite(v))
+                            patchScatter({
+                              colorSatJitter: Math.max(0, Math.min(1, v)),
+                            });
+                        }}
+                      />
+                      <NumberInput
+                        value={colorValJitter}
+                        min={0}
+                        max={1}
+                        step={0.05}
+                        onChange={(e) => {
+                          const v = Number(e.target.value);
+                          if (Number.isFinite(v))
+                            patchScatter({
+                              colorValJitter: Math.max(0, Math.min(1, v)),
+                            });
+                        }}
+                      />
+                    </div>
+                  </label>
+                </>
+              ) : (
+                <label>
+                  Color A / Color B
+                  <div className="vector-inputs">
+                    <input
+                      type="color"
+                      aria-label="Color ramp start"
+                      value={rgbToHex(colorRampA)}
+                      onChange={(e) =>
+                        patchScatter({ colorRampA: hexToRgb(e.target.value) })
+                      }
+                    />
+                    <input
+                      type="color"
+                      aria-label="Color ramp end"
+                      value={rgbToHex(colorRampB)}
+                      onChange={(e) =>
+                        patchScatter({ colorRampB: hexToRgb(e.target.value) })
+                      }
+                    />
+                  </div>
+                </label>
+              )}
+              <label className="checkbox-row">
+                <input
+                  type="checkbox"
+                  checked={colorApplyToMaterials}
+                  onChange={(e) =>
+                    patchScatter({ colorApplyToMaterials: e.target.checked })
+                  }
+                />
+                <span>
+                  Tint prototype materials
+                  <InspectorHint text="Automatically multiplies bound MaterialX base_color (and connects untextured UsdPreviewSurface diffuseColor) with primvars:displayColor inside the scatter prototypes." />
+                </span>
+              </label>
+            </>
+          )}
+        </div>
+      </details>
+
       <label className="checkbox-row">
         <input
           type="checkbox"

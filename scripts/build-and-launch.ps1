@@ -1,5 +1,6 @@
 param(
     [switch]$NoLastProject,
+    [switch]$NoBuild,
     [string]$Project = ''
 )
 
@@ -36,8 +37,10 @@ if (-not $env:ORCHFLOW_OVRTX_PYTHON) {
     }
 }
 
-& (Join-Path $PSScriptRoot 'build.ps1')
-if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
+if (-not $NoBuild) {
+    & (Join-Path $PSScriptRoot 'build.ps1')
+    if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
+}
 
 if (-not (Test-Path $exe)) {
     throw "Built executable not found at $exe"

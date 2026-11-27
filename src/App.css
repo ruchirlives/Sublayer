@@ -524,3 +524,5 @@ input[type="number"]{-moz-appearance:textfield;padding-right:18px !important}
 
 .materialx-proc-driven{background:rgba(127,190,163,0.22)!important;box-shadow:inset 0 0 0 1px #7fbea3;cursor:pointer}
 .materialx-proc-flash{background:rgba(246,173,85,0.28)!important;box-shadow:inset 0 0 0 2px #f6ad55!important}
+
+.card[data-node-type=metahuman]{--node-accent:#83bdf0;--node-fill:#1a2938;--node-border:#486b8c}

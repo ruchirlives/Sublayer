@@ -1,5 +1,5 @@
 import type { StoredProject } from "./fileRegistry.ts";
-export const toolbarOperations = ["source","blender","transform","group","delete","scatter","assetOverride","materialx","material_bind","light","hdri","postfx","hair","cache_edit","character","pose","camera","output","application"];
+export const toolbarOperations = ["source","metahuman","blender","transform","group","delete","scatter","assetOverride","materialx","material_bind","light","hdri","postfx","hair","cache_edit","character","pose","camera","output","application"];
 export type DropTarget = {kind:"edge"|"node";id:string} | null;
 export function insertToolbarNode(project:StoredProject, node:StoredProject["nodes"][number], target:DropTarget, makeId=()=>crypto.randomUUID()):StoredProject {
   if(!toolbarOperations.includes(node.data.operation) || project.nodes.some(n=>n.id===node.id))throw new Error("Invalid or duplicate inserted node");
@@ -59,4 +59,104 @@ export function insertToolbarNode(project:StoredProject, node:StoredProject["nod
     }
   }
   return {...project,edges,nodes:[...project.nodes.map(n=>({...n,selected:false,position:shifted.has(n.id)?{x:n.position.x+amount,y:n.position.y}:verticalShift.has(n.id)?{x:n.position.x,y:n.position.y+verticalShift.get(n.id)!}:n.position})),{...node,position,selected:true}]};
+}
+
+export function detachNodeFromEdges(
+  project: StoredProject,
+  nodeId: string,
+  makeId = () => crypto.randomUUID(),
+): StoredProject {
+  const incoming = project.edges.filter((e) => e.target === nodeId);
+  const outgoing = project.edges.filter((e) => e.source === nodeId);
+  if (!incoming.length && !outgoing.length) return project;
+
+  const remaining = project.edges.filter(
+    (e) => e.source !== nodeId && e.target !== nodeId,
+  );
+  const nextEdges = [...remaining];
+  const hasEdge = (
+    source: string,
+    target: string,
+    sourceHandle?: string | null,
+    targetHandle?: string | null,
+  ) =>
+    nextEdges.some(
+      (e) =>
+        e.source === source &&
+        e.target === target &&
+        (e.sourceHandle ?? null) === (sourceHandle ?? null) &&
+        (e.targetHandle ?? null) === (targetHandle ?? null),
+    );
+
+  for (const inEdge of incoming) {
+    for (const outEdge of outgoing) {
+      if (inEdge.source === outEdge.target) continue;
+      if (
+        !hasEdge(
+          inEdge.source,
+          outEdge.target,
+          inEdge.sourceHandle,
+          outEdge.targetHandle,
+        )
+      ) {
+        nextEdges.push({
+          id: makeId(),
+          source: inEdge.source,
+          target: outEdge.target,
+          sourceHandle: inEdge.sourceHandle ?? null,
+          targetHandle: outEdge.targetHandle ?? null,
+        });
+      }
+    }
+  }
+  return { ...project, edges: nextEdges };
+}
+
+export function insertExistingNodeOnEdge(
+  project: StoredProject,
+  nodeId: string,
+  edgeId: string,
+  makeId = () => crypto.randomUUID(),
+): StoredProject {
+  const targetEdge = project.edges.find((e) => e.id === edgeId);
+  if (!targetEdge || targetEdge.source === nodeId || targetEdge.target === nodeId) {
+    return project;
+  }
+
+  // Detach nodeId cleanly first if it still has any links, preserving a valid DAG.
+  const base = detachNodeFromEdges(project, nodeId, makeId);
+  const edge = base.edges.find((e) => e.id === edgeId) || targetEdge;
+
+  const reaches = (start: string, goal: string, seen = new Set<string>()): boolean => {
+    if (start === goal) return true;
+    if (seen.has(start)) return false;
+    seen.add(start);
+    return base.edges
+      .filter((e) => e.source === start)
+      .some((e) => reaches(e.target, goal, seen));
+  };
+  if (reaches(nodeId, edge.source) || reaches(edge.target, nodeId)) {
+    return project;
+  }
+
+  const nextEdges = base.edges
+    .filter((e) => e.id !== edge.id)
+    .concat([
+      {
+        id: makeId(),
+        source: edge.source,
+        target: nodeId,
+        sourceHandle: edge.sourceHandle ?? null,
+        targetHandle: null,
+      },
+      {
+        id: makeId(),
+        source: nodeId,
+        target: edge.target,
+        sourceHandle: null,
+        targetHandle: edge.targetHandle ?? null,
+      },
+    ]);
+
+  return { ...base, edges: nextEdges };
 }

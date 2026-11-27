@@ -9,7 +9,7 @@ import { TransformGizmo } from "./TransformGizmo";
 
 type Delegate = { id: string; name: string; support: string };
 type OvrtxMode = "realtime" | "pathTracing";
-type CameraAnchor = { session: string; fit: number; center: [number, number, number]; radius: number; unitScale?: number; translation?: [number, number, number]; transformTarget?: string | null };
+type CameraAnchor = { session: string; fit: number; center: [number, number, number]; radius: number; unitScale?: number; translation?: [number, number, number]; transformTarget?: string | null; gizmoOffset?: [number, number, number] | null };
 type PickResult = { prim: string; material?: string | null; point: Frame["pickedPoint"] };
 type Capabilities = {
   version: string;
@@ -66,7 +66,7 @@ type Frame = {
   vramUsedMb?: number | null;
   vramTotalMb?: number | null;
   cachedScenes?: number;
-  updateKind?: "cache-hit" | "material-delta" | "material-delta-fast" | "full-rebuild" | "hair-delta" | "hair-brush" | "groom-commit";
+  updateKind?: "cache-hit" | "material-delta" | "material-delta-fast" | "full-rebuild" | "hair-delta" | "hair-brush" | "groom-commit" | "groom-xform-delta" | "pose-delta" | "cache-delta" | "postfx-delta";
   sceneMs?: number;
   stepMs?: number;
   hairGroomDeltas?: Record<string, HairGroomDelta>;
@@ -288,7 +288,7 @@ export function NativeViewport({
   const lastDispatchedCacheSeq = useRef(0);
   const [hairPopupOpen, setHairPopupOpen] = useState(false);
   const [popupCamera, setPopupCamera] = useState<ViewportCamera>(home);
-  const [popupSize, setPopupSize] = useState<{ width: number; height: number }>({ width: 1180, height: 722 });
+  const [popupSize, setPopupSize] = useState<{ width: number; height: number }>({ width: 1480, height: 780 });
   const popupNavRef = useRef<{ mode: "orbit" | "pan" | "dolly"; x: number; y: number; cam: ViewportCamera } | null>(null);
   const popupBrushRef = useRef<{ nx: number; ny: number } | null>(null);
   const popupLineRef = useRef<{ nx: number; ny: number } | null>(null);
@@ -298,13 +298,16 @@ export function NativeViewport({
   const [livePhysics, setLivePhysics] = useState(false);
   const [nativePopup, setNativePopup] = useState(false);
   const rgbaCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const [brushTool, setBrushTool] = useState<"comb" | "surfaceComb" | "grab" | "smooth" | "physics" | "clump" | "part" | "puff" | "lengthen" | "shorten" | "cut" | "add" | "delete" | "pin" | "unpin">("comb");
+  const [brushTool, setBrushTool] = useState<"comb" | "surfaceComb" | "grab" | "smooth" | "physics" | "clump" | "part" | "puff" | "lengthen" | "shorten" | "cut" | "drawLock" | "add" | "delete" | "pin" | "unpin">("comb");
   const [brushCursor, setBrushCursor] = useState<{ x: number; y: number } | null>(null);
   const [brushRadius, setBrushRadius] = useState(0.06);
   const [brushRadiusText, setBrushRadiusText] = useState("0.06");
   const [brushStrength, setBrushStrength] = useState(1.0);
   const [brushStrengthText, setBrushStrengthText] = useState("1.0");
   const [brushVertexPct, setBrushVertexPct] = useState<100 | 50 | 25>(100);
+  const [drawTipPct, setDrawTipPct] = useState(25);
+  const [drawTipPctText, setDrawTipPctText] = useState("25");
+  const [drawDensity, setDrawDensity] = useState(120);
   const [hairBrush, setHairBrushState] = useState<{
     nx: number;
     ny: number;
@@ -314,10 +317,14 @@ export function NativeViewport({
     screenRadiusFrac?: number;
     strength: number;
     vertexPct?: 100 | 50 | 25;
-    tool?: "comb" | "surfaceComb" | "grab" | "smooth" | "physics" | "clump" | "part" | "puff" | "lengthen" | "shorten" | "cut" | "add" | "delete" | "pin" | "unpin";
+    tool?: "comb" | "surfaceComb" | "grab" | "smooth" | "physics" | "clump" | "part" | "puff" | "lengthen" | "shorten" | "cut" | "drawLock" | "add" | "delete" | "pin" | "unpin";
     cutLine?: [number, number, number, number];
     lengthenDrag?: [number, number, number, number];
+    drawCurve?: [number, number][];
+    drawTipPct?: number;
+    drawDensity?: number;
     undoStroke?: boolean;
+    smoothAll?: boolean;
     clearPins?: boolean;
     newStroke?: boolean;
     strokeId?: number;
@@ -347,6 +354,9 @@ export function NativeViewport({
   const cutLineRef = useRef<typeof cutLine>(null);
   const [lengthenDrag, setLengthenDrag] = useState<typeof cutLine>(null);
   const lengthenDragRef = useRef<typeof cutLine>(null);
+  const [drawCurve, setDrawCurve] = useState<{ x: number; y: number; nx: number; ny: number }[] | null>(null);
+  const drawCurveRef = useRef<{ x: number; y: number; nx: number; ny: number }[] | null>(null);
+  const popupDrawCurveRef = useRef<[number, number][] | null>(null);
   const brushSeqRef = useRef(0);
   const lastDispatchedHairSeq = useRef(0);
   const lastCombCursor = useRef<{ strokeId: number; nx: number; ny: number } | null>(null);
@@ -907,6 +917,17 @@ export function NativeViewport({
     if (!graph || !transformGizmo?.nodeId) return undefined;
     try {
       const spec = JSON.parse(graph);
+      if (transformGizmo.nodeId.startsWith("groom:")) {
+        const [, charNodeId, groomId] = transformGizmo.nodeId.split(":");
+        return spec.nodes?.some(
+          (node: { id: string; operation: string; character?: { headGrooms?: Array<{ id: string; enabled?: boolean }> } }) =>
+            node.id === charNodeId &&
+            node.operation === "character" &&
+            (node.character?.headGrooms || []).some((hg) => hg.id === groomId && hg.enabled !== false),
+        )
+          ? transformGizmo.nodeId
+          : undefined;
+      }
       return spec.nodes?.some((node: { id: string; operation: string }) =>
         node.id === transformGizmo.nodeId && node.operation === "transform",
       ) ? transformGizmo.nodeId : undefined;
@@ -985,6 +1006,8 @@ export function NativeViewport({
     brushTool,
     brushRadius,
     brushStrength,
+    drawTipPct,
+    drawDensity,
     ovrtxMode,
     popupSize,
     livePhysics,
@@ -995,6 +1018,8 @@ export function NativeViewport({
     brushTool,
     brushRadius,
     brushStrength,
+    drawTipPct,
+    drawDensity,
     ovrtxMode,
     popupSize,
     livePhysics,
@@ -1017,6 +1042,8 @@ export function NativeViewport({
       altKey?: boolean;
       key?: string;
       vertexPct?: number;
+      drawTipPct?: number;
+      drawDensity?: number;
     }>("hair-popup-input", (ev) => {
       const e = ev.payload;
       const st = popupStateRef.current;
@@ -1031,19 +1058,23 @@ export function NativeViewport({
       }
       if (e.type === "toolbar") {
         if (e.action === "closed") {
-          if (hairGroomDirtyRef.current) finishHairStroke();
+          if (hairGroomDirtyRef.current) finishHairStroke(previousViewportRequest.current, true);
           setHairPopupOpen(false);
           return;
         }
         const cmd = e.command || "";
         if (cmd.startsWith("tool:")) {
           setBrushTool(cmd.slice(5) as typeof brushTool);
+        } else if (cmd === "set:drawTipPct" && typeof e.drawTipPct === "number") {
+          const clamped = Math.max(0, Math.min(100, Math.round(e.drawTipPct)));
+          setDrawTipPct(clamped);
+          setDrawTipPctText(String(clamped));
+        } else if (cmd === "set:drawDensity" && typeof e.drawDensity === "number") {
+          setDrawDensity(Math.max(16, Math.min(300, Math.round(e.drawDensity))));
         } else if (cmd === "toggle:livePhysics") {
-          setLivePhysics((prev) => {
-            const next = !prev;
-            if (!next && hairGroomDirtyRef.current) finishHairStroke();
-            return next;
-          });
+          const next = !st.livePhysics;
+          setLivePhysics(next);
+          if (!next && hairGroomDirtyRef.current) finishHairStroke();
         } else if (cmd === "toggle:showPins") {
           setShowPins((v) => !v);
         } else if (cmd === "toggle:realtime") {
@@ -1053,6 +1084,13 @@ export function NativeViewport({
             nx: 0.5, ny: 0.5, prevNx: 0.5, prevNy: 0.5,
             radius: st.brushRadius, strength: st.brushStrength,
             tool: st.brushTool, undoStroke: true, seq: ++brushSeqRef.current,
+          });
+        } else if (cmd === "action:smoothAll") {
+          hairGroomDirtyRef.current = true;
+          commitHairBrush({
+            nx: 0.5, ny: 0.5, prevNx: 0.5, prevNy: 0.5,
+            radius: st.brushRadius, strength: st.brushStrength,
+            tool: st.brushTool, smoothAll: true, seq: ++brushSeqRef.current,
           });
         } else if (cmd === "action:radiusDown" || cmd === "action:radiusUp") {
           setBrushRadius((prev) => {
@@ -1082,7 +1120,7 @@ export function NativeViewport({
             return next;
           });
         } else if (e.key === "Escape") {
-          if (hairGroomDirtyRef.current) finishHairStroke();
+          if (hairGroomDirtyRef.current) finishHairStroke(previousViewportRequest.current, true);
           setHairPopupOpen(false);
         }
         return;
@@ -1106,7 +1144,11 @@ export function NativeViewport({
         }
         if (btn === 0) {
           brushStrokeIdRef.current += 1;
-          if (st.brushTool === "cut" || st.brushTool === "lengthen") {
+          if (st.brushTool === "drawLock") {
+            popupDrawCurveRef.current = [[nx, ny]];
+            popupHoverPendingRef.current = true;
+            setPopupHoverSeq((v) => v + 1);
+          } else if (st.brushTool === "cut" || st.brushTool === "lengthen") {
             popupLineRef.current = { nx, ny };
           } else {
             popupBrushRef.current = { nx, ny };
@@ -1146,6 +1188,16 @@ export function NativeViewport({
           }
           return;
         }
+        if (popupDrawCurveRef.current) {
+          const pts = popupDrawCurveRef.current;
+          const last = pts[pts.length - 1];
+          if (pts.length < 256 && Math.hypot(nx - last[0], ny - last[1]) >= 0.004) {
+            pts.push([nx, ny]);
+          }
+          popupHoverPendingRef.current = true;
+          setPopupHoverSeq((v) => v + 1);
+          return;
+        }
         if (popupBrushRef.current) {
           const prev = popupBrushRef.current;
           popupBrushRef.current = { nx, ny };
@@ -1165,6 +1217,27 @@ export function NativeViewport({
       if (e.type === "mouseup") {
         if (popupNavRef.current) {
           popupNavRef.current = null;
+          return;
+        }
+        if (popupDrawCurveRef.current) {
+          const pts = popupDrawCurveRef.current;
+          popupDrawCurveRef.current = null;
+          const last = pts[pts.length - 1];
+          if (Math.hypot(nx - last[0], ny - last[1]) >= 0.002) {
+            pts.push([nx, ny]);
+          }
+          if (pts.length >= 2) {
+            hairGroomDirtyRef.current = true;
+            commitHairBrush({
+              nx, ny, prevNx: pts[0][0], prevNy: pts[0][1],
+              radius: st.brushRadius, strength: st.brushStrength,
+              tool: "drawLock", drawCurve: pts, drawTipPct: st.drawTipPct, drawDensity: st.drawDensity, newStroke: true,
+              strokeId: brushStrokeIdRef.current, seq: ++brushSeqRef.current,
+            });
+          } else {
+            popupHoverPendingRef.current = true;
+            setPopupHoverSeq((v) => v + 1);
+          }
           return;
         }
         if (popupLineRef.current) {
@@ -1283,8 +1356,27 @@ export function NativeViewport({
       nativePopup: renderer === "OmniverseRTX" && (nativePopup || hairPopupOpen),
       closeNativePopup: renderer === "OmniverseRTX" && !nativePopup && !hairPopupOpen,
       popupSkipImage: renderer === "OmniverseRTX" && (nativePopup || hairPopupOpen),
-      popupStatus: hairPopupOpen ? `Rad: ${brushRadius.toFixed(3)} | Str: ${brushStrength.toFixed(2)} | ${brushVertexPct}% | ${brushTool}` : undefined,
-      popupBrushRadiusPx: hairPopupOpen ? Math.max(8, Math.min(240, (brushRadius * popupSize.height * 0.45) / Math.max(0.02, popupCamera.zoom))) : undefined,
+      popupStatus: hairPopupOpen
+        ? `Rad: ${brushRadius.toFixed(3)} | Str: ${brushStrength.toFixed(2)} | Tip: ${drawTipPct}% | Den: ${drawDensity} | ${brushTool}`
+        : undefined,
+      popupBrushRadiusPx: hairPopupOpen
+        ? (() => {
+            const anchorRadius = Math.max(0.05, cameraAnchor.current?.radius ?? 0.5);
+            const unitScale = Math.max(1e-4, cameraAnchor.current?.unitScale ?? 1.0);
+            const aspectMin = Math.min(popupSize.width / Math.max(1, popupSize.height), 1);
+            const baseFovRad = Math.atan(Math.tan((22.5 * Math.PI) / 180) * aspectMin);
+            const camDist = (anchorRadius / Math.sin(baseFovRad)) * 1.15 * Math.max(0.002, popupCamera.zoom);
+            const tanHalfFov = Math.tan((22.5 * Math.PI) / 180);
+            return Math.max(
+              6,
+              Math.min(
+                popupSize.height * 0.45,
+                ((brushRadius * unitScale) / Math.max(1e-4, camDist * tanHalfFov)) * (popupSize.height * 0.5),
+              ),
+            );
+          })()
+        : undefined,
+      popupDrawCurve: hairPopupOpen && popupDrawCurveRef.current && popupDrawCurveRef.current.length >= 2 ? [...popupDrawCurveRef.current] : undefined,
       hairBrush: hairBrush
         ? { ...hairBrush, vertexPct: brushVertexPct, nodeId: activeHairNodeId || undefined }
         : undefined,
@@ -1329,6 +1421,8 @@ export function NativeViewport({
       brushRadius,
       brushStrength,
       brushVertexPct,
+      drawTipPct,
+      drawDensity,
       livePhysics,
       nativePopup,
       showPins,
@@ -1373,6 +1467,7 @@ export function NativeViewport({
   function commitHairBrush(
     brush: NonNullable<typeof hairBrush>,
     source = previousViewportRequest.current,
+    closingPopup = false,
   ) {
     const nodeId = source?.request.activeHairNodeId;
     if (!source || !nodeId || !queue.current) return;
@@ -1384,13 +1479,19 @@ export function NativeViewport({
         ...original, hairBrush: { ...unsentSample, nodeId },
       });
     }
-    const finalBrush = brush.settleOnly && unsentSample ? { ...unsentSample, seq: brush.seq } : brush;
+    const finalBrush = brush.settleOnly && unsentSample && !unsentSample.livePhysics
+      ? { ...unsentSample, seq: brush.seq }
+      : brush;
+    const keepPopup = !closingPopup && renderer === "OmniverseRTX" && (nativePopup || hairPopupOpen);
     queue.current.enqueueRequired(
       source.context,
       {
         ...original,
-        nativePopup: renderer === "OmniverseRTX" && (nativePopup || hairPopupOpen),
-        closeNativePopup: false,
+        popupHoverOnly: false,
+        popupDrawCurve: undefined,
+        nativePopup: keepPopup,
+        closeNativePopup: closingPopup && renderer === "OmniverseRTX",
+        popupSkipImage: keepPopup,
         hairBrush: { ...finalBrush, nodeId, commitUsd: true },
       },
     );
@@ -1417,7 +1518,7 @@ export function NativeViewport({
     setInteracting(false);
   }
 
-  function finishHairStroke(source = previousViewportRequest.current) {
+  function finishHairStroke(source = previousViewportRequest.current, closingPopup = false) {
     commitHairBrush({
       nx: 0.5,
       ny: 0.5,
@@ -1428,7 +1529,7 @@ export function NativeViewport({
       tool: brushTool,
       settleOnly: true,
       seq: ++brushSeqRef.current,
-    }, source);
+    }, source, closingPopup);
   }
 
   latestContextKeyRef.current = currentContextKey;
@@ -1462,8 +1563,11 @@ export function NativeViewport({
       brushDragRef.current = null;
       cutLineRef.current = null;
       lengthenDragRef.current = null;
+      drawCurveRef.current = null;
+      popupDrawCurveRef.current = null;
       setCutLine(null);
       setLengthenDrag(null);
+      setDrawCurve(null);
       setBrushingActive(false);
       setHairBrush(null);
     }
@@ -1691,6 +1795,16 @@ export function NativeViewport({
       if (rect && rect.width > 0 && rect.height > 0) {
         const nx = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
         const ny = Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height));
+        if (brushTool === "drawLock") {
+          const x = event.clientX - rect.left;
+          const y = event.clientY - rect.top;
+          const nextCurve = [{ x, y, nx, ny }];
+          drawCurveRef.current = nextCurve;
+          setDrawCurve(nextCurve);
+          setInteracting(true);
+          event.currentTarget.setPointerCapture(event.pointerId);
+          return;
+        }
         if (brushTool === "cut") {
           const x = event.clientX - rect.left;
           const y = event.clientY - rect.top;
@@ -1753,6 +1867,9 @@ export function NativeViewport({
     setCutLine(null);
     lengthenDragRef.current = null;
     setLengthenDrag(null);
+    drawCurveRef.current = null;
+    setDrawCurve(null);
+    popupDrawCurveRef.current = null;
     setBrushingActive(false);
     if (hairGroomDirtyRef.current) finishHairStroke();
     setHairBrush(null);
@@ -1762,6 +1879,42 @@ export function NativeViewport({
     const cs = clickStart.current;
     clickStart.current = null;
     const dist = cs ? Math.hypot(event.clientX - cs.x, event.clientY - cs.y) : Infinity;
+    if (drawCurveRef.current) {
+      const pts = drawCurveRef.current;
+      drawCurveRef.current = null;
+      setDrawCurve(null);
+      setInteracting(false);
+      const rect = host.current?.getBoundingClientRect();
+      if (rect && rect.width > 0 && rect.height > 0 && pts.length > 0) {
+        const x = event.clientX - rect.left;
+        const y = event.clientY - rect.top;
+        const nx = Math.max(0, Math.min(1, x / rect.width));
+        const ny = Math.max(0, Math.min(1, y / rect.height));
+        const last = pts[pts.length - 1];
+        if (Math.hypot(x - last.x, y - last.y) > 2) {
+          pts.push({ x, y, nx, ny });
+        }
+      }
+      if (pts.length >= 2) {
+        const first = pts[0];
+        const last = pts[pts.length - 1];
+        commitHairBrush({
+          nx: last.nx,
+          ny: last.ny,
+          prevNx: first.nx,
+          prevNy: first.ny,
+          radius: brushRadius,
+          strength: brushStrength,
+          tool: "drawLock",
+          drawCurve: pts.map((p) => [p.nx, p.ny]),
+          drawTipPct,
+          drawDensity,
+          newStroke: true,
+          seq: ++brushSeqRef.current,
+        });
+      }
+      return;
+    }
     if (cutLineRef.current) {
       const line = cutLineRef.current;
       cutLineRef.current = null;
@@ -1894,6 +2047,22 @@ export function NativeViewport({
         strokeId: prev.strokeId,
         seq: ++cacheSeqRef.current,
       });
+      return;
+    }
+    if (drawCurveRef.current) {
+      const curPts = drawCurveRef.current;
+      const rect = host.current?.getBoundingClientRect();
+      if (!rect || rect.width <= 0 || rect.height <= 0) return;
+      const x = event.clientX - rect.left;
+      const y = event.clientY - rect.top;
+      const nx = Math.max(0, Math.min(1, x / rect.width));
+      const ny = Math.max(0, Math.min(1, y / rect.height));
+      const last = curPts[curPts.length - 1];
+      if (curPts.length < 256 && Math.hypot(x - last.x, y - last.y) >= 3) {
+        const nextPts = [...curPts, { x, y, nx, ny }];
+        drawCurveRef.current = nextPts;
+        setDrawCurve(nextPts);
+      }
       return;
     }
     if (cutLineRef.current) {
@@ -2081,6 +2250,29 @@ export function NativeViewport({
             <circle cx={lengthenDrag.x2} cy={lengthenDrag.y2} r={4} fill="rgba(56, 189, 248, 0.95)" />
           </svg>
         )}
+        {combMode && hasSimulatedHair && drawCurve && drawCurve.length >= 2 && (
+          <svg
+            style={{
+              position: "absolute",
+              inset: 0,
+              width: "100%",
+              height: "100%",
+              pointerEvents: "none",
+              zIndex: 6,
+            }}
+          >
+            <polyline
+              points={drawCurve.map((p) => `${p.x},${p.y}`).join(" ")}
+              fill="none"
+              stroke="rgba(52, 211, 153, 0.95)"
+              strokeWidth={2.5}
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+            <circle cx={drawCurve[0].x} cy={drawCurve[0].y} r={4.5} fill="rgba(52, 211, 153, 0.95)" />
+            <circle cx={drawCurve[drawCurve.length - 1].x} cy={drawCurve[drawCurve.length - 1].y} r={3.5} fill="rgba(167, 243, 208, 0.95)" />
+          </svg>
+        )}
         {combMode && hasSimulatedHair && cutLine && (
           <svg
             style={{
@@ -2206,7 +2398,7 @@ export function NativeViewport({
                     ? "rgba(16, 185, 129, 0.92)"
                     : brushTool === "delete"
                     ? "rgba(239, 68, 68, 0.92)"
-                    : brushTool === "add"
+                    : brushTool === "add" || brushTool === "drawLock"
                     ? "rgba(34, 197, 94, 0.92)"
                     : brushTool === "lengthen" || brushTool === "shorten"
                     ? "rgba(56, 189, 248, 0.92)"
@@ -2229,6 +2421,7 @@ export function NativeViewport({
             height={size.height}
             radius={frame.cameraAnchor?.radius ?? cameraAnchor.current?.radius ?? 1}
             anchorTranslation={frame.cameraAnchor?.translation ?? cameraAnchor.current?.translation}
+            originOffset={frame.cameraAnchor?.gizmoOffset ?? undefined}
             interactive={sceneMode}
             onChange={transformGizmo.onChange}
             onCommit={transformGizmo.onCommit}
@@ -2606,39 +2799,41 @@ export function NativeViewport({
                 title="Open the dedicated Native Hair Grooming & Live Physics pop-up window"
                 onClick={() => {
                   if (renderer === "OmniverseRTX") {
-                    setHairPopupOpen((prev) => {
-                      const next = !prev;
-                      if (next) {
-                        setPopupCamera({ ...camera });
-                      } else if (hairGroomDirtyRef.current) {
-                        finishHairStroke();
-                      }
-                      return next;
-                    });
+                    const next = !hairPopupOpen;
+                    if (next) {
+                      setPopupCamera({ ...camera });
+                    } else if (hairGroomDirtyRef.current) {
+                      finishHairStroke(previousViewportRequest.current, true);
+                    }
+                    setHairPopupOpen(next);
                     return;
                   }
-                  setCombMode((prev) => {
-                    const next = !prev;
-                    if (!next && hairGroomDirtyRef.current) {
-                      finishHairStroke();
-                    }
-                    return next;
-                  });
+                  const next = !combMode;
+                  if (!next && hairGroomDirtyRef.current) {
+                    finishHairStroke();
+                  }
+                  setCombMode(next);
                 }}
               >
                 {combMode || hairPopupOpen ? "Comb (Active)" : "Comb Hair"}
               </button>
               {combMode && (
                 <>
-                  {(["comb", "surfaceComb", "grab", "smooth", "physics", "clump", "part", "puff", "lengthen", "shorten", "cut", "add", "delete", "pin", "unpin"] as const).map((t) => (
+                  {(["comb", "surfaceComb", "grab", "smooth", "physics", "clump", "part", "puff", "lengthen", "shorten", "cut", "drawLock", "add", "delete", "pin", "unpin"] as const).map((t) => (
                     <button
                       key={t}
                       type="button"
                       className={brushTool === t ? "chosen" : ""}
                       onClick={() => setBrushTool(t)}
-                      title={t === "surfaceComb" ? "Surface Comb (arc along scalp surface)" : `Hair ${t} brush`}
+                      title={
+                        t === "surfaceComb"
+                          ? "Surface Comb (arc along scalp surface)"
+                          : t === "drawLock"
+                          ? "Draw Hair Lock (drag over a 3D object to create a lock along the curve)"
+                          : `Hair ${t} brush`
+                      }
                     >
-                      {t === "surfaceComb" ? "Surface" : t[0].toUpperCase() + t.slice(1)}
+                      {t === "surfaceComb" ? "Surface" : t === "drawLock" ? "Draw" : t[0].toUpperCase() + t.slice(1)}
                     </button>
                   ))}
                   <label title="Brush radius (m)">
@@ -2705,6 +2900,63 @@ export function NativeViewport({
                       <option value={25}>25%</option>
                     </select>
                   </label>
+                  <label title="Draw Lock tip width (% of cursor radius)">
+                    Tip%
+                    <input
+                      type="text"
+                      inputMode="numeric"
+                      value={drawTipPctText}
+                      onChange={(e) => {
+                        const raw = e.target.value;
+                        setDrawTipPctText(raw);
+                        const v = Number(raw);
+                        if (raw.trim() !== "" && Number.isFinite(v) && v >= 0 && v <= 100) {
+                          setDrawTipPct(Math.round(v));
+                        }
+                      }}
+                      onBlur={() => {
+                        const v = Number(drawTipPctText);
+                        const clamped = Number.isFinite(v) ? Math.max(0, Math.min(100, Math.round(v))) : drawTipPct;
+                        setDrawTipPct(clamped);
+                        setDrawTipPctText(String(clamped));
+                      }}
+                      style={{ width: "38px" }}
+                    />
+                  </label>
+                  <label title="Draw Lock hair density (strands per lock)" style={{ display: "inline-flex", alignItems: "center", gap: "4px" }}>
+                    Den
+                    <input
+                      type="range"
+                      min={16}
+                      max={300}
+                      step={4}
+                      value={drawDensity}
+                      onChange={(e) => setDrawDensity(Math.max(16, Math.min(300, Number(e.target.value) || 120)))}
+                      style={{ width: "72px" }}
+                    />
+                    <span style={{ minWidth: "24px", fontSize: "11px" }}>{drawDensity}</span>
+                  </label>
+                  <button
+                    type="button"
+                    title="Smooth all unfrozen (unpinned) hair strands"
+                    onClick={() => {
+                      setBrushingActive(false);
+                      hairGroomDirtyRef.current = true;
+                      commitHairBrush({
+                        nx: 0.5,
+                        ny: 0.5,
+                        prevNx: 0.5,
+                        prevNy: 0.5,
+                        radius: brushRadius,
+                        strength: brushStrength,
+                        tool: brushTool,
+                        smoothAll: true,
+                        seq: ++brushSeqRef.current,
+                      });
+                    }}
+                  >
+                    Smooth All
+                  </button>
                   <button
                     type="button"
                     title="Undo last hair brush stroke"
@@ -2729,13 +2981,11 @@ export function NativeViewport({
                     type="button"
                     className={livePhysics ? "chosen" : ""}
                     onClick={() => {
-                      setLivePhysics((prev) => {
-                        const next = !prev;
-                        if (!next && hairGroomDirtyRef.current) {
-                          finishHairStroke();
-                        }
-                        return next;
-                      });
+                      const next = !livePhysics;
+                      setLivePhysics(next);
+                      if (!next && hairGroomDirtyRef.current) {
+                        finishHairStroke();
+                      }
                     }}
                     title="Continuously run ADMM hair physics in the viewport"
                   >

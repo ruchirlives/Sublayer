@@ -554,8 +554,8 @@ def build_guide_kernels(wp):
     )
 
 
-def bound_full_brush(wp, device, session, previous):
-    collider = session.get("wp_collider")
+def bound_full_brush(wp, device, session, previous, collider_override=None):
+    collider = collider_override if collider_override is not None else session.get("wp_collider")
     wp.launch(
         build_guide_kernels(wp)[6], session["num_strands"],
         inputs=[
@@ -763,6 +763,7 @@ def create_guide_buffers(wp, device, rest_points, counts, contact_diameter, fric
 def step_guide_brush(
     wp, device, session, apply_brush, new_stroke, timing_events=None,
     dynamic_guides=False, self_collision=True, zero_gravity=False, vertex_stride=1,
+    bend_scale=1.0, collider_override=None,
 ):
     """Solve compact guides and reconstruct full-resolution strand points."""
     counts = session["counts_np"]
@@ -890,8 +891,11 @@ def step_guide_brush(
         dynamic_guides=dynamic_guides,
         self_collision=self_collision,
         zero_gravity=zero_gravity,
+        bend_scale=bend_scale,
+        collider_override=collider_override,
     )
-    collider = session.get("wp_collider")
+    collider = collider_override if collider_override is not None else session.get("wp_collider")
+    coll_id_val = collider.id if collider is not None else 0
 
     def _run_post_solve():
         wp.launch(
@@ -899,7 +903,7 @@ def step_guide_brush(
             inputs=[
                 cache["previous_guides"], cache["anim_rest_wp"], guide_points,
                 cache["guide_starts"], cache["guide_counts"], cache["inv_mass_wp"], cache["cum_len_wp"],
-                cache["active_guides"], 1, 0, 0, 0.0,
+                cache["active_guides"], 1, coll_id_val, int(collider is not None), 1e-5 * session["unit_scale"],
             ],
             device=device,
         )
@@ -952,9 +956,10 @@ def step_guide_brush(
             )
 
     if points.device.is_cuda and events is None:
-        if cache.get("last_vertex_stride") != int(vertex_stride):
+        if cache.get("last_vertex_stride") != int(vertex_stride) or cache.get("last_collider_id") != coll_id_val:
             cache["post_solve_cuda_graph"] = None
             cache["last_vertex_stride"] = int(vertex_stride)
+            cache["last_collider_id"] = coll_id_val
         post_graph = cache.get("post_solve_cuda_graph")
         if post_graph is None:
             with wp.ScopedDevice(device):
@@ -1050,10 +1055,14 @@ def init_sim_guide_cache(
     return cache
 
 
-def step_sim_guides(wp, device, cache, step_fn, strand_ids_wp, vert_starts_wp, full_pos_wp, dynamic_guides=True):
+def step_sim_guides(wp, device, cache, step_fn, strand_ids_wp, vert_starts_wp, full_pos_wp, dynamic_guides=True, collider_override=None):
     """Advance one frame with ADMM DER + contacts on guides and reconstruct all strands."""
     gather_points, _, _, transport_frames, _, deform_followers, _, _ = cache["kernels"]
     guide_points = cache["pos_wp"]
+    coll_id_val = collider_override.id if collider_override is not None else 0
+    if cache.get("last_sim_collider_id") != coll_id_val:
+        cache["sim_cuda_graph"] = None
+        cache["last_sim_collider_id"] = coll_id_val
     if cache.pop("sync_from_full", False):
         wp.launch(gather_points, cache["total_verts"], inputs=[full_pos_wp, cache["indices"], guide_points], device=device)
         wp.copy(cache["prev_pos_wp"], guide_points)
@@ -1074,7 +1083,7 @@ def step_sim_guides(wp, device, cache, step_fn, strand_ids_wp, vert_starts_wp, f
         cache["sim_cuda_graph"] = None
 
     def _run_step():
-        step_fn(None, use_volume=False, solve_state=cache, dynamic_guides=dynamic_guides, self_collision=False)
+        step_fn(None, use_volume=False, solve_state=cache, dynamic_guides=dynamic_guides, self_collision=False, collider_override=collider_override)
         wp.launch(
             transport_frames, cache["active_guide_count"],
             inputs=[

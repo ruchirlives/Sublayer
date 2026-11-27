@@ -132,6 +132,53 @@ class PoseTests(unittest.TestCase):
         head_query = cache.GetSkelQuery(UsdSkel.Skeleton(stage.GetPrimAtPath('/Scene/Rig/Head')))
         self.assertAlmostEqual(head_query.ComputeJointLocalTransforms(0)[0][3][0], 0)
 
+    def test_pose_accepts_multiple_inputs(self):
+        import shutil
+        from usd_graph import inspect_stage_skeletons
+        second_rig = pathlib.Path(self.tmp.name) / 'rig2.usda'
+        shutil.copyfile(str(self.path), str(second_rig))
+        multi_graph = {
+            'targetNodeId': 'pose',
+            'dependencies': [
+                {'id': 'rig1', 'path': str(self.path)},
+                {'id': 'rig2', 'path': str(second_rig)},
+                {'id': 'clip', 'path': str(self.external)},
+            ],
+            'nodes': [
+                {'id': 'src1', 'operation': 'source', 'inputDependencyId': 'rig1'},
+                {'id': 'src2', 'operation': 'source', 'inputDependencyId': 'rig2'},
+                {'id': 'pose', 'operation': 'pose', 'pose': {'entries': [], 'mappings': []}},
+            ],
+            'edges': [
+                {'id': 'e1', 'source': 'src1', 'target': 'pose'},
+                {'id': 'e2', 'source': 'src2', 'target': 'pose'},
+            ],
+        }
+        scanned = inspect_stage_skeletons({'graph': multi_graph, 'frame': 0})
+        skel_paths = [s['path'] for s in scanned['skeletons']]
+        self.assertEqual(len(skel_paths), 2)
+        self.assertTrue(all(p.startswith('/Scene/Branch_') for p in skel_paths))
+
+        multi_graph['nodes'][2]['pose'] = {
+            'entries': [
+                {'id': 'a', 'name': 'Frame1', 'dependencyId': 'clip', 'animationPath': '/Rig/Animation', 'mode': 'pose', 'poseTime': 1},
+                {'id': 'b', 'name': 'Frame0', 'dependencyId': 'clip', 'animationPath': '/Rig/Animation', 'mode': 'pose', 'poseTime': 0},
+            ],
+            'mappings': [
+                {'id': 'm1', 'skeletonPath': skel_paths[0], 'entryId': 'a'},
+                {'id': 'm2', 'skeletonPath': skel_paths[1], 'entryId': 'b'},
+            ],
+        }
+        stage, alive, _ = compile_graph(multi_graph)
+        cache = UsdSkel.Cache()
+        for prim in stage.Traverse():
+            if prim.IsA(UsdSkel.Root):
+                cache.Populate(UsdSkel.Root(prim), Usd.PrimDefaultPredicate)
+        q0 = cache.GetSkelQuery(UsdSkel.Skeleton(stage.GetPrimAtPath(skel_paths[0])))
+        q1 = cache.GetSkelQuery(UsdSkel.Skeleton(stage.GetPrimAtPath(skel_paths[1])))
+        self.assertAlmostEqual(q0.ComputeJointLocalTransforms(0)[0][3][0], 1)
+        self.assertAlmostEqual(q1.ComputeJointLocalTransforms(0)[0][3][0], 0)
+
 
 if __name__ == '__main__':
     unittest.main()

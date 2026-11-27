@@ -276,9 +276,15 @@ pub fn prepare_with_catalog(
     if node.data.operation != "application" {
         return Err("Open in App requires an Application node".into());
     }
-    if node.data.app != "Blender" {
-        return Err("Reopening is currently supported for Blender only; this application's launch adapter is not implemented".into());
-    }
+    let allowed_extensions: &[&str] = match node.data.app.as_str() {
+        "Blender" => &["blend"],
+        "Marvelous Designer" => &["zprj", "zpac"],
+        "Substance Painter" => &["spp"],
+        "ZBrush" => &["zpr", "ztl"],
+        _ => {
+            return Err("Reopening is currently supported for Blender, Marvelous Designer, Substance Painter, and ZBrush; this application's launch adapter is not implemented".into());
+        }
+    };
     let resolve = |id: &Option<String>, role: &str| -> Result<PathBuf, String> {
         let dependency = project
             .dependencies
@@ -294,15 +300,28 @@ pub fn prepare_with_catalog(
         .is_some_and(|s| s.eq_ignore_ascii_case("exe"))
     {
         return Err(
-            "Choose Blender's .exe executable; shell scripts and shortcuts are not supported"
+            "Choose the application's .exe executable; shell scripts and shortcuts are not supported"
                 .into(),
         );
     }
     if !native_project
         .extension()
-        .is_some_and(|s| s.eq_ignore_ascii_case("blend"))
+        .and_then(|s| s.to_str())
+        .is_some_and(|ext| {
+            allowed_extensions
+                .iter()
+                .any(|allowed| ext.eq_ignore_ascii_case(allowed))
+        })
     {
-        return Err("Blender reopening requires an existing .blend native project".into());
+        return Err(format!(
+            "{} reopening requires an existing {} native project",
+            node.data.app,
+            allowed_extensions
+                .iter()
+                .map(|e| format!(".{e}"))
+                .collect::<Vec<_>>()
+                .join("/")
+        ));
     }
     Ok(LaunchSpec {
         executable,
@@ -387,9 +406,26 @@ pub fn evaluation_graph(
                     }
                 }
             }
+            for hg in &ch.head_grooms {
+                if hg.source_mode == "file" {
+                    if let Some(did) = &hg.dependency_id {
+                        if !did.is_empty() {
+                            used.insert(did);
+                        }
+                    }
+                }
+            }
         }
         if !(n.id==node_id && application_input) {if let Some(live)=&n.data.live_adjustment {used.insert(&live.edited_dependency_id);used.insert(&live.baseline_dependency_id);used.insert(&live.handoff_dependency_id);}}
+        if let Some(id) = &n.data.metahuman_body_dependency_id { used.insert(id); }
         let mut value=serde_json::json!({"id":n.id,"operation":operation,"inputDependencyId":n.data.input_dependency_id,"publishedDependencyId":published,"nativeProjectDependencyId":if n.id == node_id && application_input { None } else { n.data.native_project_dependency_id.as_ref() },"instanced":n.data.instanced.unwrap_or(false),"axis":n.data.axis,"frontAxis":n.data.front_axis,"scale":n.data.scale,"transform":n.data.transform,"assetOverrides":n.data.asset_overrides,"publication":if n.id == node_id && application_input {None} else {n.data.publication.as_ref().map(|p|serde_json::json!({"sourceRevisions":p.source_revisions}))}});
+        if n.data.operation == "metahuman" {
+            value["metahumanLod"] = serde_json::json!(n.data.metahuman_lod);
+            value["metahumanMaterials"] = serde_json::json!(n.data.metahuman_materials);
+            if let Some(body_id) = &n.data.metahuman_body_dependency_id {
+                value["metahumanBodyDependencyId"] = serde_json::json!(body_id);
+            }
+        }
         if n.data.operation=="blender"{if let Some(scene)=&n.data.blender_scene{value["blenderScene"]=serde_json::to_value(scene).unwrap();}if let Some(sel)=&n.data.blender_selections{value["blenderSelections"]=serde_json::to_value(sel).unwrap();}if let Some(mode)=&n.data.blender_material_mode{value["blenderMaterialMode"]=serde_json::to_value(mode).unwrap();}if let Some(cp)=n.data.blender_convert_procedurals{value["blenderConvertProcedurals"]=serde_json::to_value(cp).unwrap();}if let Some(es)=n.data.blender_export_skeletons{value["blenderExportSkeletons"]=serde_json::to_value(es).unwrap();}if let Some(secs)=n.data.last_extraction_seconds{value["lastExtractionSeconds"]=serde_json::to_value(secs).unwrap();}}
 if n.data.operation=="camera"{if let Some(cam)=&n.data.camera{value["camera"]=serde_json::to_value(cam).unwrap();}if let Some(views)=&n.data.camera_views{value["cameraViews"]=serde_json::to_value(views).unwrap();}}
         if !(n.id==node_id && application_input) {if let Some(live)=&n.data.live_adjustment {value["liveAdjustment"]=serde_json::to_value(live).unwrap();value["publishedDependencyId"]=serde_json::Value::Null;value["publication"]=serde_json::Value::Null;}}
@@ -397,7 +433,7 @@ if n.data.operation=="camera"{if let Some(cam)=&n.data.camera{value["camera"]=se
         if n.data.operation=="group"{if let Some(gn)=&n.data.group_name {value["groupName"]=serde_json::to_value(gn).unwrap();}}
         if n.data.operation=="materialx"{value["materialX"]=serde_json::to_value(&n.data.material_x).unwrap();if let Some(rules)=&n.data.material_x_rules {value["materialXRules"]=serde_json::to_value(rules).unwrap();}}
         if n.data.operation=="material_bind"{if let Some(bindings)=&n.data.material_bindings {value["materialBindings"]=serde_json::to_value(bindings).unwrap();}}
-        if n.data.operation=="light"{if let Some(overrides)=&n.data.light_overrides {value["lightOverrides"]=serde_json::to_value(overrides).unwrap();}}
+        if n.data.operation=="light"{if let Some(overrides)=&n.data.light_overrides {value["lightOverrides"]=serde_json::to_value(overrides).unwrap();}if let Some(ls)=n.data.light_intensity_scale {value["lightIntensityScale"]=serde_json::to_value(ls).unwrap();}}
         if n.data.operation=="hdri"{if let Some(hdri)=&n.data.hdri {value["hdri"]=serde_json::to_value(hdri).unwrap();}}
         if n.data.operation=="postfx"{if let Some(post_fx)=&n.data.post_fx {value["postFx"]=serde_json::to_value(post_fx).unwrap();}}
         if n.data.operation=="hair"{if let Some(hair)=&n.data.hair {value["hair"]=serde_json::to_value(hair).unwrap();}}
@@ -1054,7 +1090,7 @@ mod tests {
             prepare(&project, "app")
                 .err()
                 .unwrap()
-                .contains("Blender only")
+                .contains("launch adapter is not implemented")
         );
         project.nodes[0].data.app = "Blender".into();
         std::fs::remove_file(&native).unwrap();
@@ -1065,6 +1101,50 @@ mod tests {
         );
         std::fs::remove_file(executable).unwrap();
         std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn validate_reopen_marvelous_designer_without_launching() {
+        let dir = std::env::temp_dir().join(format!(
+            "orchflow-md-launch-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let executable = dir.join("MarvelousDesigner.exe");
+        let native = dir.join("garment.zprj");
+        std::fs::write(&executable, b"fixture, never launched").unwrap();
+        std::fs::write(&native, b"zprj fixture").unwrap();
+        let value = serde_json::json!({
+            "version": 2,
+            "nodes": [{
+                "id": "md",
+                "type": "stage",
+                "position": {"x": 0, "y": 0},
+                "data": {
+                    "label": "Marvelous Designer",
+                    "operation": "application",
+                    "app": "Marvelous Designer",
+                    "applicationProfileId": "marvelous-designer",
+                    "axis": "Y",
+                    "scale": 1,
+                    "nativeProjectDependencyId": "native",
+                    "appExecutableDependencyId": "exe"
+                }
+            }],
+            "edges": [],
+            "dependencies": [
+                {"id": "exe", "kind": "executable", "path": executable},
+                {"id": "native", "kind": "nativeProject", "path": native}
+            ]
+        });
+        let project = Project::from_value(value).unwrap();
+        let spec = prepare(&project, "md").unwrap();
+        assert_eq!(spec.executable, executable);
+        assert_eq!(spec.native_project, native);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
 

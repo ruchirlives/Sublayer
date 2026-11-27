@@ -17,7 +17,7 @@ import time
 import functools
 import usd_graph
 if 'compile_graph' not in globals():
-    from usd_graph import compile_graph, coordinate_preflight, export_handoff, materialx_document, materialx_rule_matches, asset_override_inputs, reuse_handoff, inspect_stage_materials, inspect_stage_lights, inspect_stage_curves, inspect_stage_skeletons, export_character_body, convert_source_to_usd, clear_graph_caches, query_scene_children, compute_material_users, resolve_prim_material, _open_source_stage, _build_transform_matrix
+    from usd_graph import compile_graph, coordinate_preflight, export_handoff, materialx_document, materialx_rule_matches, asset_override_inputs, reuse_handoff, inspect_stage_materials, inspect_stage_lights, inspect_stage_curves, inspect_stage_skeletons, export_character_body, export_md_bridge_handoff, convert_source_to_usd, clear_graph_caches, query_scene_children, compute_material_users, resolve_prim_material, _open_source_stage, _build_transform_matrix
 from usd_graph import editable_hair_node_id, graph_after_groom_commit, groom_frame_view, open_hair_preview_stage
 
 if 'review_publication' not in globals():
@@ -529,11 +529,14 @@ class Viewport:
             self.pending_groom_frame = None
         transform_only_node = None
         pose_only = None
+        groom_only = None
         if stage_changed and not groom_committed and not needs_hair_session and graph and self.stage is not None and self.current_graph is not None and not request.get('reload') and self.renderer == renderer:
             transform_only_node = _transform_only_node(self.current_graph, graph, self.live_transforms)
             if transform_only_node is None:
-                from usd_graph import pose_only_node as _pose_only_node
+                from usd_graph import pose_only_node as _pose_only_node, groom_xform_only_changes as _groom_xform_only
                 pose_only = _pose_only_node(self.current_graph, graph, getattr(self, 'live_poses', {}))
+                if pose_only is None:
+                    groom_only = _groom_xform_only(self.current_graph, graph, getattr(self, 'live_grooms', {}))
         if groom_committed:
             self.path = path
             self.current_graph = graph
@@ -563,6 +566,15 @@ class Viewport:
                 self.auto_preview = None
             self.path = path
             self.current_graph = graph
+        elif groom_only is not None:
+            from usd_graph import apply_live_groom_xforms as _apply_live_groom_xforms
+            self.stage_cache.pop(self.path, None)
+            _apply_live_groom_xforms(groom_only, self.live_grooms)
+            if self.auto_preview is not None and self.auto_preview[0] != self.stage:
+                self.auto_preview = None
+            self.path = path
+            self.current_graph = copy.deepcopy(graph)
+            self.outline_key = json.dumps(graph, sort_keys=True)
         elif stage_changed:
             # New engine prevents stale prims from a previously selected stage.
             if self.path is not None:
@@ -572,10 +584,11 @@ class Viewport:
                     raise RuntimeError('Unable to reinitialize selected delegate')
             cached = None if request.get('reload') or editable_hair_id is not None else self.stage_cache.get(path)
             if cached is not None:
-                stage, self.graph_stages, self.graph_stats, self.outline_key, self.has_scene_lights, self.live_transforms, self.live_poses = cached
+                stage, self.graph_stages, self.graph_stats, self.outline_key, self.has_scene_lights, self.live_transforms, self.live_poses, self.live_grooms = cached
             else:
                 self.live_transforms = {}
                 self.live_poses = {}
+                self.live_grooms = {}
                 private_hair_preview = False
                 if graph:
                     import usd_graph as _ug
@@ -584,7 +597,7 @@ class Viewport:
                     try:
                         stage, self.graph_stages, self.graph_stats = compile_graph(
                             graph, request.get('reload', False), live_transforms=self.live_transforms,
-                            live_poses=self.live_poses,
+                            live_poses=self.live_poses, live_grooms=self.live_grooms,
                             interactive_hair=editable_hair_id is not None,
                         )
                     finally:
@@ -607,7 +620,7 @@ class Viewport:
                 if editable_hair_id is None:
                     if len(self.stage_cache) >= 4:
                         self.stage_cache.pop(next(iter(self.stage_cache)))
-                    self.stage_cache[path] = (stage, self.graph_stages, self.graph_stats, self.outline_key, None, self.live_transforms, self.live_poses)
+                    self.stage_cache[path] = (stage, self.graph_stages, self.graph_stats, self.outline_key, None, self.live_transforms, self.live_poses, self.live_grooms)
             self.stage, self.path = stage, path
             self.prepared_hair_node_id = editable_hair_id
             self.current_graph = copy.deepcopy(graph) if graph else None
@@ -655,6 +668,8 @@ class Viewport:
                             rot_attr.Set(rot_arr)
                             rot_attr.Set(rot_arr, Usd.TimeCode(frame))
                             rot_attr.Set(rot_arr, Usd.TimeCode(frame + 1e-4))
+                            import pose_node as _pn
+                            _pn.apply_body_riglogic_to_anim(output, stage.GetPrimAtPath(lp_skel), frame)
                             self._pose_time_bump = 1e-4 if not getattr(self, '_pose_time_bump', 0.0) else 0.0
                             self.stage_cache.pop(self.path, None)
                             skel_prim = stage.GetPrimAtPath(lp_skel)
@@ -1176,8 +1191,8 @@ class Viewport:
                     for p in iter_scene_and_prototype_prims(stage)
                 )
                 if self.path in self.stage_cache:
-                    s, gs, gst, ok, _, live, live_poses = self.stage_cache[self.path]
-                    self.stage_cache[self.path] = (s, gs, gst, ok, self.has_scene_lights, live, live_poses)
+                    s, gs, gst, ok, _, *rest = self.stage_cache[self.path]
+                    self.stage_cache[self.path] = (s, gs, gst, ok, self.has_scene_lights, *rest)
             has_scene_lights = self.has_scene_lights
         session = stage.GetSessionLayer()
         if not has_scene_lights:
@@ -1352,6 +1367,19 @@ class Viewport:
                     'radius': float(self.camera_anchor[1]),
                     'translation': list(self.camera_anchor_translation or [0.0, 0.0, 0.0]),
                     'transformTarget': self.camera_anchor_target,
+                    'gizmoOffset': (
+                        [
+                            float(g_entry['head_world_pos'][0] - self.camera_anchor[0][0]),
+                            float(g_entry['head_world_pos'][1] - self.camera_anchor[0][1]),
+                            float(g_entry['head_world_pos'][2] - self.camera_anchor[0][2]),
+                        ]
+                        if isinstance(self.camera_anchor_target, str)
+                        and self.camera_anchor_target.startswith('groom:')
+                        and len(self.camera_anchor_target.split(':', 2)) == 3
+                        and (g_entry := getattr(self, 'live_grooms', {}).get(tuple(self.camera_anchor_target.split(':', 2)[1:])))
+                        and g_entry.get('head_world_pos')
+                        else None
+                    ),
                 },
                 'renderMs': round(render_ms, 2), 'captureMs': round(capture_ms, 2),
                 'totalMs': round((time.perf_counter() - started) * 1000, 2),
@@ -1490,6 +1518,8 @@ def dispatch(request):
         return inspect_stage_skeletons(request)
     if operation == 'export_character_body':
         return export_character_body(request)
+    if operation == 'export_md_bridge_handoff':
+        return export_md_bridge_handoff(request)
     if operation == 'convert_source_to_usd':
         return convert_source_to_usd(request)
     if operation == 'materialx_document':

@@ -14,6 +14,9 @@ export function sceneHierarchyKey(graph?: string): string {
         if (node?.operation === "cache_edit") {
           return { ...node, cacheEdit: null };
         }
+        if (node?.operation === "postfx") {
+          return { ...node, postFx: null };
+        }
         return node;
       });
     }
@@ -33,10 +36,12 @@ export function previewTarget(project: StoredProject, id: string, mode: "handoff
     return dependency ? {path:dependency.path,graph:undefined,title:"",message:"",label:`${node.data.label} · Handoff USD`} : {
       path:"",graph:undefined,title:"No handoff USD yet",message:"Choose Create handoff USD in the inspector to prepare a file for the application, or preview the incoming scene before conversion.",label:`${node.data.label} · Handoff USD`};
   }
-  if(app && !input && !node.data.liveAdjustment) return {
+  if(app && !input && !node.data.liveAdjustment && !node.data.mdBridgeDependencyId) return {
     path:"",graph:undefined,title:"No saved live adjustment",
     message:"This node has no live adjustment in the project JSON. Review edited USD, Apply reviewed edits, then save the project. Old published.usda links are not used.",label:`${node.data.label} · Published output`};
-  const hasInputs = project.edges.some(e=>e.target===id) || !!node.data.inputDependencyId;
+  const hasInputs = project.edges.some(e=>e.target===id) || !!node.data.inputDependencyId || !!node.data.metahumanBodyDependencyId;
+  if(node.data.operation === "metahuman" && !node.data.inputDependencyId && !node.data.metahumanBodyDependencyId) return {
+    path:"",graph:undefined,title:"No MetaHuman DNA linked",message:"Browse a Head or Body .dna file in the MetaHuman inspector to begin.",label:node.data.label};
   if(app && input && !hasInputs) return {path:"",graph:undefined,title:"No incoming scene",message:"Connect a Source or link an input USD in the inspector.",label:`${node.data.label} · Incoming scene`};
   if(!app && node.data.operation === "source" && !project.edges.some(e=>e.target===id)) {
     const source=project.dependencies.find(d=>d.id===node.data.inputDependencyId);

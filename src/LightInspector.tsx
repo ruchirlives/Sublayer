@@ -270,6 +270,9 @@ export function LightInspector({
   project,
   nodeId,
   overrides,
+  globalScale = 1,
+  intensityScale = 1,
+  onScalesChange,
   getViewportCameraTransform,
   onStatus,
   onChange,
@@ -277,6 +280,9 @@ export function LightInspector({
   project: StoredProject;
   nodeId: string;
   overrides?: LightOverride[];
+  globalScale?: number;
+  intensityScale?: number;
+  onScalesChange?: (patch: { scale?: number; lightIntensityScale?: number }) => void;
   getViewportCameraTransform?: () => CameraWorldTransform | null;
   onStatus?: (message: string) => void;
   onChange: (overrides: LightOverride[]) => void;
@@ -362,13 +368,18 @@ export function LightInspector({
         ]
       : [0, roundUnitValue(2 * unitScale), roundUnitValue(2 * unitScale)];
     let rotate: [number, number, number] = [-35, 0, 0];
+    const activeGlobalScale = typeof globalScale === "number" && Number.isFinite(globalScale) && globalScale > 0 ? globalScale : 1;
     if (fromView) {
       const cam = getViewportCameraTransform?.();
       if (!cam) {
         onStatus?.("Render a viewport frame first to create a light from the camera view.");
         return;
       }
-      translate = [...cam.translate];
+      translate = [
+        roundUnitValue(cam.translate[0] / activeGlobalScale),
+        roundUnitValue(cam.translate[1] / activeGlobalScale),
+        roundUnitValue(cam.translate[2] / activeGlobalScale),
+      ];
       rotate = [...cam.rotate];
     }
     const id = crypto.randomUUID();
@@ -420,8 +431,13 @@ export function LightInspector({
       onStatus?.("Render a viewport frame first to match the camera view.");
       return;
     }
+    const activeGlobalScale = typeof globalScale === "number" && Number.isFinite(globalScale) && globalScale > 0 ? globalScale : 1;
     updateOverride(item.id, {
-      translate: [...cam.translate],
+      translate: [
+        roundUnitValue(cam.translate[0] / activeGlobalScale),
+        roundUnitValue(cam.translate[1] / activeGlobalScale),
+        roundUnitValue(cam.translate[2] / activeGlobalScale),
+      ],
       rotate: [...cam.rotate],
     });
     onStatus?.(`Matched ${item.lightPath.split("/").pop() || "light"} to viewport camera`);
@@ -527,6 +543,93 @@ export function LightInspector({
           {sceneBounds ? `${unitLabel} · r=${Number(sceneBounds.radius.toPrecision(2))}` : unitLabel}
         </span>
       </div>
+
+      {/* Global Spatial & Intensity Scale (Storm / RTX switcher) */}
+      {onScalesChange && (() => {
+        const currentPosScale = typeof globalScale === "number" && Number.isFinite(globalScale) && globalScale > 0 ? globalScale : 1;
+        const currentIntScale = typeof intensityScale === "number" && Number.isFinite(intensityScale) && intensityScale > 0 ? intensityScale : 1;
+        const presets = [
+          { label: "Storm", pos: 1, intensity: 1, title: "Storm defaults (Pos/Size 1x, Intensity 1x)" },
+          { label: "RTX", pos: 100, intensity: 250, title: "Omniverse RTX defaults (Pos/Size 100x, Intensity 250x)" },
+        ];
+        return (
+          <div
+            style={{
+              background: "#121d22",
+              border: "1px solid #22333b",
+              borderRadius: "5px",
+              padding: "5px 6px",
+              display: "flex",
+              flexDirection: "column",
+              gap: "4px",
+            }}
+            title="Independent non-destructive multipliers for light position/size and lumen intensity. Use Storm or RTX presets when switching renderers."
+          >
+            <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
+              <span style={{ fontSize: "10px", color: "#9eb6ab", flex: 1 }}>Global Scale</span>
+              {presets.map((p) => {
+                const active =
+                  Math.abs(currentPosScale - p.pos) < 1e-6 &&
+                  Math.abs(currentIntScale - p.intensity) < 1e-6;
+                return (
+                  <button
+                    key={p.label}
+                    type="button"
+                    title={p.title}
+                    onClick={() => {
+                      onScalesChange({ scale: p.pos, lightIntensityScale: p.intensity });
+                      onStatus?.(`Light scale set to ${p.label} (Pos ${p.pos}x, Int ${p.intensity}x)`);
+                    }}
+                    style={{
+                      fontSize: "10px",
+                      padding: "2px 6px",
+                      ...(active
+                        ? {
+                            background: "#1f4a3c",
+                            borderColor: "#9fe2b6",
+                            color: "#d9f7e6",
+                          }
+                        : {}),
+                    }}
+                  >
+                    {p.label}
+                  </button>
+                );
+              })}
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "4px" }}>
+              <label style={{ margin: 0, fontSize: "9px", color: "#8b9c96" }}>
+                Pos / Size ×
+                <NumberInput
+                  aria-label="Global Light Position Scale"
+                  min="0.0001"
+                  step="any"
+                  value={currentPosScale}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    if (Number.isFinite(v) && v > 0) onScalesChange({ scale: v });
+                  }}
+                  style={{ width: "100%", padding: "2px 4px", fontSize: "10px", marginTop: "2px" }}
+                />
+              </label>
+              <label style={{ margin: 0, fontSize: "9px", color: "#8b9c96" }}>
+                Intensity ×
+                <NumberInput
+                  aria-label="Global Light Intensity Scale"
+                  min="0.0001"
+                  step="any"
+                  value={currentIntScale}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    if (Number.isFinite(v) && v > 0) onScalesChange({ lightIntensityScale: v });
+                  }}
+                  style={{ width: "100%", padding: "2px 4px", fontSize: "10px", marginTop: "2px" }}
+                />
+              </label>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* Preset bar */}
       <div

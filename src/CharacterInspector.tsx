@@ -5,6 +5,7 @@ import {
   registerFiles,
   type CharacterAnimationOverride,
   type CharacterClothCache,
+  type CharacterHeadGroom,
   type CharacterJointAttachment,
   type CharacterSettings,
   type CharacterSkeletonBinding,
@@ -29,8 +30,83 @@ type AnimationInfo = {
   instanceProxy: boolean;
 };
 
+type StagePrimInfo = {
+  path: string;
+  name: string;
+  typeName: string;
+  isMesh: boolean;
+  isCurves?: boolean;
+};
+
 function makeRuleId(prefix: string): string {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+}
+
+const GROOM_SCALE_PRESETS = [
+  { label: "×0.01", value: 0.01 },
+  { label: "×0.1", value: 0.1 },
+  { label: "×1", value: 1 },
+  { label: "×10", value: 10 },
+  { label: "×100", value: 100 },
+];
+
+function hairQueryMatches(rawQuery: string, primPath: string): boolean {
+  const terms = rawQuery
+    .split(",")
+    .map((t) => t.trim().toLowerCase())
+    .filter(Boolean);
+  const includes = terms.filter((t) => !t.startsWith("!"));
+  const excludes = terms
+    .filter((t) => t.startsWith("!"))
+    .map((t) => t.slice(1).trim())
+    .filter(Boolean);
+  const low = primPath.toLowerCase();
+  const nameLow = (primPath.split("/").pop() || "").toLowerCase();
+  const hit = (term: string): boolean => {
+    if (term === "*") return true;
+    if (/[*?[]/.test(term)) {
+      const escaped = term
+        .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+        .replace(/\*/g, ".*")
+        .replace(/\?/g, ".");
+      try {
+        const re = new RegExp(`^${escaped}$`);
+        return re.test(low) || re.test(nameLow);
+      } catch {
+        return false;
+      }
+    }
+    if (term.startsWith("/")) {
+      const trimmed = term.replace(/\/+$/, "");
+      return low === trimmed || low.startsWith(`${trimmed}/`);
+    }
+    return low.includes(term);
+  };
+  if (excludes.some(hit)) return false;
+  if (includes.length === 0 || includes.includes("*")) return true;
+  return includes.some(hit);
+}
+
+function characterQueryMatches(rawQuery: string, primPath: string): boolean {
+  if (hairQueryMatches(rawQuery, primPath)) return true;
+  const parts = primPath.split("/");
+  if (parts.length >= 4 && parts[1] === "Scene" && parts[2].startsWith("Branch_")) {
+    const unbranched = "/Scene/" + parts.slice(3).join("/");
+    return hairQueryMatches(rawQuery, unbranched);
+  }
+  return false;
+}
+
+function filterOutermostStagePrims(prims: StagePrimInfo[]): StagePrimInfo[] {
+  const sorted = [...prims].sort((a, b) => a.path.localeCompare(b.path));
+  const out: StagePrimInfo[] = [];
+  const prefixes: string[] = [];
+  for (const p of sorted) {
+    if (prefixes.some((pref) => p.path === pref || p.path.startsWith(`${pref}/`))) continue;
+    out.push(p);
+    prefixes.push(p.path);
+  }
+  return out;
 }
 
 export function CharacterInspector({
@@ -39,12 +115,16 @@ export function CharacterInspector({
   dependencies,
   onChange,
   onStatus,
+  activeGroomGizmoId,
+  onToggleGroomGizmo,
 }: {
   value: CharacterSettings | null | undefined;
   graph: string | null;
   dependencies: Dependency[];
   onChange: (next: CharacterSettings, nextDependencies?: Dependency[]) => void;
   onStatus?: (msg: string) => void;
+  activeGroomGizmoId?: string | null;
+  onToggleGroomGizmo?: (groomId: string) => void;
 }) {
   const cfg: CharacterSettings = {
     ...defaultCharacterSettings,
@@ -53,6 +133,7 @@ export function CharacterInspector({
     jointAttachments: value?.jointAttachments || [],
     skeletonBindings: value?.skeletonBindings || [],
     clothCaches: value?.clothCaches || [],
+    headGrooms: value?.headGrooms || [],
   };
 
   const [draft, setDraft] = useState<CharacterSettings>(cfg);
@@ -94,6 +175,7 @@ export function CharacterInspector({
 
   const [skeletons, setSkeletons] = useState<SkeletonInfo[] | null>(null);
   const [animations, setAnimations] = useState<AnimationInfo[] | null>(null);
+  const [stagePrims, setStagePrims] = useState<StagePrimInfo[] | null>(null);
   const [scanning, setScanning] = useState(false);
   const [exportingBody, setExportingBody] = useState(false);
   const [scanError, setScanError] = useState("");
@@ -106,11 +188,13 @@ export function CharacterInspector({
       const res = await invoke<{
         skeletons?: SkeletonInfo[];
         animations?: AnimationInfo[];
+        prims?: StagePrimInfo[];
       }>("usd_request", {
         request: { operation: "inspect_stage_skeletons", graph: JSON.parse(graph) },
       });
       setSkeletons(res?.skeletons || []);
       setAnimations(res?.animations || []);
+      setStagePrims(res?.prims || []);
     } catch (e) {
       setScanError(String(e));
     } finally {
@@ -236,6 +320,68 @@ export function CharacterInspector({
   const removeClothCache = (id: string) => {
     commitNow({ clothCaches: draft.clothCaches.filter((r) => r.id !== id) });
   };
+
+  const addHeadGroom = () => {
+    const nextRule: CharacterHeadGroom = {
+      id: makeRuleId("groom"),
+      enabled: true,
+      sourceMode: "file",
+      dependencyId: null,
+      targetQuery: "",
+      attachMode: "joint",
+      skeletonPath: draft.baseSkeletonPath || "",
+      headJointName: "",
+      preserveRestPosition: true,
+      headMeshPath: "",
+      axis: "preserve",
+      frontAxis: "preserve",
+      scale: 1.0,
+      offsetTranslation: [0, 0, 0],
+      offsetRotation: [0, 0, 0],
+      offsetScale: [1, 1, 1],
+    };
+    commitNow({ headGrooms: [...draft.headGrooms, nextRule] });
+  };
+
+  const updateHeadGroom = (
+    id: string,
+    patch: Partial<CharacterHeadGroom>,
+    immediate = false,
+    nextDeps?: Dependency[]
+  ) => {
+    const next = draft.headGrooms.map((r) => (r.id === id ? { ...r, ...patch } : r));
+    if (immediate) commitNow({ headGrooms: next }, nextDeps);
+    else commitDebounced({ headGrooms: next });
+  };
+
+  const removeHeadGroom = (id: string) => {
+    commitNow({ headGrooms: draft.headGrooms.filter((r) => r.id !== id) });
+  };
+
+  async function browseHeadGroom(id: string) {
+    try {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const picked = await open({
+        multiple: false,
+        filters: [
+          {
+            name: "Hair Groom (Alembic / USD)",
+            extensions: ["abc", "usd", "usda", "usdc"],
+          },
+        ],
+      });
+      if (!picked || typeof picked !== "string") return;
+      const { dependencies: nextDeps, ids } = registerFiles(
+        dependencies,
+        [picked],
+        "usd"
+      );
+      updateHeadGroom(id, { dependencyId: ids[0], sourceMode: "file" }, true, nextDeps);
+      onStatus?.(`Linked head groom: ${picked.split(/[\\/]/).pop()}`);
+    } catch (e) {
+      onStatus?.(`Head groom browse failed: ${String(e)}`);
+    }
+  }
 
   async function browseClothCache(id: string) {
     try {
@@ -804,6 +950,405 @@ export function CharacterInspector({
                   />
                 </label>
               </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Section 5: Head Grooms */}
+      <div style={{ borderTop: "1px solid rgba(255,255,255,0.12)", paddingTop: "8px", display: "flex", flexDirection: "column", gap: "6px" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+          <span className="field-label">Head Grooms</span>
+          <button type="button" onClick={addHeadGroom} style={{ padding: "2px 7px", fontSize: "11px" }}>
+            + Add Groom
+          </button>
+        </div>
+        {draft.headGrooms.length === 0 && (
+          <p className="hint" style={{ margin: 0 }}>
+            Attach external .abc/.usd grooms or connected Hair/Source curves to the head joint or head mesh surface.
+          </p>
+        )}
+        {draft.headGrooms.map((rule) => {
+          const dep = rule.dependencyId
+            ? dependencies.find((d) => d.id === rule.dependencyId)
+            : undefined;
+          const joints = resolveJointsForSkeleton(rule.skeletonPath);
+          const scannedMeshes = (stagePrims || []).filter((p) => p.isMesh);
+          const scannedCurves = (stagePrims || []).filter((p) => p.isCurves);
+          const matchedGroomPrims =
+            rule.sourceMode === "upstream" && stagePrims && rule.targetQuery.trim()
+              ? filterOutermostStagePrims(
+                  stagePrims.filter((p) => characterQueryMatches(rule.targetQuery, p.path))
+                )
+              : null;
+          return (
+            <div
+              key={rule.id}
+              style={{
+                padding: "6px",
+                borderRadius: "4px",
+                border: "1px solid rgba(255,255,255,0.12)",
+                background: "rgba(0,0,0,0.16)",
+                display: "flex",
+                flexDirection: "column",
+                gap: "5px",
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "6px" }}>
+                <label style={{ display: "flex", alignItems: "center", gap: "5px", fontSize: "11px", margin: 0 }}>
+                  <input
+                    type="checkbox"
+                    checked={rule.enabled}
+                    onChange={(e) => updateHeadGroom(rule.id, { enabled: e.target.checked }, true)}
+                  />
+                  Enabled
+                </label>
+                <div style={{ display: "flex", gap: "4px", alignItems: "center" }}>
+                  {rule.attachMode === "joint" && onToggleGroomGizmo && (
+                    <button
+                      type="button"
+                      disabled={!rule.enabled}
+                      onClick={() => onToggleGroomGizmo(rule.id)}
+                      title="Toggle 3D viewport gizmo (Q/W/E/R) to position this groom"
+                      style={{
+                        padding: "1px 6px",
+                        fontSize: "11px",
+                        ...(activeGroomGizmoId === rule.id
+                          ? {
+                              background: "rgba(99, 102, 241, 0.45)",
+                              borderColor: "rgba(129, 140, 248, 0.9)",
+                            }
+                          : {}),
+                      }}
+                    >
+                      {activeGroomGizmoId === rule.id ? "Gizmo On" : "Gizmo"}
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => removeHeadGroom(rule.id)}
+                    style={{ padding: "1px 6px", fontSize: "11px" }}
+                  >
+                    Remove
+                  </button>
+                </div>
+              </div>
+
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "6px" }}>
+                <label>
+                  <span className="field-label">Source</span>
+                  <select
+                    value={rule.sourceMode}
+                    onChange={(e) =>
+                      updateHeadGroom(rule.id, { sourceMode: e.target.value as "file" | "upstream" }, true)
+                    }
+                  >
+                    <option value="file">External File</option>
+                    <option value="upstream">Connected Input</option>
+                  </select>
+                </label>
+                <label>
+                  <span className="field-label">Attach Mode</span>
+                  <select
+                    value={rule.attachMode}
+                    onChange={(e) =>
+                      updateHeadGroom(rule.id, { attachMode: e.target.value as "joint" | "surface" }, true)
+                    }
+                  >
+                    <option value="joint">Head Joint (Rigid)</option>
+                    <option value="surface">Head Mesh (Surface)</option>
+                  </select>
+                </label>
+              </div>
+
+              {rule.sourceMode === "file" ? (
+                <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                  <button
+                    type="button"
+                    onClick={() => browseHeadGroom(rule.id)}
+                    style={{ padding: "3px 8px", fontSize: "11px" }}
+                  >
+                    Browse Groom...
+                  </button>
+                  <span
+                    style={{
+                      fontSize: "11px",
+                      opacity: 0.85,
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
+                      flex: 1,
+                    }}
+                    title={dep?.path || ""}
+                  >
+                    {dep ? dep.path.split(/[\\/]/).pop() : "No groom file linked"}
+                  </span>
+                </div>
+              ) : (
+                <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+                  <label>
+                    <span className="field-label">Groom Prim / Wildcard</span>
+                    <input
+                      type="text"
+                      list={`groom-curves-${rule.id}`}
+                      value={rule.targetQuery}
+                      onChange={(e) => updateHeadGroom(rule.id, { targetQuery: e.target.value })}
+                      placeholder="*Hair*, *Groom*, *Eyebrows*, /Scene/..."
+                    />
+                    {scannedCurves.length > 0 && (
+                      <datalist id={`groom-curves-${rule.id}`}>
+                        {scannedCurves.map((c) => (
+                          <option key={c.path} value={c.path}>{c.name}</option>
+                        ))}
+                      </datalist>
+                    )}
+                  </label>
+                  {rule.targetQuery.trim() && (
+                    stagePrims === null ? (
+                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "6px", fontSize: "11px", opacity: 0.75 }}>
+                        <span>Scan to preview matched prims</span>
+                        <button
+                          type="button"
+                          onClick={scanSkeletons}
+                          disabled={!graph || scanning}
+                          style={{ padding: "1px 6px", fontSize: "10px" }}
+                        >
+                          {scanning ? "Scanning..." : "Scan"}
+                        </button>
+                      </div>
+                    ) : matchedGroomPrims && matchedGroomPrims.length > 0 ? (
+                      <div style={{ fontSize: "11px", display: "flex", flexWrap: "wrap", gap: "4px", alignItems: "center" }}>
+                        <span style={{ opacity: 0.75 }}>Matched ({matchedGroomPrims.length}):</span>
+                        {matchedGroomPrims.slice(0, 6).map((mp) => (
+                          <span
+                            key={mp.path}
+                            title={mp.path}
+                            style={{
+                              padding: "1px 5px",
+                              borderRadius: "3px",
+                              background: "rgba(99, 102, 241, 0.22)",
+                              border: "1px solid rgba(129, 140, 248, 0.4)",
+                              fontSize: "10px",
+                              maxWidth: "100%",
+                              overflow: "hidden",
+                              textOverflow: "ellipsis",
+                              whiteSpace: "nowrap",
+                            }}
+                          >
+                            {mp.name}
+                          </span>
+                        ))}
+                        {matchedGroomPrims.length > 6 && (
+                          <span style={{ opacity: 0.7, fontSize: "10px" }}>
+                            +{matchedGroomPrims.length - 6} more
+                          </span>
+                        )}
+                      </div>
+                    ) : (
+                      <span style={{ fontSize: "11px", color: "#fbbf24" }}>
+                        No prims matched by query
+                      </span>
+                    )
+                  )}
+                </div>
+              )}
+
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "6px" }}>
+                <label>
+                  <span className="field-label">Up Axis</span>
+                  <select
+                    value={rule.axis}
+                    onChange={(e) => updateHeadGroom(rule.id, { axis: e.target.value }, true)}
+                  >
+                    {["preserve", "Y", "-Y", "Z", "-Z", "X", "-X"].map((ax) => (
+                      <option key={ax} value={ax}>{ax}</option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  <span className="field-label">Front Axis</span>
+                  <select
+                    value={rule.frontAxis}
+                    onChange={(e) => updateHeadGroom(rule.id, { frontAxis: e.target.value }, true)}
+                  >
+                    {["preserve", "Y", "-Y", "Z", "-Z", "X", "-X"].map((ax) => (
+                      <option key={ax} value={ax}>{ax}</option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+
+              <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+                <label>
+                  <span className="field-label">Uniform Scale</span>
+                  <NumberInput
+                    value={rule.scale}
+                    min={0.0001}
+                    step={0.01}
+                    onChange={(e) => {
+                      const v = Number(e.target.value);
+                      if (Number.isFinite(v) && v > 0) updateHeadGroom(rule.id, { scale: v });
+                    }}
+                  />
+                </label>
+                <div style={{ display: "flex", gap: "4px", flexWrap: "wrap" }}>
+                  {GROOM_SCALE_PRESETS.map((preset) => {
+                    const active = Math.abs(rule.scale - preset.value) < 1e-6;
+                    return (
+                      <button
+                        key={preset.label}
+                        type="button"
+                        onClick={() => updateHeadGroom(rule.id, { scale: preset.value }, true)}
+                        style={{
+                          padding: "2px 6px",
+                          fontSize: "10px",
+                          flex: "1 1 auto",
+                          ...(active
+                            ? {
+                                background: "rgba(99, 102, 241, 0.35)",
+                                borderColor: "rgba(129, 140, 248, 0.8)",
+                              }
+                            : {}),
+                        }}
+                      >
+                        {preset.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {rule.attachMode === "joint" ? (
+                <>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "6px" }}>
+                    <label>
+                      <span className="field-label">Skeleton</span>
+                      {skeletons && skeletons.length > 0 ? (
+                        <select
+                          value={rule.skeletonPath}
+                          onChange={(e) => updateHeadGroom(rule.id, { skeletonPath: e.target.value }, true)}
+                        >
+                          <option value="">Default Base Skeleton</option>
+                          {skeletons.map((s) => (
+                            <option key={s.path} value={s.path}>{s.path}</option>
+                          ))}
+                        </select>
+                      ) : (
+                        <input
+                          type="text"
+                          value={rule.skeletonPath}
+                          onChange={(e) => updateHeadGroom(rule.id, { skeletonPath: e.target.value })}
+                          placeholder="Default Base Skeleton"
+                        />
+                      )}
+                    </label>
+                    <label>
+                      <span className="field-label">Head Joint</span>
+                      {joints.length > 0 ? (
+                        <select
+                          value={rule.headJointName}
+                          onChange={(e) => updateHeadGroom(rule.id, { headJointName: e.target.value }, true)}
+                        >
+                          <option value="">Auto-detect head joint</option>
+                          {joints.map((j) => (
+                            <option key={j} value={j}>{j}</option>
+                          ))}
+                        </select>
+                      ) : (
+                        <input
+                          type="text"
+                          value={rule.headJointName}
+                          onChange={(e) => updateHeadGroom(rule.id, { headJointName: e.target.value })}
+                          placeholder="Auto-detect (head)"
+                        />
+                      )}
+                    </label>
+                  </div>
+                  <label style={{ display: "flex", alignItems: "center", gap: "6px", fontSize: "11px", margin: 0 }}>
+                    <input
+                      type="checkbox"
+                      checked={rule.preserveRestPosition}
+                      onChange={(e) =>
+                        updateHeadGroom(rule.id, { preserveRestPosition: e.target.checked }, true)
+                      }
+                    />
+                    Preserve rest position relative to head
+                  </label>
+                </>
+              ) : (
+                <label>
+                  <span className="field-label">Head Mesh (Surface Target)</span>
+                  {scannedMeshes.length > 0 ? (
+                    <select
+                      value={rule.headMeshPath}
+                      onChange={(e) => updateHeadGroom(rule.id, { headMeshPath: e.target.value }, true)}
+                    >
+                      <option value="">Auto-detect head mesh</option>
+                      {scannedMeshes.map((m) => (
+                        <option key={m.path} value={m.path}>{m.name} — {m.path}</option>
+                      ))}
+                    </select>
+                  ) : (
+                    <input
+                      type="text"
+                      value={rule.headMeshPath}
+                      onChange={(e) => updateHeadGroom(rule.id, { headMeshPath: e.target.value })}
+                      placeholder="Auto-detect (or /Scene/.../head_lod0_mesh)"
+                    />
+                  )}
+                </label>
+              )}
+
+              <details style={{ fontSize: "11px" }}>
+                <summary style={{ cursor: "pointer", opacity: 0.8 }}>Offset Transform</summary>
+                <div style={{ display: "flex", flexDirection: "column", gap: "3px", marginTop: "4px" }}>
+                  <span className="field-label">Offset Translate (m)</span>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "4px" }}>
+                    {[0, 1, 2].map((idx) => (
+                      <NumberInput
+                        key={idx}
+                        value={rule.offsetTranslation[idx]}
+                        step={0.005}
+                        onChange={(e) => {
+                          const v = Number(e.target.value);
+                          if (!Number.isFinite(v)) return;
+                          const next: [number, number, number] = [...rule.offsetTranslation] as [number, number, number];
+                          next[idx] = v;
+                          updateHeadGroom(rule.id, { offsetTranslation: next });
+                        }}
+                      />
+                    ))}
+                  </div>
+                  <span className="field-label">Offset Rotate (deg)</span>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "4px" }}>
+                    {[0, 1, 2].map((idx) => (
+                      <NumberInput
+                        key={idx}
+                        value={rule.offsetRotation[idx]}
+                        step={1}
+                        onChange={(e) => {
+                          const v = Number(e.target.value);
+                          if (!Number.isFinite(v)) return;
+                          const next: [number, number, number] = [...rule.offsetRotation] as [number, number, number];
+                          next[idx] = v;
+                          updateHeadGroom(rule.id, { offsetRotation: next });
+                        }}
+                      />
+                    ))}
+                  </div>
+                  <span className="field-label">Uniform Offset Scale</span>
+                  <NumberInput
+                    value={rule.offsetScale[0]}
+                    min={0.0001}
+                    step={0.05}
+                    onChange={(e) => {
+                      const v = Number(e.target.value);
+                      if (!Number.isFinite(v) || v <= 0) return;
+                      updateHeadGroom(rule.id, { offsetScale: [v, v, v] });
+                    }}
+                  />
+                </div>
+              </details>
             </div>
           );
         })}

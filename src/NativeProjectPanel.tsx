@@ -50,6 +50,7 @@ export function NativeProjectPanel({
   onLive,
   onStatus,
   onConfigure,
+  onMdBridgePulled,
   projectName,
 }: {
   project: StoredProject;
@@ -65,6 +66,7 @@ export function NativeProjectPanel({
   onNativeCreated: (result: NativeCreationResult) => StoredProject;
   onStatus: (message: string) => void;
   onConfigure: () => void;
+  onMdBridgePulled?: () => void;
 }) {
   const { catalog } = useApplicationCatalog();
   const profile = findProfile(catalog, data);
@@ -76,15 +78,88 @@ export function NativeProjectPanel({
   const [preparingQuickstart, setPreparingQuickstart] = useState(false);
   const [availability, setAvailability] = useState<Record<string, string>>({});
   const [revision, setRevision] = useState(0);
+  const [mdBridge, setMdBridge] = useState<{
+    available: boolean;
+    bridgeDir: string;
+    scriptPath: string;
+    pullScriptPath?: string;
+    projectPath?: string;
+    projectName?: string;
+    exportPath?: string;
+    exportedAt?: number;
+    handoffAvailable?: boolean;
+    handoffPath?: string;
+    handoffExportedAt?: number;
+  } | null>(null);
+  const [bridgeFeedback, setBridgeFeedback] = useState("");
+  const [copiedScript, setCopiedScript] = useState<"send" | "pull" | null>(null);
 
+  async function copyBridgeScript(kind: "send" | "pull", text: string) {
+    let copied = false;
+    try {
+      await navigator.clipboard.writeText(text);
+      copied = true;
+    } catch {
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        copied = document.execCommand("copy");
+        document.body.removeChild(ta);
+      } catch {
+        copied = false;
+      }
+    }
+    setCopiedScript(kind);
+    window.setTimeout(() => setCopiedScript((cur) => (cur === kind ? null : cur)), 2000);
+    const msg = copied ? `Copied path: ${text}` : `Script path: ${text}`;
+    setBridgeFeedback(msg);
+    onStatus(msg);
+  }
+
+  async function refreshMdBridge() {
+    if (!isTauri() || data.app !== "Marvelous Designer") return;
+    try {
+      const info = await invoke<{
+        available: boolean;
+        bridgeDir: string;
+        scriptPath: string;
+        pullScriptPath?: string;
+        projectPath?: string;
+        projectName?: string;
+        exportPath?: string;
+        exportedAt?: number;
+        handoffAvailable?: boolean;
+        handoffPath?: string;
+        handoffExportedAt?: number;
+      }>("md_bridge_status");
+      setMdBridge(info);
+    } catch {
+      /* ignore bridge status errors */
+    }
+  }
+
+  useEffect(() => {
+    void refreshMdBridge();
+  }, [data.app, revision]);
+
+  const launchableApps = new Set([
+    "Blender",
+    "Marvelous Designer",
+    "Substance Painter",
+    "ZBrush",
+  ]);
   const commonReasons = [
     ...(!isTauri() ? ["Use the desktop app."] : []),
     ...(busy ? ["Wait for the current operation to finish."] : []),
-    ...(data.app !== "Blender"
+    ...(!launchableApps.has(data.app)
       ? [
           data.app
-            ? `Native creation/opening is not implemented for ${data.app}; its profile is currently a template.`
-            : "Choose the Blender application profile.",
+            ? `Native project opening is not implemented for ${data.app}; its profile is currently a template.`
+            : "Choose an application profile.",
         ]
       : []),
     ...(!effectiveExecutable ? ["Set the executable in Applications."] : []),
@@ -154,13 +229,20 @@ export function NativeProjectPanel({
 
   async function browse(field: "nativeProject") {
     const { open } = await import("@tauri-apps/plugin-dialog");
+    const filters =
+      data.app === "Blender"
+        ? [{ name: "Blender project", extensions: ["blend"] }]
+        : data.app === "Marvelous Designer"
+          ? [{ name: "Marvelous Designer project", extensions: ["zprj", "zpac"] }]
+          : data.app === "Substance Painter"
+            ? [{ name: "Substance Painter project", extensions: ["spp"] }]
+            : data.app === "ZBrush"
+              ? [{ name: "ZBrush project", extensions: ["zpr", "ztl"] }]
+              : undefined;
     const path = await open({
       multiple: false,
       title: "Choose an existing native project",
-      filters:
-        data.app === "Blender"
-          ? [{ name: "Blender project", extensions: ["blend"] }]
-          : undefined,
+      filters,
     });
     if (!path) return;
     const existingId = await invoke<string | null>("find_dependency", {
@@ -590,6 +672,137 @@ export function NativeProjectPanel({
           </>
         )}
       </section>
+
+      {data.app === "Marvelous Designer" && (
+        <section className="coordinate-panel app-workflow-step">
+          <div className="app-section-heading">
+            <h3>
+              MD Live Bridge
+              <InspectorHint text="Run scripts/md_bridge/sublayer_send_garment.py inside Marvelous Designer (Script -> Python Editor) to export your open garment without the avatar, then pull it here." />
+            </h3>
+            <button
+              className="app-text-action"
+              type="button"
+              onClick={() => void refreshMdBridge()}
+            >
+              Refresh
+            </button>
+          </div>
+          {mdBridge?.available && mdBridge.exportPath ? (
+            <>
+              <div className="app-file" title={mdBridge.exportPath}>
+                <span className="app-file-kind">
+                  Open garment · {mdBridge.projectName || "Untitled"}
+                </span>
+                <strong>{mdBridge.exportPath.split(/[\\/]/).pop()}</strong>
+              </div>
+              <button
+                className="primary"
+                type="button"
+                disabled={busy || !isTauri()}
+                onClick={() => {
+                  const patch: Partial<Data> = {
+                    mdBridgePath: mdBridge.exportPath!,
+                  };
+                  if (
+                    !data.nativeProject &&
+                    mdBridge.projectPath &&
+                    /\.(zprj|zpac)$/i.test(mdBridge.projectPath)
+                  ) {
+                    patch.nativeProject = mdBridge.projectPath;
+                  }
+                  onChange(patch);
+                  onMdBridgePulled?.();
+                  const fileName = mdBridge.exportPath!.split(/[\\/]/).pop() || "garment.obj";
+                  const msg = `Pulled ${fileName} into scene output (combined with upstream avatar, mm → m).`;
+                  setBridgeFeedback(msg);
+                  onStatus(msg);
+                }}
+              >
+                Pull from MD Bridge
+              </button>
+            </>
+          ) : (
+            <p className="hint">
+              No MD bridge export yet. Run <code>sublayer_send_garment.py</code>{" "}
+              in MD&apos;s Python Editor.
+            </p>
+          )}
+          {data.mdBridgePath && (
+            <div className="app-file" title={data.mdBridgePath}>
+              <span className="app-file-kind">Active MD garment</span>
+              <strong>{data.mdBridgePath.split(/[\\/]/).pop()}</strong>
+              <button
+                type="button"
+                className="app-text-action"
+                onClick={() => {
+                  onChange({ mdBridgePath: "" });
+                  setBridgeFeedback("Cleared pulled MD garment.");
+                }}
+              >
+                Clear
+              </button>
+            </div>
+          )}
+          {mdBridge?.handoffAvailable && mdBridge.handoffPath && (
+            <div className="app-file" title={mdBridge.handoffPath}>
+              <span className="app-file-kind">Handoff avatar</span>
+              <strong>{mdBridge.handoffPath.split(/[\\/]/).pop()}</strong>
+            </div>
+          )}
+          <button
+            type="button"
+            disabled={busy || !isTauri()}
+            onClick={() =>
+              run(async () => {
+                const res = await invoke<{
+                  handoffPath: string;
+                  meshCount: number;
+                }>("send_to_md_bridge", {
+                  project,
+                  nodeId,
+                  baseName: `${projectName}_${data.label}`,
+                });
+                await refreshMdBridge();
+                const msg = `Sent ${res.handoffPath.split(/[\\/]/).pop()} (${res.meshCount} mesh(es)) to MD Bridge. Run sublayer_pull_avatar.py in MD to import it.`;
+                setBridgeFeedback(msg);
+                onStatus(msg);
+              })
+            }
+          >
+            Send Handoff to MD Bridge
+          </button>
+          {mdBridge?.scriptPath && (
+            <button
+              className="app-secondary"
+              type="button"
+              onClick={() => void copyBridgeScript("send", mdBridge.scriptPath)}
+            >
+              {copiedScript === "send"
+                ? "Copied Send Garment script ✓"
+                : "Copy Send Garment script"}
+            </button>
+          )}
+          {mdBridge?.pullScriptPath && (
+            <button
+              className="app-secondary"
+              type="button"
+              onClick={() =>
+                void copyBridgeScript("pull", mdBridge.pullScriptPath!)
+              }
+            >
+              {copiedScript === "pull"
+                ? "Copied Pull Avatar script ✓"
+                : "Copy Pull Avatar script"}
+            </button>
+          )}
+          {bridgeFeedback && (
+            <p className="app-notice" role="status">
+              {bridgeFeedback}
+            </p>
+          )}
+        </section>
+      )}
 
       <PublicationPanel
         key={data.nativeImport?.baselineDependencyId}

@@ -267,5 +267,67 @@ class MaterialBindingAndLightTests(unittest.TestCase):
         self.assertIs(prim.GetAttribute('omni:rtx:post:tvNoise:vignetting:enabled').Get(), True)
         self.assertIs(prim.GetAttribute('omni:rtx:post:tvNoise:filmGrain:enabled').Get(), False)
 
+    def test_light_global_scale_multiplies_positions_sizes_and_intensities(self):
+        sample = pathlib.Path(__file__).resolve().parents[1] / 'samples/layered.usda'
+        graph = {
+            'targetNodeId': 'light_node',
+            'nodes': [
+                {'id': 'geo', 'operation': 'source', 'inputDependencyId': 'asset'},
+                {
+                    'id': 'light_node',
+                    'operation': 'light',
+                    'scale': 100.0,
+                    'lightIntensityScale': 250.0,
+                    'lightOverrides': [
+                        {
+                            'id': 'k1',
+                            'mode': 'create',
+                            'lightPath': '/Scene/Lights/Key',
+                            'lightType': 'RectLight',
+                            'enabled': True,
+                            'intensity': 12.0,
+                            'translate': [3.2, 3.0, 3.2],
+                            'rotate': [-35.0, 45.0, 0.0],
+                            'width': 2.0,
+                            'height': 1.5,
+                        },
+                        {
+                            'id': 'sun1',
+                            'mode': 'create',
+                            'lightPath': '/Scene/Lights/Sun',
+                            'lightType': 'DistantLight',
+                            'enabled': True,
+                            'intensity': 3.5,
+                            'angle': 0.53,
+                        },
+                        {
+                            'id': 'off1',
+                            'mode': 'create',
+                            'lightPath': '/Scene/Lights/Disabled',
+                            'lightType': 'RectLight',
+                            'enabled': False,
+                            'intensity': 10.0,
+                        },
+                    ],
+                },
+            ],
+            'edges': [{'id': 'e1', 'source': 'geo', 'target': 'light_node'}],
+            'dependencies': [{'id': 'asset', 'path': str(sample)}],
+        }
+        stage, _, _ = compile_graph(graph)
+        key = stage.GetPrimAtPath('/Scene/Lights/Key')
+        sun = stage.GetPrimAtPath('/Scene/Lights/Sun')
+        off = stage.GetPrimAtPath('/Scene/Lights/Disabled')
+        self.assertAlmostEqual(key.GetAttribute('inputs:intensity').Get(), 3000.0, places=3)
+        self.assertAlmostEqual(key.GetAttribute('inputs:width').Get(), 200.0, places=3)
+        self.assertAlmostEqual(key.GetAttribute('inputs:height').Get(), 150.0, places=3)
+        pos = UsdGeom.Xformable(key).ComputeLocalToWorldTransform(Usd.TimeCode.Default()).ExtractTranslation()
+        self.assertAlmostEqual(pos[0], 320.0, places=3)
+        self.assertAlmostEqual(pos[1], 300.0, places=3)
+        self.assertAlmostEqual(pos[2], 320.0, places=3)
+        self.assertAlmostEqual(sun.GetAttribute('inputs:intensity').Get(), 875.0, places=3)
+        self.assertAlmostEqual(sun.GetAttribute('inputs:angle').Get(), 0.53, places=4)
+        self.assertAlmostEqual(off.GetAttribute('inputs:intensity').Get(), 0.0, places=3)
+
 if __name__ == '__main__':
     unittest.main()

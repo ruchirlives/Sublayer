@@ -43,6 +43,7 @@ from hair_kernels import _build_kernels, _ensure_warp
 from hair_topology_brushes import (
     _apply_add_or_delete_brush,
     _apply_cut_line_brush,
+    _apply_draw_lock_brush,
     _apply_length_or_cut_brush,
     _apply_lengthen_drag_brush,
 )
@@ -251,6 +252,33 @@ def apply_hair_simulation(stage, hair_cfg, query_matcher):
             if query_matcher(collider_query, str(prim.GetPath())):
                 collider_prims.append(prim)
 
+    # Restore any hair prims created interactively (e.g. Draw Lock on a mesh-only scene)
+    # that are persisted in groomDeltas with full topology.
+    saved_deltas = cfg.get("groomDeltas") if isinstance(cfg.get("groomDeltas"), dict) else {}
+    existing_curve_paths = {str(p.GetPath()) for p in curve_prims}
+    for d_path, d_val in saved_deltas.items():
+        if d_path in existing_curve_paths or not query_matcher(raw_query, d_path):
+            continue
+        if _decode_topology_override(d_val, np) is not None:
+            from pxr import Gf, Sdf, UsdShade
+            new_prim = UsdGeom.BasisCurves.Define(stage, d_path).GetPrim()
+            UsdGeom.Xformable(new_prim).SetResetXformStack(True)
+            bc_new = UsdGeom.BasisCurves(new_prim)
+            bc_new.CreateTypeAttr().Set(UsdGeom.Tokens.cubic)
+            bc_new.CreateBasisAttr().Set(UsdGeom.Tokens.bspline)
+            bc_new.CreateWrapAttr().Set(UsdGeom.Tokens.pinned)
+            bc_new.SetWidthsInterpolation(UsdGeom.Tokens.vertex)
+            if not UsdShade.MaterialBindingAPI(new_prim).ComputeBoundMaterial()[0]:
+                mat = UsdShade.Material.Define(stage, "/Scene/_OrchFlowCreatedHairMat")
+                sh = UsdShade.Shader.Define(stage, "/Scene/_OrchFlowCreatedHairMat/Surface")
+                sh.CreateIdAttr("UsdPreviewSurface")
+                sh.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(0.14, 0.08, 0.05))
+                sh.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.42)
+                mat.CreateSurfaceOutput().ConnectToSource(sh.ConnectableAPI(), "surface")
+                UsdShade.MaterialBindingAPI.Apply(new_prim).Bind(mat)
+            curve_prims.append(new_prim)
+            existing_curve_paths.add(d_path)
+
     if not curve_prims:
         return
 
@@ -377,6 +405,10 @@ def apply_hair_simulation(stage, hair_cfg, query_matcher):
                     existing_sess["cache_key"] = cache_key
                     existing_sess["synced_groom_sig"] = prim_groom_sig
                     existing_sess["dirty_groom"] = False
+                    if existing_sess.get("sim_guide_cache") is not None:
+                        existing_sess["sim_guide_cache"]["sync_from_full"] = True
+                    if existing_sess.get("guide_cache") is not None:
+                        existing_sess["guide_cache"]["stroke_ready"] = None
                     continue
             else:
                 for frame_f, vt_pts in cached.items():
@@ -501,7 +533,9 @@ def apply_hair_simulation(stage, hair_cfg, query_matcher):
             pre_constraints_fn=None, inv_mass_override=None, use_volume=True,
             max_stretch=None, solve_state=None, dynamic_guides=False,
             self_collision=True, zero_gravity=False, rest_shape_pull=True, overdamped=False,
+            bend_scale=1.0, collider_override=None,
         ):
+            eff_collider = collider_override if collider_override is not None else wp_collider
             state = sim_state if solve_state is None else solve_state
             s_tv = state["total_verts"]
             if s_tv <= 0:
@@ -560,20 +594,21 @@ def apply_hair_simulation(stage, hair_cfg, query_matcher):
                         inputs=[s_pos, active_im, s_rt, vol_inv_cell, vol_cell_size, vol_table_mask, 0.25, vol_grid_pos_wp, vol_grid_count_wp],
                         device=device,
                     )
+                eff_bend = bend_stiffness * float(bend_scale)
                 if solve_elastic is not None:
                     first_iterations = min(2, max(1, iterations // 2)) if dynamic_guides else max(1, iterations // 2)
-                    solve_elastic(stiffness, bend_stiffness, first_iterations, int(pre_constraints_fn is not None), 0)
+                    solve_elastic(stiffness, eff_bend, first_iterations, int(pre_constraints_fn is not None), 0)
                 if project_guide_contacts is not None:
                     wp.launch(zero_accum_kernel, dim=s_tv, inputs=[s_dp, s_dw], device=device)
                     guide_margin = min(scaled_margin, float(state.get("max_guide_margin", scaled_margin)))
                     project_guide_contacts(
-                        wp_collider.id if wp_collider is not None else 0,
+                        eff_collider.id if eff_collider is not None else 0,
                         guide_margin,
                         max_query_dist,
                         self_collision=self_collision,
                     )
                     second_iterations = min(2, max(1, iterations - first_iterations)) if dynamic_guides else max(1, iterations - first_iterations)
-                    solve_elastic(stiffness, bend_stiffness, second_iterations, 0, 1)
+                    solve_elastic(stiffness, eff_bend, second_iterations, 0, 1)
                 for iter_idx in range(iterations if solve_elastic is None else 0):
                     wp.launch(zero_accum_kernel, dim=s_tv, inputs=[s_dp, s_dw], device=device)
                     if s_nsegs > 0:
@@ -583,18 +618,18 @@ def apply_hair_simulation(stage, hair_cfg, query_matcher):
                             inputs=[s_pos, active_im, s_sv0, s_sv1, s_slen, stiffness, s_dp, s_dw],
                             device=device,
                         )
-                        if rest_shape_pull and pre_constraints_fn is None and bend_stiffness > 1e-6:
+                        if rest_shape_pull and pre_constraints_fn is None and eff_bend > 1e-6:
                             wp.launch(
                                 shape_bend_constraint_kernel,
                                 dim=s_nsegs,
-                                inputs=[s_pos, active_im, s_rest, s_sv0, s_sv1, bend_stiffness * 0.25, s_dp, s_dw],
+                                inputs=[s_pos, active_im, s_rest, s_sv0, s_sv1, eff_bend * 0.25, s_dp, s_dw],
                                 device=device,
                             )
                     if s_nbends > 0:
                         wp.launch(
                             bend_constraint_kernel,
                             dim=s_nbends,
-                            inputs=[s_pos, active_im, s_bv0, s_bv2, s_blen, bend_stiffness, s_dp, s_dw],
+                            inputs=[s_pos, active_im, s_bv0, s_bv2, s_blen, eff_bend, s_dp, s_dw],
                             device=device,
                         )
                     wp.launch(
@@ -603,12 +638,12 @@ def apply_hair_simulation(stage, hair_cfg, query_matcher):
                         inputs=[s_pos, active_im, s_dp, s_dw],
                         device=device,
                     )
-                    if wp_collider is not None and (iter_idx % 2 == 1 or iter_idx + 1 == iterations):
+                    if eff_collider is not None and (iter_idx % 2 == 1 or iter_idx + 1 == iterations):
                         wp.launch(
                             collide_mesh_kernel,
                             dim=s_tv,
                             inputs=[
-                                s_pos, s_prev, active_im, wp_collider.id, scaled_margin, friction, max_query_dist, 0,
+                                s_pos, s_prev, active_im, eff_collider.id, scaled_margin, friction, max_query_dist, 0,
                                 scalp_edges, scalp_edge_ends, 0,
                             ],
                             device=device,
@@ -620,14 +655,14 @@ def apply_hair_simulation(stage, hair_cfg, query_matcher):
                         inputs=[s_pos, active_im, state["vert_starts_wp"], state.get("counts_wp", state.get("guide_counts")), state["cum_len_wp"], max_stretch],
                         device=device,
                     )
-                if wp_collider is not None and not guide_brush:
+                if eff_collider is not None and not guide_brush:
                     if scalp_segment_count > 0:
                         wp.launch(zero_accum_kernel, dim=s_tv, inputs=[s_dp, s_dw], device=device)
                         wp.launch(
                             collide_segments_kernel,
                             dim=scalp_segment_count,
                             inputs=[
-                                s_pos, active_im, s_sv0, s_sv1, wp_collider.id, scaled_margin, max_query_dist,
+                                s_pos, active_im, s_sv0, s_sv1, eff_collider.id, scaled_margin, max_query_dist,
                                 s_dp, s_dw, scalp_edges, int(guide_brush),
                             ],
                             device=device,
@@ -642,7 +677,7 @@ def apply_hair_simulation(stage, hair_cfg, query_matcher):
                         collide_mesh_kernel,
                         dim=scalp_point_count,
                         inputs=[
-                            s_pos, s_prev, active_im, wp_collider.id, scaled_margin, friction, max_query_dist, 1,
+                            s_pos, s_prev, active_im, eff_collider.id, scaled_margin, friction, max_query_dist, 1,
                             scalp_edges, scalp_edge_ends, int(guide_brush),
                         ],
                         device=device,
@@ -844,7 +879,7 @@ def step_hair_brush(
     diagnostics=None, uploaded_points=None, unchanged_uploads=None,
 ):
     """Apply an interactive 3D hair grooming brush (comb/grab/smooth/part/puff) with full GPU XPBD."""
-    from pxr import Gf, UsdGeom, Vt
+    from pxr import Gf, Usd, UsdGeom, Vt
 
     wp, np, device = _ensure_warp()
     kernels = _build_kernels(wp)
@@ -884,14 +919,71 @@ def step_hair_brush(
 
     cfg = hair_cfg if isinstance(hair_cfg, dict) else {}
     raw_query = str(cfg.get("targetQuery") or "").strip()
+    settle_only = bool(brush.get("settleOnly", False))
+    tool = str(brush.get("tool") or "comb").lower()
 
     # Ensure active GPU sessions exist for matching BasisCurves
     matching_paths = _brush_curve_paths(stage, raw_query, query_matcher)
+    if (
+        not matching_paths
+        and not settle_only
+        and tool == "drawlock"
+        and isinstance(brush.get("drawCurve"), (list, tuple))
+        and len(brush["drawCurve"]) >= 2
+    ):
+        # Bootstrap a new BasisCurves prim on a mesh-only scene when dragging over a 3D object
+        from hair_topology_brushes import _build_scene_draw_mesh
+        wp_coll = _build_scene_draw_mesh(stage, wp, np, device, Usd, UsdGeom)
+        if wp_coll is None:
+            return []
+        meters_per_unit = float(UsdGeom.GetStageMetersPerUnit(stage) or 1.0)
+        stage_unit_scale = 1.0 / max(meters_per_unit, 1e-6)
+        sim_scale = max(float(cfg.get("simScale", 1.0)), 1e-4)
+        unit_scale = stage_unit_scale * sim_scale
+        new_path = "/Scene/CreatedHair"
+        if not stage.GetPrimAtPath("/Scene").IsValid():
+            UsdGeom.Xform.Define(stage, "/Scene")
+        UsdGeom.BasisCurves.Define(stage, new_path)
+        scaled_margin = float(cfg.get("collisionMargin", 0.004)) * unit_scale
+        boot_sess = {
+            "_bootstrap_only": True,
+            "num_strands": 0,
+            "total_verts": 0,
+            "counts_np": np.zeros(0, dtype=np.int32),
+            "wp_collider": wp_coll,
+            "unit_scale": unit_scale,
+            "scaled_margin": scaled_margin,
+            "max_query_dist": max(0.5 * unit_scale, scaled_margin * 20.0),
+        }
+        radius = max(float(brush.get("radius", 0.06)), 0.005)
+        strength = max(0.05, min(2.0, float(brush.get("strength", 0.65))))
+        tip_pct = float(brush.get("drawTipPct", 25.0))
+        density = brush.get("drawDensity")
+        created = _apply_draw_lock_brush(
+            stage, new_path, boot_sess, brush["drawCurve"], radius * unit_scale, strength,
+            cam_basis, wp, np, device, Vt, UsdGeom, tip_pct=tip_pct, density=density,
+        )
+        if not created:
+            stage.RemovePrim(new_path)
+            return []
+        global _BRUSH_CURVE_INDEX
+        if _BRUSH_CURVE_INDEX is not None:
+            _BRUSH_CURVE_INDEX.paths = None
+        apply_hair_simulation(stage, {**cfg, "settleSteps": 0, "gravity": 0.0}, query_matcher)
+        sess_new = _ACTIVE_SIM_SESSIONS.get(new_path)
+        if sess_new is None:
+            return []
+        sess_new["topology_dirty"] = True
+        sess_new["needs_stage_repopulate"] = True
+        sess_new["dirty_groom"] = True
+        sess_new["_brush_scene_collider"] = wp_coll
+        sess_new["_brush_scene_collider_checked"] = True
+        local_np = _session_local_points(sess_new, np)
+        return [(new_path, local_np)]
+
     if any(path not in _ACTIVE_SIM_SESSIONS for path in matching_paths):
         apply_hair_simulation(stage, cfg, query_matcher)
 
-    settle_only = bool(brush.get("settleOnly", False))
-    tool = str(brush.get("tool") or "comb").lower()
     guarded_shape_tool = tool in ("comb", "surfacecomb", "smooth", "clump")
     # This release contains no pending pointer sample. Save the shape already shown.
     commit_shape = settle_only and bool(brush.get("commitUsd")) and guarded_shape_tool
@@ -1005,6 +1097,49 @@ def step_hair_brush(
                     "aspect": aspect,
                 }
 
+        def _resolve_brush_collider():
+            coll = sess.get("wp_collider") or sess.get("_brush_scene_collider")
+            if coll is None and not sess.get("_brush_scene_collider_checked"):
+                from hair_topology_brushes import _build_scene_draw_mesh
+                coll = _build_scene_draw_mesh(stage, wp, np, device, Usd, UsdGeom)
+                sess["_brush_scene_collider_checked"] = True
+                if coll is not None:
+                    sess["_brush_scene_collider"] = coll
+            return coll
+
+        def _snapshot_pre_coll():
+            if total_verts <= 0:
+                return None
+            buf = sess.get("brush_pre_coll_wp")
+            if buf is None or buf.shape != pos_wp.shape:
+                buf = wp.empty_like(pos_wp)
+                sess["brush_pre_coll_wp"] = buf
+            wp.copy(buf, pos_wp)
+            return buf
+
+        def _enforce_brush_collider(pre_buf, active_im, coll):
+            if coll is None or total_verts <= 0 or sess["num_strands"] <= 0:
+                return
+            from hair_draw_kernels import _build_brush_collider_kernel
+            enforce_coll_kernel = _build_brush_collider_kernel(wp)
+            src_prev = pre_buf if (pre_buf is not None and pre_buf.shape == pos_wp.shape) else pos_wp
+            wp.launch(
+                enforce_coll_kernel,
+                dim=sess["num_strands"],
+                inputs=[
+                    src_prev,
+                    pos_wp,
+                    active_im,
+                    sess["vert_starts_wp"],
+                    sess["counts_wp"],
+                    sess["cum_len_wp"],
+                    coll.id,
+                    sess["scaled_margin"],
+                    sess["max_query_dist"],
+                ],
+                device=device,
+            )
+
         if brush.get("clearPins"):
             sess["pinned_strand_wp"].zero_()
             continue
@@ -1025,6 +1160,45 @@ def step_hair_brush(
             sess["strand_brush_w_wp"].zero_()
             sess["active_strand_wp"].zero_()
             sess["brush_inv_mass_wp"].zero_()
+        elif brush.get("smoothAll"):
+            if total_verts > 0:
+                undo_stack = sess.setdefault("undo_stack", [])
+                if len(undo_stack) == 15:
+                    snapshot = undo_stack.pop(0)
+                else:
+                    snapshot = wp.empty_like(pos_wp, device="cpu", pinned=pos_wp.device.is_cuda)
+                wp.copy(snapshot, pos_wp)
+                undo_stack.append(snapshot)
+                from hair_draw_kernels import _build_smooth_all_kernel
+                smooth_all_kernel = _build_smooth_all_kernel(wp)
+                wp_collider = _resolve_brush_collider()
+                coll_id = wp_collider.id if wp_collider is not None else 0
+                has_coll = 1 if wp_collider is not None else 0
+                wp.launch(
+                    smooth_all_kernel,
+                    dim=sess["num_strands"],
+                    inputs=[
+                        pos_wp,
+                        inv_mass_wp,
+                        sess["pinned_strand_wp"],
+                        sess["vert_starts_wp"],
+                        sess["counts_wp"],
+                        sess["cum_len_wp"],
+                        coll_id,
+                        has_coll,
+                        sess["scaled_margin"],
+                        sess["max_query_dist"],
+                        strength,
+                    ],
+                    device=device,
+                )
+                wp.copy(sess["prev_pos_wp"], pos_wp)
+                sess["vel_wp"].zero_()
+                sess["dirty_groom"] = True
+                if sess.get("guide_cache") is not None:
+                    sess["guide_cache"]["stroke_ready"] = None
+                if sess.get("sim_guide_cache") is not None:
+                    sess["sim_guide_cache"]["sync_from_full"] = True
         elif not commit_shape:
             stroke_id = brush.get("strokeId")
             is_new_stroke = bool(brush.get("newStroke")) or (
@@ -1069,10 +1243,12 @@ def step_hair_brush(
                         inputs=[pos_wp, sess["vert_starts_wp"], sess["counts_wp"], arc_lengths],
                         device=device,
                     )
-            direct_sweep_tool = tool in ("lengthen", "shorten", "cut", "add", "delete")
+            direct_sweep_tool = tool in ("lengthen", "shorten", "cut", "add", "delete", "drawlock")
             sweep_ray_dir = ray_dir if direct_sweep_tool else prev_ray_dir
             direct_edit_done = False
             if brush.get("livePhysics"):
+                brush_collider = _resolve_brush_collider()
+                pre_coll_buf = _snapshot_pre_coll() if brush_collider is not None else None
                 sess["active_strand_wp"].fill_(1)
                 wp.launch(
                     sync_active_inv_mass_kernel,
@@ -1093,15 +1269,20 @@ def step_hair_brush(
                     step_sim_guides(
                         wp, device, sim_guides, sess["step_fn"],
                         sess["strand_ids_wp"], sess["vert_starts_wp"], pos_wp,
+                        collider_override=brush_collider,
                     )
                     if diagnostics is not None:
                         diagnostics["totalStrands"] += len(sess["counts_np"])
                         diagnostics["guideStrands"] += sim_guides["num_strands"]
                 else:
-                    sess["step_fn"](None, use_volume=False, inv_mass_override=sess["brush_inv_mass_wp"], max_stretch=1.02)
+                    sess["step_fn"](
+                        None, use_volume=False, inv_mass_override=sess["brush_inv_mass_wp"],
+                        max_stretch=1.02, collider_override=brush_collider,
+                    )
                     if diagnostics is not None:
                         diagnostics["totalStrands"] += len(sess["counts_np"])
                         diagnostics["fullSolveStrands"] += len(sess["counts_np"])
+                _enforce_brush_collider(pre_coll_buf, sess["brush_inv_mass_wp"], brush_collider)
                 sess["dirty_groom"] = True
                 direct_edit_done = True
             elif not settle_only and (not sess.get("grab_ready") or direct_sweep_tool):
@@ -1218,8 +1399,20 @@ def step_hair_brush(
             pin_only = tool in ("pin", "unpin")
             cut_line = brush.get("cutLine")
             lengthen_drag = brush.get("lengthenDrag")
+            draw_curve = brush.get("drawCurve")
             if direct_edit_done:
                 pass
+            elif not settle_only and tool == "drawlock" and isinstance(draw_curve, (list, tuple)) and len(draw_curve) >= 2:
+                tip_pct = float(brush.get("drawTipPct", 25.0))
+                density = brush.get("drawDensity")
+                if _apply_draw_lock_brush(
+                    stage, p_str, sess, draw_curve, scaled_radius, strength, cam_basis, wp, np, device, Vt, UsdGeom,
+                    tip_pct=tip_pct, density=density,
+                ):
+                    sess["dirty_groom"] = True
+                    total_verts = int(sess["total_verts"])
+                    pos_wp = sess.get("pos_wp")
+                direct_edit_done = True
             elif not settle_only and tool == "cut" and isinstance(cut_line, (list, tuple)) and len(cut_line) == 4:
                 _apply_cut_line_brush(
                     stage, p_str, sess, cut_line, cam_basis, wp, np, device, Vt, UsdGeom,
@@ -1228,7 +1421,11 @@ def step_hair_brush(
                 pos_wp = sess.get("pos_wp")
                 direct_edit_done = True
             elif not settle_only and tool == "lengthen" and isinstance(lengthen_drag, (list, tuple)) and len(lengthen_drag) == 4:
+                brush_collider = _resolve_brush_collider()
+                pre_coll_buf = _snapshot_pre_coll() if brush_collider is not None else None
                 if _apply_lengthen_drag_brush(sess, lengthen_drag, scaled_radius, cam_basis, wp, np, device):
+                    _enforce_brush_collider(pre_coll_buf, inv_mass_wp, brush_collider)
+                    wp.copy(sess["prev_pos_wp"], pos_wp)
                     sess["dirty_groom"] = True
                 direct_edit_done = True
             elif not settle_only and sess.get("grab_ready") and sess.get("grab_center") is not None:
@@ -1252,7 +1449,7 @@ def step_hair_brush(
                 )
                 sess["prev_cursor_target"] = cursor_target
                 inv_dt = 1.0 / max(dt_sub, 1e-6)
-                wp_collider = sess["wp_collider"]
+                wp_collider = _resolve_brush_collider()
                 coll_id = wp_collider.id if wp_collider is not None else 0
                 has_coll = 1 if wp_collider is not None else 0
 
@@ -1280,7 +1477,11 @@ def step_hair_brush(
                     else:
                         brush_center = cursor_target
                     if tool in ("lengthen", "shorten", "cut"):
+                        pre_coll_buf = _snapshot_pre_coll() if (wp_collider is not None and tool in ("lengthen", "shorten")) else None
                         if _apply_length_or_cut_brush(sess, tool, brush_center, scaled_radius, strength, wp, np, device, ray_origin=ray_origin, ray_dir=ray_dir):
+                            if tool in ("lengthen", "shorten"):
+                                _enforce_brush_collider(pre_coll_buf, inv_mass_wp, wp_collider)
+                                wp.copy(sess["prev_pos_wp"], pos_wp)
                             sess["dirty_groom"] = True
                         direct_edit_done = True
                     elif tool in ("add", "delete"):
@@ -1290,6 +1491,9 @@ def step_hair_brush(
                         )
                         total_verts = int(sess["total_verts"])
                         pos_wp = sess.get("pos_wp")
+                        if tool == "add" and wp_collider is not None and total_verts > 0:
+                            _enforce_brush_collider(None, sess["inv_mass_wp"], wp_collider)
+                            wp.copy(sess["prev_pos_wp"], pos_wp)
                         direct_edit_done = True
                     elif pin_only:
                         wp.launch(
@@ -1415,7 +1619,7 @@ def step_hair_brush(
                                 state["strand_hero_k_wp"],
                                 state["strand_surface_target_wp"],
                                 state["strand_brush_w_wp"],
-                                sess["stroke_arc_lengths_wp"] if direct else state["cum_len_wp"],
+                                state["cum_len_wp"],
                                 coll_id,
                                 has_coll,
                                 sess["max_query_dist"],
@@ -1423,6 +1627,8 @@ def step_hair_brush(
                                 scaled_radius,
                                 strength,
                                 int(direct),
+                                state["counts_wp"] if direct else state["guide_counts"],
+                                sess["scaled_margin"],
                             ],
                             device=device,
                         )
@@ -1537,6 +1743,8 @@ def step_hair_brush(
                 if not brush.get("livePhysics"):
                     sess["sim_guide_cache"] = None
             elif not guarded_shape_tool or sess.get("grab_ready"):
+                brush_collider = _resolve_brush_collider()
+                pre_coll_buf = _snapshot_pre_coll() if brush_collider is not None else None
                 raw_vpct = int(brush.get("vertexPct", 100) or 100)
                 vertex_stride = 4 if raw_vpct <= 25 else (2 if raw_vpct <= 50 else 1)
                 used_guides = False
@@ -1550,9 +1758,11 @@ def step_hair_brush(
                         self_collision=False,
                         zero_gravity=(tool != "physics"),
                         vertex_stride=vertex_stride,
+                        bend_scale=(0.15 if tool == "comb" else 1.0),
+                        collider_override=brush_collider,
                     )
                 max_stretch = None
-                if tool in ("grab", "part", "puff", "physics"):
+                if tool in ("comb", "grab", "part", "puff", "physics"):
                     max_stretch = 1.02
                 if not used_guides and tool in ("smooth", "clump") and pre_constraints_fn is not None:
                     if vertex_stride > 1 and total_verts > 0:
@@ -1588,6 +1798,7 @@ def step_hair_brush(
                             inputs=[pos_wp, sess["brush_inv_mass_wp"], sess["vert_starts_wp"], sess["counts_wp"], sess["cum_len_wp"], 1.02],
                             device=device,
                         )
+                    _enforce_brush_collider(pre_coll_buf, sess["brush_inv_mass_wp"], brush_collider)
                     wp.copy(sess["prev_pos_wp"], pos_wp)
                     if sess.get("guide_cache") is not None:
                         sess["guide_cache"]["stroke_ready"] = None
@@ -1616,7 +1827,9 @@ def step_hair_brush(
                         max_stretch=max_stretch,
                         zero_gravity=(tool != "physics"),
                         rest_shape_pull=False,
-                        overdamped=(tool in ("puff", "part", "physics")),
+                        overdamped=(tool in ("grab", "comb", "surfacecomb", "puff", "part", "physics")),
+                        bend_scale=(0.15 if tool == "comb" else (0.35 if tool == "grab" else 1.0)),
+                        collider_override=brush_collider,
                     )
                     if vertex_stride > 1 and previous_shape is not None and num_strands > 0:
                         from hair_kernels import _build_subsample_kernels
@@ -1628,10 +1841,13 @@ def step_hair_brush(
                         )
                     if guarded_shape_tool and previous_shape is not None:
                         from hair_guides import bound_full_brush
-                        bound_full_brush(wp, device, sess, previous_shape)
+                        bound_full_brush(wp, device, sess, previous_shape, collider_override=brush_collider)
                         # The guard can reject part of the proposal. Don't
                         # carry velocity from the rejected motion into the next sample.
                         vel_wp.zero_()
+                    _enforce_brush_collider(pre_coll_buf, sess["brush_inv_mass_wp"], brush_collider)
+                elif used_guides:
+                    _enforce_brush_collider(pre_coll_buf, sess["brush_inv_mass_wp"], brush_collider)
                 if diagnostics is not None:
                     diagnostics["totalStrands"] += num_strands
                     if used_guides:

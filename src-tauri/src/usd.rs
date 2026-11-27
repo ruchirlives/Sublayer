@@ -127,7 +127,12 @@ fn ensure_worker_script_dir() -> Result<std::path::PathBuf, String> {
             return Ok(dir);
         }
     }
-    let files: [(&str, &str); 12] = [
+    let files: [(&str, &str); 14] = [
+        ("metahuman.py", include_str!("../../worker/metahuman.py")),
+        (
+            "metahuman_riglogic.py",
+            include_str!("../../worker/metahuman_riglogic.py"),
+        ),
         (
             "geometry_exports.py",
             include_str!("../../worker/geometry_exports.py"),
@@ -484,6 +489,7 @@ impl UsdService {
             Some("inspect_stage_curves"),
             Some("inspect_stage_skeletons"),
             Some("export_character_body"),
+            Some("export_md_bridge_handoff"),
             Some("reset_hair"),
             Some("convert_source_to_usd"),
             Some("sp_build_materials"),

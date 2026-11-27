@@ -577,6 +577,419 @@ class HairSimTests(unittest.TestCase):
         after_seg_lens = np.linalg.norm(after[:, 1:] - after[:, :-1], axis=2)
         self.assertLessEqual(float(np.max(after_seg_lens / np.maximum(rest_seg_lens, 1e-6))), 1.03)
 
+    def test_comb_brush_disentangles_and_straightens_along_drag_path(self):
+        import numpy as np
+        from pxr import Usd, UsdGeom, Vt
+        import hair_sim
+        from usd_graph import _hair_query_matches
+
+        self.addCleanup(hair_sim.reset_hair_sessions)
+        hair_sim.reset_hair_sessions()
+
+        def _direction_roughness(pts_3d):
+            segs = pts_3d[:, 1:] - pts_3d[:, :-1]
+            lens = np.linalg.norm(segs, axis=2, keepdims=True)
+            dirs = segs / np.maximum(lens, 1e-6)
+            return float(np.mean(np.linalg.norm(dirs[:, 1:] - dirs[:, :-1], axis=2)))
+
+        # 1) Direct-mode kinked/zig-zag strands combed downward
+        stage = Usd.Stage.CreateInMemory()
+        UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.y)
+        UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+        UsdGeom.Xform.Define(stage, "/Scene")
+        n_strands, n_verts = 6, 10
+        xs = np.linspace(-0.08, 0.08, n_strands, dtype=np.float32)
+        pts = np.zeros((n_strands, n_verts, 3), dtype=np.float32)
+        for s in range(n_strands):
+            for j in range(n_verts):
+                kink = (0.045 if (j % 2 == 1) else -0.045) if j > 0 else 0.0
+                z_kink = (0.03 if ((j + s) % 2 == 1) else -0.03) if j > 0 else 0.0
+                pts[s, j] = [xs[s] + kink, 0.4 - 0.045 * j, z_kink]
+        curves = UsdGeom.BasisCurves.Define(stage, "/Scene/Hair")
+        curves.CreateTypeAttr().Set(UsdGeom.Tokens.linear)
+        curves.CreateCurveVertexCountsAttr().Set(Vt.IntArray([n_verts] * n_strands))
+        curves.CreatePointsAttr().Set(Vt.Vec3fArray.FromNumpy(pts.reshape(-1, 3)))
+
+        cfg = {
+            "simEnabled": True,
+            "simMode": "static",
+            "gravity": 0.0,
+            "stiffness": 0.95,
+            "bendStiffness": 0.4,
+            "substeps": 4,
+            "iterations": 8,
+            "collisionMargin": 0.005,
+        }
+        cam = {
+            "origin": (0.0, 0.2, 1.8), "forward": (0.0, 0.0, -1.0),
+            "right": (1.0, 0.0, 0.0), "up": (0.0, 1.0, 0.0),
+            "tan_half_fov": 0.4142, "aspect": 1.3333,
+        }
+        before_rough = _direction_roughness(pts)
+        rest_seg_lens = np.linalg.norm(pts[:, 1:] - pts[:, :-1], axis=2)
+
+        # Drag downward (+ny in screen space => -Y in world space)
+        ny_steps = [0.40, 0.46, 0.52, 0.58, 0.64, 0.70]
+        for idx, ny in enumerate(ny_steps):
+            hair_sim.step_hair_brush(
+                stage, cfg, _hair_query_matches,
+                {
+                    "tool": "comb", "strokeId": 1, "newStroke": idx == 0,
+                    "nx": 0.50, "ny": ny,
+                    "prevNx": 0.50, "prevNy": ny_steps[max(0, idx - 1)],
+                    "radius": 0.45, "strength": 1.0,
+                },
+                cam,
+            )
+        after = np.asarray(curves.GetPointsAttr().Get(), dtype=np.float32).reshape(n_strands, n_verts, 3)
+        after_rough = _direction_roughness(after)
+        self.assertLess(after_rough, before_rough * 0.55)
+        # Roots stay pinned and segment lengths stay preserved
+        self.assertLess(float(np.max(np.linalg.norm(after[:, 0] - pts[:, 0], axis=1))), 1e-4)
+        after_seg_lens = np.linalg.norm(after[:, 1:] - after[:, :-1], axis=2)
+        self.assertLessEqual(float(np.max(after_seg_lens / np.maximum(rest_seg_lens, 1e-6))), 1.05)
+        # Segments align downward (-Y) along the drag path (much higher than initial zig-zag ~0.38)
+        before_segs = pts[:, 1:] - pts[:, :-1]
+        before_dirs = before_segs / np.maximum(np.linalg.norm(before_segs, axis=2, keepdims=True), 1e-6)
+        before_align = float(np.mean(before_dirs[:, :, 1] * -1.0))
+        after_segs = after[:, 1:] - after[:, :-1]
+        after_dirs = after_segs / np.maximum(np.linalg.norm(after_segs, axis=2, keepdims=True), 1e-6)
+        after_align = float(np.mean(after_dirs[:, :, 1] * -1.0))
+        self.assertGreater(after_align, before_align + 0.25)
+
+        # 2) Guide-mode (1,100 tangled strands) with a spherical scalp collider
+        hair_sim.reset_hair_sessions()
+        stage2 = Usd.Stage.CreateInMemory()
+        UsdGeom.SetStageUpAxis(stage2, UsdGeom.Tokens.y)
+        UsdGeom.SetStageMetersPerUnit(stage2, 1.0)
+        UsdGeom.Xform.Define(stage2, "/Scene")
+        # Simple icosphere/octahedron-like scalp collider centered at (0, 0.2, -0.35), r=0.16
+        sphere = UsdGeom.Sphere.Define(stage2, "/Scene/Scalp")
+        sphere.CreateRadiusAttr().Set(0.16)
+        UsdGeom.Xformable(sphere).AddTranslateOp().Set((0.0, 0.2, -0.35))
+
+        n_strands2, n_verts2 = 1100, 10
+        rng = np.random.default_rng(13)
+        roots2 = np.stack([
+            rng.uniform(-0.14, 0.14, n_strands2).astype(np.float32),
+            rng.uniform(0.30, 0.42, n_strands2).astype(np.float32),
+            rng.uniform(-0.08, 0.08, n_strands2).astype(np.float32),
+        ], axis=1)
+        pts2 = np.zeros((n_strands2, n_verts2, 3), dtype=np.float32)
+        pts2[:, 0] = roots2
+        for j in range(1, n_verts2):
+            sign = 1.0 if (j % 2 == 1) else -1.0
+            pts2[:, j, 0] = roots2[:, 0] + sign * 0.035
+            pts2[:, j, 1] = roots2[:, 1] - 0.04 * j
+            pts2[:, j, 2] = roots2[:, 2] + sign * 0.02
+        curves2 = UsdGeom.BasisCurves.Define(stage2, "/Scene/Hair")
+        curves2.CreateTypeAttr().Set(UsdGeom.Tokens.linear)
+        curves2.CreateCurveVertexCountsAttr().Set(Vt.IntArray([n_verts2] * n_strands2))
+        curves2.CreatePointsAttr().Set(Vt.Vec3fArray.FromNumpy(pts2.reshape(-1, 3)))
+
+        before_rough2 = _direction_roughness(pts2)
+        diag = {"totalStrands": 0, "guideStrands": 0, "fullSolveStrands": 0}
+        for idx, ny in enumerate(ny_steps):
+            diag = {"totalStrands": 0, "guideStrands": 0, "fullSolveStrands": 0}
+            hair_sim.step_hair_brush(
+                stage2, cfg, _hair_query_matches,
+                {
+                    "tool": "comb", "strokeId": 2, "newStroke": idx == 0,
+                    "nx": 0.50, "ny": ny,
+                    "prevNx": 0.50, "prevNy": ny_steps[max(0, idx - 1)],
+                    "radius": 0.45, "strength": 1.0,
+                },
+                cam,
+                diagnostics=diag,
+            )
+        self.assertGreater(diag.get("guideStrands", 0), 0)
+        after2 = np.asarray(curves2.GetPointsAttr().Get(), dtype=np.float32).reshape(n_strands2, n_verts2, 3)
+        after_rough2 = _direction_roughness(after2)
+        self.assertLess(after_rough2, before_rough2 * 0.70)
+
+    def test_draw_lock_hair_creation_over_3d_object_and_empty_space(self):
+        import numpy as np
+        from pxr import Usd, UsdGeom, Vt
+        import hair_sim
+        from usd_graph import _hair_query_matches
+
+        self.addCleanup(hair_sim.reset_hair_sessions)
+        hair_sim.reset_hair_sessions()
+
+        def _make_mesh_only_stage():
+            st = Usd.Stage.CreateInMemory()
+            UsdGeom.SetStageUpAxis(st, UsdGeom.Tokens.y)
+            UsdGeom.SetStageMetersPerUnit(st, 1.0)
+            UsdGeom.Xform.Define(st, "/Scene")
+            # Triangulated UV sphere centered at (0, 0, 0), radius 0.25
+            mesh = UsdGeom.Mesh.Define(st, "/Scene/Head")
+            n_lat, n_lon = 16, 24
+            r = 0.25
+            verts = []
+            for i in range(n_lat + 1):
+                theta = np.pi * i / n_lat
+                for j in range(n_lon):
+                    phi = 2.0 * np.pi * j / n_lon
+                    verts.append((
+                        float(r * np.sin(theta) * np.cos(phi)),
+                        float(r * np.cos(theta)),
+                        float(r * np.sin(theta) * np.sin(phi)),
+                    ))
+            faces = []
+            counts = []
+            for i in range(n_lat):
+                for j in range(n_lon):
+                    jn = (j + 1) % n_lon
+                    v00 = i * n_lon + j
+                    v01 = i * n_lon + jn
+                    v10 = (i + 1) * n_lon + j
+                    v11 = (i + 1) * n_lon + jn
+                    faces.extend([v00, v11, v10, v00, v01, v11])
+                    counts.extend([3, 3])
+            mesh.CreatePointsAttr().Set(Vt.Vec3fArray(verts))
+            mesh.CreateFaceVertexCountsAttr().Set(Vt.IntArray(counts))
+            mesh.CreateFaceVertexIndicesAttr().Set(Vt.IntArray(faces))
+            return st
+
+        stage = _make_mesh_only_stage()
+        cfg = {
+            "simEnabled": True,
+            "simMode": "static",
+            "gravity": 0.0,
+            "stiffness": 0.95,
+            "bendStiffness": 0.4,
+            "collisionMargin": 0.004,
+        }
+        cam = {
+            "origin": (0.0, 0.0, 1.2), "forward": (0.0, 0.0, -1.0),
+            "right": (1.0, 0.0, 0.0), "up": (0.0, 1.0, 0.0),
+            "tan_half_fov": 0.4142, "aspect": 1.3333,
+        }
+
+        # 1) Dragging in empty space (far left corner) must NOT create hair
+        empty_curve = [[0.04, 0.10], [0.06, 0.18], [0.08, 0.26]]
+        res_empty = hair_sim.step_hair_brush(
+            stage, cfg, _hair_query_matches,
+            {
+                "tool": "drawLock", "strokeId": 1, "newStroke": True,
+                "nx": 0.08, "ny": 0.26, "prevNx": 0.04, "prevNy": 0.10,
+                "radius": 0.04, "strength": 1.0, "drawCurve": empty_curve,
+            },
+            cam,
+        )
+        self.assertEqual(res_empty, [])
+        self.assertFalse(stage.GetPrimAtPath("/Scene/CreatedHair").IsValid())
+
+        # 2) Dragging across the 3D head mesh creates a multi-strand lock along the curve
+        head_curve = [[0.48, 0.34], [0.50, 0.42], [0.52, 0.50], [0.54, 0.58], [0.55, 0.64]]
+        res_hit = hair_sim.step_hair_brush(
+            stage, cfg, _hair_query_matches,
+            {
+                "tool": "drawLock", "strokeId": 2, "newStroke": True,
+                "nx": 0.55, "ny": 0.64, "prevNx": 0.48, "prevNy": 0.34,
+                "radius": 0.04, "strength": 1.0, "drawCurve": head_curve,
+            },
+            cam,
+        )
+        self.assertEqual(len(res_hit), 1)
+        prim = stage.GetPrimAtPath("/Scene/CreatedHair")
+        self.assertTrue(prim.IsValid())
+        curves = UsdGeom.BasisCurves(prim)
+        c1 = np.asarray(curves.GetCurveVertexCountsAttr().Get(), dtype=np.int32)
+        p1 = np.asarray(curves.GetPointsAttr().Get(), dtype=np.float32).reshape(len(c1), int(c1[0]), 3)
+        self.assertGreaterEqual(len(c1), 16)
+        # Lock flows downward from top of head drag (+Y) to lower (-Y)
+        self.assertGreater(float(np.mean(p1[:, 0, 1])), float(np.mean(p1[:, -1, 1])) + 0.12)
+        # Non-root vertices stay outside the sphere collider (r=0.25)
+        radii = np.linalg.norm(p1[:, 1:, :], axis=2)
+        self.assertGreaterEqual(float(np.min(radii)), 0.245)
+
+        # 3) Persisting via groomDeltas restores /Scene/CreatedHair on a fresh mesh-only stage
+        deltas = hair_sim.export_session_groom_deltas(stage, cfg, _hair_query_matches)
+        self.assertIn("/Scene/CreatedHair", deltas)
+        hair_sim.reset_hair_sessions()
+        stage_reloaded = _make_mesh_only_stage()
+        hair_sim.apply_hair_simulation(stage_reloaded, {**cfg, "groomDeltas": deltas}, _hair_query_matches)
+        prim_reloaded = stage_reloaded.GetPrimAtPath("/Scene/CreatedHair")
+        self.assertTrue(prim_reloaded.IsValid())
+        c_rel = np.asarray(UsdGeom.BasisCurves(prim_reloaded).GetCurveVertexCountsAttr().Get(), dtype=np.int32)
+        self.assertEqual(len(c_rel), len(c1))
+
+        # 4) Drawing a second lock appends cleanly to the existing hair prim
+        head_curve2 = [[0.44, 0.36], [0.43, 0.46], [0.42, 0.56], [0.41, 0.62]]
+        hair_sim.step_hair_brush(
+            stage_reloaded, {**cfg, "groomDeltas": deltas}, _hair_query_matches,
+            {
+                "tool": "drawLock", "strokeId": 3, "newStroke": True,
+                "nx": 0.41, "ny": 0.62, "prevNx": 0.44, "prevNy": 0.36,
+                "radius": 0.04, "strength": 1.0, "drawCurve": head_curve2,
+            },
+            cam,
+        )
+        c2 = np.asarray(UsdGeom.BasisCurves(prim_reloaded).GetCurveVertexCountsAttr().Get(), dtype=np.int32)
+        self.assertEqual(len(c2), len(c1) * 2)
+
+        # 4b) Immediately styling the newly drawn lock with Comb moves the strands
+        before_comb = np.asarray(UsdGeom.BasisCurves(prim_reloaded).GetPointsAttr().Get(), dtype=np.float32).copy()
+        for idx, nx in enumerate((0.50, 0.54, 0.58)):
+            hair_sim.step_hair_brush(
+                stage_reloaded, {**cfg, "groomDeltas": deltas}, _hair_query_matches,
+                {
+                    "tool": "comb", "strokeId": 10, "newStroke": idx == 0,
+                    "nx": nx, "ny": 0.50, "prevNx": 0.50 if idx == 0 else nx - 0.04, "prevNy": 0.50,
+                    "radius": 0.08, "strength": 1.0,
+                },
+                cam,
+            )
+        after_comb = np.asarray(UsdGeom.BasisCurves(prim_reloaded).GetPointsAttr().Get(), dtype=np.float32)
+        self.assertGreater(float(np.max(np.linalg.norm(after_comb - before_comb, axis=1))), 0.005)
+
+        # 5) Also works when the 3D object is an instanceable USD reference (like Source nodes)
+        hair_sim.reset_hair_sessions()
+        proto_stage = _make_mesh_only_stage()
+        inst_stage = Usd.Stage.CreateInMemory()
+        UsdGeom.SetStageUpAxis(inst_stage, UsdGeom.Tokens.y)
+        UsdGeom.SetStageMetersPerUnit(inst_stage, 1.0)
+        UsdGeom.Xform.Define(inst_stage, "/Scene")
+        ref_prim = inst_stage.DefinePrim("/Scene/HeadInstance")
+        ref_prim.GetReferences().AddReference(proto_stage.GetRootLayer().identifier, "/Scene/Head")
+        ref_prim.SetInstanceable(True)
+        res_inst = hair_sim.step_hair_brush(
+            inst_stage, cfg, _hair_query_matches,
+            {
+                "tool": "drawLock", "strokeId": 4, "newStroke": True,
+                "nx": 0.55, "ny": 0.64, "prevNx": 0.48, "prevNy": 0.34,
+                "radius": 0.04, "strength": 1.0, "drawCurve": head_curve,
+            },
+            cam,
+        )
+        self.assertEqual(len(res_inst), 1)
+        self.assertTrue(inst_stage.GetPrimAtPath("/Scene/CreatedHair").IsValid())
+
+    def test_all_brushes_prevent_collider_penetration(self):
+        """Every grooming brush (including with default colliderQuery='__none__') must not push strands through 3D scene meshes."""
+        import numpy as np
+        from pxr import Gf, Usd, UsdGeom, Vt
+        import hair_sim
+        from usd_graph import _hair_query_matches, apply_hair
+
+        self.addCleanup(hair_sim.reset_hair_sessions)
+
+        radius = 0.25
+
+        def _make_head_and_hair_stage():
+            stage = Usd.Stage.CreateInMemory()
+            UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.y)
+            UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+            UsdGeom.Xform.Define(stage, "/Scene")
+
+            # UV sphere head mesh centered at origin, radius = 0.25
+            n_lat, n_lon = 16, 24
+            m_pts = []
+            for i in range(n_lat + 1):
+                phi = np.pi * i / n_lat
+                for j in range(n_lon):
+                    theta = 2.0 * np.pi * j / n_lon
+                    m_pts.append(Gf.Vec3f(
+                        float(radius * np.sin(phi) * np.cos(theta)),
+                        float(radius * np.cos(phi)),
+                        float(radius * np.sin(phi) * np.sin(theta)),
+                    ))
+            fvc, fvi = [], []
+            for i in range(n_lat):
+                for j in range(n_lon):
+                    jn = (j + 1) % n_lon
+                    a = i * n_lon + j
+                    b = i * n_lon + jn
+                    c = (i + 1) * n_lon + jn
+                    d = (i + 1) * n_lon + j
+                    fvc.append(4)
+                    fvi.extend([a, b, c, d])
+            head = UsdGeom.Mesh.Define(stage, "/Scene/Head")
+            head.CreatePointsAttr().Set(Vt.Vec3fArray(m_pts))
+            head.CreateFaceVertexCountsAttr().Set(Vt.IntArray(fvc))
+            head.CreateFaceVertexIndicesAttr().Set(Vt.IntArray(fvi))
+
+            # Strands wrapping closely around the front (+Z) of the sphere
+            pts = []
+            counts = []
+            for s in range(6):
+                x0 = -0.05 + 0.02 * s
+                for k in range(12):
+                    ang = -0.7 + 1.4 * (k / 11.0)
+                    r = radius + 0.015
+                    pts.append(Gf.Vec3f(
+                        float(x0),
+                        float(r * np.sin(ang)),
+                        float(r * np.cos(ang)),
+                    ))
+                counts.append(12)
+            curves = UsdGeom.BasisCurves.Define(stage, "/Scene/Hair")
+            curves.CreateTypeAttr().Set(UsdGeom.Tokens.linear)
+            curves.CreateCurveVertexCountsAttr().Set(Vt.IntArray(counts))
+            curves.CreatePointsAttr().Set(Vt.Vec3fArray(pts))
+            curves.CreateWidthsAttr().Set(Vt.FloatArray([0.002] * len(pts)))
+            return stage, curves
+
+        cfg = {
+            "simEnabled": True,
+            "simMode": "static",
+            "settleSteps": 1,
+            "gravity": 0.0,
+            "colliderQuery": "__none__",
+            "collisionMargin": 0.005,
+        }
+        cam = {
+            "origin": (0.0, 0.0, 1.2),
+            "forward": (0.0, 0.0, -1.0),
+            "right": (1.0, 0.0, 0.0),
+            "up": (0.0, 1.0, 0.0),
+            "tan_half_fov": 0.4142,
+            "aspect": 1.0,
+        }
+
+        # 1. smoothAll
+        hair_sim.reset_hair_sessions()
+        stage, curves = _make_head_and_hair_stage()
+        apply_hair(stage, cfg)
+        roots_before = np.asarray(curves.GetPointsAttr().Get(), dtype=np.float32)[::12].copy()
+        for _ in range(4):
+            hair_sim.step_hair_brush(
+                stage, cfg, _hair_query_matches,
+                {"tool": "smooth", "smoothAll": True, "strength": 1.0, "commitUsd": True},
+                cam,
+            )
+        pts_np = np.asarray(curves.GetPointsAttr().Get(), dtype=np.float32)
+        min_r = float(np.min(np.linalg.norm(pts_np, axis=1)))
+        self.assertGreaterEqual(min_r, radius - 0.002, f"smoothAll penetrated sphere: min_r={min_r}")
+        self.assertLess(float(np.max(np.linalg.norm(pts_np[::12] - roots_before, axis=1))), 1e-5, "smoothAll detached roots")
+
+        # 2. Interactive brushes dragged directly across the curved sphere surface
+        for idx, tool in enumerate(("comb", "surfaceComb", "grab", "smooth", "clump", "part", "puff", "physics", "lengthen"), start=1):
+            with self.subTest(tool=tool):
+                hair_sim.reset_hair_sessions()
+                stage, curves = _make_head_and_hair_stage()
+                apply_hair(stage, cfg)
+                roots_before = np.asarray(curves.GetPointsAttr().Get(), dtype=np.float32)[::12].copy()
+                for step in range(4):
+                    nx = 0.50 + 0.06 * step
+                    prev_nx = 0.50 + 0.06 * max(0, step - 1)
+                    ny = 0.50 + 0.04 * step
+                    prev_ny = 0.50 + 0.04 * max(0, step - 1)
+                    hair_sim.step_hair_brush(
+                        stage, cfg, _hair_query_matches,
+                        {
+                            "tool": tool, "strokeId": idx, "newStroke": step == 0,
+                            "nx": nx, "ny": ny, "prevNx": prev_nx, "prevNy": prev_ny,
+                            "radius": 0.20, "strength": 1.0, "commitUsd": step == 3,
+                        },
+                        cam,
+                    )
+                pts_np = np.asarray(curves.GetPointsAttr().Get(), dtype=np.float32)
+                min_r = float(np.min(np.linalg.norm(pts_np, axis=1)))
+                self.assertGreaterEqual(min_r, radius - 0.002, f"{tool} penetrated sphere: min_r={min_r}")
+                self.assertLess(float(np.max(np.linalg.norm(pts_np[::12] - roots_before, axis=1))), 1e-5, f"{tool} detached roots")
+
 
 if __name__ == "__main__":
     unittest.main()

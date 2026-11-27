@@ -487,6 +487,171 @@ async fn open_native_project(
     .map_err(|e| e.to_string())?
 }
 #[tauri::command]
+async fn md_bridge_status() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let base = std::env::var_os("LOCALAPPDATA")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let bridge_dir = base.join("Sublayer").join("md_bridge");
+        let manifest_path = bridge_dir.join("manifest.json");
+        let handoff_manifest_path = bridge_dir.join("handoff_manifest.json");
+        let scripts_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .map(|p| p.join("scripts").join("md_bridge"));
+        let script_path = scripts_root
+            .as_ref()
+            .map(|p| p.join("sublayer_send_garment.py"))
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from("scripts/md_bridge/sublayer_send_garment.py")
+            });
+        let pull_script_path = scripts_root
+            .as_ref()
+            .map(|p| p.join("sublayer_pull_avatar.py"))
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from("scripts/md_bridge/sublayer_pull_avatar.py")
+            });
+
+        let mut available = false;
+        let mut project_path = String::new();
+        let mut project_name = "Untitled".to_string();
+        let mut export_path = String::new();
+        let mut exported_at = 0u64;
+        if let Ok(raw) = std::fs::read_to_string(&manifest_path) {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw) {
+                export_path = parsed
+                    .get("exportPath")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                available = !export_path.is_empty() && std::path::Path::new(&export_path).is_file();
+                project_path = parsed
+                    .get("projectPath")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                project_name = parsed
+                    .get("projectName")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Untitled")
+                    .to_string();
+                exported_at = parsed
+                    .get("exportedAt")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+            }
+        }
+
+        if !available {
+            if let Ok(entries) = std::fs::read_dir(&bridge_dir) {
+                let mut newest: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if !path.is_file() {
+                        continue;
+                    }
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    if name == "garment.obj" || name.ends_with("_garment.obj") {
+                        if let Ok(meta) = entry.metadata() {
+                            if let Ok(modified) = meta.modified() {
+                                if newest.as_ref().is_none_or(|(prev, _)| modified > *prev) {
+                                    newest = Some((modified, path));
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some((modified, path)) = newest {
+                    available = true;
+                    export_path = path.to_string_lossy().into_owned();
+                    exported_at = modified
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                }
+            }
+        }
+
+        let mut handoff_available = false;
+        let mut handoff_path = String::new();
+        let mut handoff_exported_at = 0u64;
+        if let Ok(raw) = std::fs::read_to_string(&handoff_manifest_path) {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw) {
+                handoff_path = parsed
+                    .get("handoffPath")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                handoff_available =
+                    !handoff_path.is_empty() && std::path::Path::new(&handoff_path).is_file();
+                handoff_exported_at = parsed
+                    .get("exportedAt")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+            }
+        }
+
+        Ok(serde_json::json!({
+            "available": available,
+            "bridgeDir": bridge_dir,
+            "scriptPath": script_path,
+            "pullScriptPath": pull_script_path,
+            "projectPath": project_path,
+            "projectName": project_name,
+            "exportPath": export_path,
+            "exportedAt": exported_at,
+            "handoffAvailable": handoff_available,
+            "handoffPath": handoff_path,
+            "handoffExportedAt": handoff_exported_at,
+        }))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+#[tauri::command]
+async fn send_to_md_bridge(
+    app: tauri::AppHandle,
+    service: tauri::State<'_, std::sync::Arc<usd::UsdService>>,
+    project: Project,
+    node_id: String,
+    base_name: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let config = catalog_path(&app)?;
+    let service = service.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        project.validate()?;
+        let node = project
+            .nodes
+            .iter()
+            .find(|n| n.id == node_id)
+            .ok_or("Application node no longer exists")?;
+        let catalog = application_profiles::load(&config)?;
+        let policy = catalog.policy(&node.data)?;
+        let up_axis = if node.data.axis == "preserve" {
+            policy.profile.up_axis.clone()
+        } else {
+            node.data.axis.clone()
+        };
+        let meters_per_unit = node
+            .data
+            .application_meters_per_unit
+            .unwrap_or(policy.profile.meters_per_unit);
+        let scale = node.data.scale * policy.profile.scale;
+        let graph = application::evaluation_graph(&project, &node_id, true)?;
+        let req = serde_json::json!({
+            "operation": "export_md_bridge_handoff",
+            "graph": graph,
+            "upAxis": up_axis,
+            "metersPerUnit": meters_per_unit,
+            "scale": scale,
+            "selection": node.data.handoff_selection,
+            "baseName": base_name.unwrap_or_else(|| node.data.label.clone()),
+        });
+        service.request(req)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+#[tauri::command]
 async fn save_project(path: String, project: Project) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || project::save(&path, &project))
         .await
@@ -661,6 +826,160 @@ fn get_window_hwnd(window: tauri::WebviewWindow) -> Result<isize, String> {
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
+struct MetahumanCompanionResult {
+    role: Option<String>,
+    companion_path: Option<String>,
+}
+
+fn find_dna_case_insensitive(dir: &std::path::Path, target_lower: &str) -> Option<String> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_file() {
+            if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                if name.to_ascii_lowercase() == target_lower {
+                    return Some(p.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn find_unique_dna_in_dir(dir: &std::path::Path) -> Option<String> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut found = None;
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_file() {
+            if p.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("dna"))
+                .unwrap_or(false)
+            {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(p.to_string_lossy().to_string());
+            }
+        }
+    }
+    found
+}
+
+#[tauri::command]
+fn find_metahuman_companion_dna(path: String) -> MetahumanCompanionResult {
+    let p = std::path::Path::new(path.trim());
+    let Some(parent) = p.parent() else {
+        return MetahumanCompanionResult {
+            role: None,
+            companion_path: None,
+        };
+    };
+    let stem = p
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string();
+    let stem_lower = stem.to_ascii_lowercase();
+    let parent_lower = parent
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    let is_head = stem_lower == "head"
+        || stem_lower == "face"
+        || stem_lower.contains("head")
+        || stem_lower.contains("face")
+        || (!stem_lower.contains("body") && (parent_lower == "head" || parent_lower == "face"));
+    let is_body =
+        !is_head && (stem_lower == "body" || stem_lower.contains("body") || parent_lower == "body");
+
+    if !is_head && !is_body {
+        return MetahumanCompanionResult {
+            role: None,
+            companion_path: None,
+        };
+    }
+
+    let role = if is_head { "head" } else { "body" };
+    let mut candidates: Vec<String> = Vec::new();
+    if is_head {
+        if stem_lower.contains("head") {
+            candidates.push(format!("{}.dna", stem_lower.replacen("head", "body", 1)));
+        }
+        if stem_lower.contains("face") {
+            candidates.push(format!("{}.dna", stem_lower.replacen("face", "body", 1)));
+        }
+        candidates.push("body.dna".to_string());
+    } else {
+        if stem_lower.contains("body") {
+            candidates.push(format!("{}.dna", stem_lower.replacen("body", "head", 1)));
+            candidates.push(format!("{}.dna", stem_lower.replacen("body", "face", 1)));
+        }
+        candidates.push("head.dna".to_string());
+        candidates.push("face.dna".to_string());
+    }
+
+    // 1. Check same directory
+    for cand in &candidates {
+        if let Some(found) = find_dna_case_insensitive(parent, cand) {
+            if !found.eq_ignore_ascii_case(path.trim()) {
+                return MetahumanCompanionResult {
+                    role: Some(role.to_string()),
+                    companion_path: Some(found),
+                };
+            }
+        }
+    }
+
+    // 2. Check sibling folder (e.g. ../Body/body.dna <-> ../Head/head.dna or ../Face/head.dna)
+    if let Some(grandparent) = parent.parent() {
+        let sibling_dirs: &[&str] = if is_head {
+            &["body"]
+        } else {
+            &["head", "face"]
+        };
+        if let Ok(entries) = std::fs::read_dir(grandparent) {
+            for entry in entries.flatten() {
+                let sp = entry.path();
+                if !sp.is_dir() {
+                    continue;
+                }
+                let sname = sp
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if sibling_dirs.contains(&sname.as_str()) {
+                    for cand in &candidates {
+                        if let Some(found) = find_dna_case_insensitive(&sp, cand) {
+                            return MetahumanCompanionResult {
+                                role: Some(role.to_string()),
+                                companion_path: Some(found),
+                            };
+                        }
+                    }
+                    if let Some(found) = find_unique_dna_in_dir(&sp) {
+                        return MetahumanCompanionResult {
+                            role: Some(role.to_string()),
+                            companion_path: Some(found),
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    MetahumanCompanionResult {
+        role: Some(role.to_string()),
+        companion_path: None,
+    }
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 struct StartupLaunchOptions {
     open_last_project: bool,
     project_path: Option<String>,
@@ -754,6 +1073,8 @@ pub fn run() {
             create_handoff,
             reuse_handoff,
             open_native_project,
+            md_bridge_status,
+            send_to_md_bridge,
             save_project,
             load_project,
             find_dependency,
@@ -765,7 +1086,8 @@ pub fn run() {
             open_hair_groom_window,
             close_hair_groom_window,
             get_window_hwnd,
-            startup_launch_options
+            startup_launch_options,
+            find_metahuman_companion_dna
         ])
         .build(tauri::generate_context!())
         .expect("error while building OrchFlow")

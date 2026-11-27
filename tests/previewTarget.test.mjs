@@ -33,3 +33,10 @@ test("handoff and publication preview use distinct artifacts without changing gr
   assert.equal(published.nodes[0].publishedDependencyId,"output");
   assert.equal(p.nodes[0].data.publishedDependencyId,"output");
 });
+
+test("empty MetaHuman shows DNA guidance without submitting a render", () => {
+ const p={version:2,nodes:[{id:"dna",data:{label:"MetaHuman",operation:"metahuman"}}],edges:[],dependencies:[]};
+ const target=previewTarget(p,"dna");
+ assert.equal(target.graph,undefined);
+ assert.match(target.title,/DNA/);
+});

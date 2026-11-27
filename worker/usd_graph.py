@@ -34,12 +34,14 @@ _MULTI_ROOT_CACHE = {}
 _MAX_MULTI_ROOT_CACHE = 16
 _NODE_RESULT_CACHE = {}
 _MAX_NODE_RESULT_CACHE = 32
+_STAGE_TRAITS_CACHE = {}
 
 
 def clear_graph_caches():
     _SOURCE_STAGE_CACHE.clear()
     _MULTI_ROOT_CACHE.clear()
     _NODE_RESULT_CACHE.clear()
+    _STAGE_TRAITS_CACHE.clear()
     _BLENDER_FULL_LAYER_CACHE.clear()
     _BLENDER_STAGE_CACHE.clear()
 
@@ -459,10 +461,42 @@ def override_stage(upstream, rules, files, keepalive, cache):
     return result
 
 
-def has_skeleton(stage):
+def _stage_traits(stage):
     from pxr import Usd, UsdSkel
-    return any(p.IsA(UsdSkel.Root) or p.IsA(UsdSkel.Skeleton)
-               for p in stage.Traverse(Usd.TraverseInstanceProxies()))
+    key = stage.GetRootLayer().identifier
+    cached = _STAGE_TRAITS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    skel = False
+    inst = bool(stage.GetPrototypes())
+    for p in stage.Traverse():
+        if not inst and (p.IsInstanceable() or p.IsInstance()):
+            inst = True
+        if not skel and (p.IsA(UsdSkel.Root) or p.IsA(UsdSkel.Skeleton)):
+            skel = True
+        if inst and skel:
+            break
+    if not skel:
+        for proto in stage.GetPrototypes():
+            for p in Usd.PrimRange(proto):
+                if p.IsA(UsdSkel.Root) or p.IsA(UsdSkel.Skeleton):
+                    skel = True
+                    break
+            if skel:
+                break
+    if len(_STAGE_TRAITS_CACHE) >= 256:
+        _STAGE_TRAITS_CACHE.clear()
+    res = (skel, inst)
+    _STAGE_TRAITS_CACHE[key] = res
+    return res
+
+
+def has_skeleton(stage):
+    return _stage_traits(stage)[0]
+
+
+def stage_has_instances(stage):
+    return _stage_traits(stage)[1]
 
 
 def mark_reference_instanceable(prim, upstream, enable=True):
@@ -1223,7 +1257,11 @@ def _get_or_extract_full_blender_layer(blend_path, mtime, selected_objects=None,
     def _materialize_mode(raw_entry):
         raw_layer = raw_entry["raw_layer"]
         mat_bundles = raw_entry.get("mat_bundles") or {}
-        if material_mode == 'off' or not mat_bundles.get(material_mode):
+        mat_cache = raw_entry.setdefault("mat_layers", {})
+        mkey = (material_mode, bool(convert_procedurals))
+        if mkey in mat_cache:
+            layer = mat_cache[mkey]
+        elif material_mode == 'off' or not mat_bundles.get(material_mode):
             layer = raw_layer
         else:
             layer = Sdf.Layer.CreateAnonymous('blender_mtlx.usdc')
@@ -1232,6 +1270,7 @@ def _get_or_extract_full_blender_layer(blend_path, mtime, selected_objects=None,
             if extracted_materials:
                 report_status(f"Blender: Converting {len(extracted_materials)} material(s) to MaterialX...")
                 _apply_blender_materialx_to_layer(layer, extracted_materials, convert_procedurals=convert_procedurals)
+            mat_cache[mkey] = layer
         return {
             "layer": layer,
             "scene": raw_entry["scene"],
@@ -2132,7 +2171,7 @@ def _compiled_graph_cache_paths(graph, needed, lookup, files, target):
     for nid in sorted(needed):
         n = lookup[nid]
         dep_stamps.extend(_pose_dependency_stamps(n, files))
-        for key_name in ('inputDependencyId', 'publishedDependencyId', 'nativeProjectDependencyId'):
+        for key_name in ('inputDependencyId', 'publishedDependencyId', 'nativeProjectDependencyId', 'mdBridgeDependencyId'):
             did = n.get(key_name)
             if did and did in files:
                 p = files[did]
@@ -2239,7 +2278,7 @@ def _compiled_graph_cache_paths(graph, needed, lookup, files, target):
     for nid in sorted(needed):
         n = lookup[nid]
         dep_stamps.extend(_pose_dependency_stamps(n, files))
-        for key_name in ('inputDependencyId', 'publishedDependencyId', 'nativeProjectDependencyId'):
+        for key_name in ('inputDependencyId', 'publishedDependencyId', 'nativeProjectDependencyId', 'mdBridgeDependencyId'):
             did = n.get(key_name)
             if did and did in files:
                 p = files[did]
@@ -2409,12 +2448,13 @@ def open_hair_preview_stage(stage, graph):
     return preview
 
 
-def compile_graph(graph, reload=False, *, live_transforms=None, live_poses=None, mx_selections_out=None, interactive_hair=False, _disk_cache_threshold=0.35):
+def compile_graph(graph, reload=False, *, live_transforms=None, live_poses=None, live_grooms=None, mx_selections_out=None, interactive_hair=False, _disk_cache_threshold=0.35):
     import time
     from pxr import Gf, Sdf, Usd, UsdGeom, UsdUtils
     compile_start = time.perf_counter()
     if reload:
         _NODE_RESULT_CACHE.clear()
+        _STAGE_TRAITS_CACHE.clear()
     report_status("OpenUSD: Compiling scene graph...")
     if not isinstance(graph, dict):
         raise ValueError('USD graph must be an object')
@@ -2469,7 +2509,7 @@ def compile_graph(graph, reload=False, *, live_transforms=None, live_poses=None,
         needed.add(id)
         # Published application output is an existing external publication, not
         # an adapter execution. Its upstream graph is not executed again here.
-        if lookup[id]['operation'] != 'application' or lookup[id].get('liveAdjustment'):
+        if lookup[id]['operation'] != 'application' or lookup[id].get('liveAdjustment') or lookup[id].get('mdBridgeDependencyId'):
             stack.extend(edge['source'] for edge in incoming[id])
     keepalive, assets, results = [], {}, {}
     override_cache = {}
@@ -2478,7 +2518,7 @@ def compile_graph(graph, reload=False, *, live_transforms=None, live_poses=None,
         not live_hair_nodes
         and all(lookup[nid].get('loadPayloads', True) is not False for nid in needed)
         and not any(lookup[nid].get('useAsPayload') for nid in needed)
-        and not any(lookup[nid].get('operation') == 'blender' for nid in needed)
+        and not any(lookup[nid].get('operation') in ('blender', 'metahuman') for nid in needed)
         and not any(lookup[nid].get('operation') == 'application' and lookup[nid].get('liveAdjustment') for nid in needed)
     )
     graph_cache_paths = _compiled_graph_cache_paths(graph, needed, lookup, files, target) if can_disk_cache else None
@@ -2672,7 +2712,8 @@ def compile_graph(graph, reload=False, *, live_transforms=None, live_poses=None,
                 dep_stamps.append((did, np_p, mt, sz))
         in_sigs = [(edge['id'], node_hashes.get(edge['source'], edge['source'])) for edge in incoming[nid]]
         extra = graph.get('proceduralGraph') if n.get('operation') == 'materialx' else None
-        return hashlib.sha256(_json.dumps({'n': n, 'in': in_sigs, 'deps': dep_stamps, 'pg': extra}, sort_keys=True).encode('utf-8')).hexdigest()
+        cache_node = {k: v for k, v in n.items() if k != 'postFx'} if n.get('operation') == 'postfx' else n
+        return hashlib.sha256(_json.dumps({'n': cache_node, 'in': in_sigs, 'deps': dep_stamps, 'pg': extra}, sort_keys=True).encode('utf-8')).hexdigest()
 
     def _eval_node(id):
         node = lookup[id]
@@ -2687,13 +2728,56 @@ def compile_graph(graph, reload=False, *, live_transforms=None, live_poses=None,
             keepalive.extend(alive);return
         if operation == 'application':
             inputs = [(edge['id'], results[edge['source']]) for edge in incoming[id]]
+            md_dep = node.get('mdBridgeDependencyId')
+            garment_stage = None
+            if md_dep and md_dep in files:
+                md_scale = float(node.get('applicationMetersPerUnit') or 0.001)
+                garment_stage = source_stage(
+                    md_dep,
+                    instanced=False,
+                    axis='preserve',
+                    node_scale=md_scale,
+                )
+            if garment_stage is not None and len(inputs) == 1:
+                upstream = inputs[0][1]
+                overlay = Sdf.Layer.CreateAnonymous('md_bridge.usda')
+                overlay.subLayerPaths = [upstream.GetRootLayer().identifier]
+                stage = Usd.Stage.Open(overlay)
+                inherit_stage_metrics(stage, upstream)
+                default_prim = upstream.GetDefaultPrim()
+                if default_prim and default_prim.IsValid():
+                    stage.SetDefaultPrim(stage.GetPrimAtPath(default_prim.GetPath()))
+                parent_path = default_prim.GetPath() if (default_prim and default_prim.IsValid()) else Sdf.Path('/Scene')
+                garment_mount = UsdGeom.Xform.Define(stage, parent_path.AppendChild('MD_Garment'))
+                upstream_parent = upstream.GetPrimAtPath(parent_path)
+                if upstream_parent and upstream_parent.IsValid():
+                    parent_xf = UsdGeom.Xformable(upstream_parent).GetLocalTransformation()
+                    if parent_xf != Gf.Matrix4d(1):
+                        garment_mount.AddTransformOp(opSuffix='cancelParent').Set(parent_xf.GetInverse())
+                garment_prim = UsdGeom.Xform.Define(stage, garment_mount.GetPath().AppendChild('Garment')).GetPrim()
+                garment_default = garment_stage.GetDefaultPrim()
+                garment_target = garment_default.GetPath() if (garment_default and garment_default.IsValid()) else Sdf.Path('/Scene')
+                garment_prim.GetReferences().AddReference(garment_stage.GetRootLayer().identifier, garment_target)
+                results[id] = stage
+                keepalive.extend([overlay, stage, upstream, garment_stage])
+                return
+            if garment_stage is not None:
+                inputs.append((f'{id}:md_bridge', garment_stage))
             if len(inputs) == 1:
                 results[id] = inputs[0][1]
                 return
             if inputs:
-                stage, alive = combine_inputs(inputs)
+                stage, root = empty_stage()
+                stage.SetStartTimeCode(min(value.GetStartTimeCode() for _, value in inputs))
+                stage.SetEndTimeCode(max(value.GetEndTimeCode() for _, value in inputs))
+                for edge_id, upstream in inputs:
+                    name = 'Branch_' + hashlib.sha256(edge_id.encode()).hexdigest()[:16]
+                    prim = stage.OverridePrim('/Scene/' + name)
+                    prim.GetReferences().AddReference(upstream.GetRootLayer().identifier, upstream.GetDefaultPrim().GetPath())
+                    has_instances = stage_has_instances(upstream)
+                    mark_reference_instanceable(prim, upstream, enable=node.get('instanced', True) and has_instances)
                 results[id] = stage
-                keepalive.extend(alive)
+                keepalive.extend([stage, *[u for _, u in inputs]])
                 return
             raise ValueError(f'Application node {id} has no connected input or saved live adjustment.')
         inputs = [(edge['id'], results[edge['source']]) for edge in incoming[id]]
@@ -2716,6 +2800,30 @@ def compile_graph(graph, reload=False, *, live_transforms=None, live_poses=None,
                     ),
                 ),
             )
+        elif operation == 'metahuman':
+            from metahuman import apply_metahuman_materials, compose_dna_pair, load_dna
+            head_path = files.get(node.get('inputDependencyId'))
+            body_path = files.get(node.get('metahumanBodyDependencyId'))
+            if not head_path and not body_path:
+                raise ValueError('MetaHuman needs a linked Head or Body .dna file')
+            norm_head = os.path.normcase(os.path.abspath(head_path)) if head_path else None
+            norm_body = os.path.normcase(os.path.abspath(body_path)) if body_path else None
+            lod = node.get('metahumanLod', 0)
+            load_mats = bool(node.get('metahumanMaterials', True))
+            key = ('metahuman', norm_head, norm_body, lod, load_mats, node.get('axis', 'preserve'), node.get('frontAxis', 'preserve'), node.get('scale', 1.0))
+            if key not in assets:
+                if head_path and body_path:
+                    head_stage = load_dna(head_path, lod)
+                    body_stage = load_dna(body_path, lod)
+                    dna_stage = compose_dna_pair(head_stage, body_stage)
+                    keepalive.extend([head_stage, body_stage, dna_stage])
+                else:
+                    dna_stage = load_dna(head_path or body_path, lod)
+                    keepalive.append(dna_stage)
+                if load_mats:
+                    apply_metahuman_materials(dna_stage, [p for p in (head_path, body_path) if p])
+                assets[key] = wrap_source_stage(dna_stage, instanced=False, axis=node.get('axis', 'preserve'), front_axis=node.get('frontAxis', 'preserve'), node_scale=node.get('scale', 1.0))
+            inputs.insert(0, ('own-source', assets[key]))
         elif operation == 'blender':
             blend_dep = node.get('nativeProjectDependencyId')
             usd_dep = node.get('publishedDependencyId') or node.get('inputDependencyId')
@@ -2755,9 +2863,7 @@ def compile_graph(graph, reload=False, *, live_transforms=None, live_poses=None,
             raise ValueError(f'Unsupported USD graph operation: {operation}')
         if not inputs:
             raise ValueError(f'{operation.title()} node needs a linked USD file or incoming USD connection')
-        if operation == 'pose':
-            if len(inputs) != 1:
-                raise ValueError('Pose needs one upstream stage; combine inputs with Output first')
+        if operation == 'pose' and len(inputs) == 1:
             upstream = inputs[0][1]
             overlay = Sdf.Layer.CreateAnonymous('pose.usda')
             overlay.subLayerPaths = [upstream.GetRootLayer().identifier]
@@ -2770,7 +2876,7 @@ def compile_graph(graph, reload=False, *, live_transforms=None, live_poses=None,
             results[id] = stage
             return
         if operation == 'character':
-            stage, alive_char = compose_character_node(inputs, node, files=files, reload=reload, wrap_fn=wrap_source_stage)
+            stage, alive_char = compose_character_node(inputs, node, files=files, reload=reload, wrap_fn=wrap_source_stage, live_grooms=live_grooms)
             keepalive.extend(alive_char)
             results[id] = stage
             return
@@ -2788,7 +2894,12 @@ def compile_graph(graph, reload=False, *, live_transforms=None, live_poses=None,
             stage = Usd.Stage.Open(overlay)
             inherit_stage_metrics(stage, upstream)
             stage.SetDefaultPrim(stage.GetPrimAtPath(upstream.GetDefaultPrim().GetPath()))
-            apply_light_overrides(stage, node.get('lightOverrides', []))
+            apply_light_overrides(
+                stage,
+                node.get('lightOverrides', []),
+                spatial_scale=node.get('scale', 1.0),
+                intensity_scale=node.get('lightIntensityScale', 1.0),
+            )
             keepalive.extend([upstream, overlay, stage])
             results[id] = stage
             return
@@ -2857,7 +2968,7 @@ def compile_graph(graph, reload=False, *, live_transforms=None, live_poses=None,
             stage.SetDefaultPrim(stage.GetPrimAtPath(upstream.GetDefaultPrim().GetPath()))
             apply_transform(stage,node,stage.GetDefaultPrim(),live_transforms[id] if id == live_node_id else None)
             keepalive.extend([upstream,overlay,stage]);results[id]=stage;return
-        if operation in ('source', 'blender', 'assetOverride', 'output') and len(inputs) == 1:
+        if operation in ('source', 'blender', 'metahuman', 'assetOverride', 'output') and len(inputs) == 1:
             results[id] = inputs[0][1]
             return
         if operation == 'group':
@@ -2877,7 +2988,7 @@ def compile_graph(graph, reload=False, *, live_transforms=None, live_poses=None,
                 default_prim = upstream.GetDefaultPrim()
                 target_path = default_prim.GetPath() if (default_prim and default_prim.IsValid()) else Sdf.Path('/Scene')
                 child_prim.GetReferences().AddReference(upstream.GetRootLayer().identifier, target_path)
-                has_instances = any(p.IsInstanceable() or p.IsInstance() for p in upstream.Traverse())
+                has_instances = stage_has_instances(upstream)
                 mark_reference_instanceable(child_prim, upstream, enable=node.get('instanced', True) and has_instances)
             apply_transform(stage, node, group_xform.GetPrim(), live_transforms[id] if id == live_node_id else None)
             keepalive.append(stage)
@@ -2907,7 +3018,7 @@ def compile_graph(graph, reload=False, *, live_transforms=None, live_poses=None,
                         name = 'Branch_' + hashlib.sha256(edge_id.encode()).hexdigest()[:16]
                         prim = stage.OverridePrim('/Scene/' + name)
                         prim.GetReferences().AddReference(upstream.GetRootLayer().identifier, upstream.GetDefaultPrim().GetPath())
-                        has_instances = any(p.IsInstanceable() or p.IsInstance() for p in upstream.Traverse())
+                        has_instances = stage_has_instances(upstream)
                         mark_reference_instanceable(prim, upstream, enable=node.get('instanced', True) and has_instances)
                 keepalive.append(stage)
             apply_scatter(stage, node, inputs)
@@ -2921,7 +3032,7 @@ def compile_graph(graph, reload=False, *, live_transforms=None, live_poses=None,
             prim.GetReferences().AddReference(upstream.GetRootLayer().identifier, upstream.GetDefaultPrim().GetPath())
             # Transform ops live on the enclosing Scene prim. Descendants remain
             # read-only instance proxies unless upstream has uninstanced prims or node disabled instancing.
-            has_instances = any(p.IsInstanceable() or p.IsInstance() for p in upstream.Traverse())
+            has_instances = stage_has_instances(upstream)
             mark_reference_instanceable(prim, upstream, enable=node.get('instanced', True) and has_instances)
         if operation == 'transform':
             apply_transform(stage,node,root,live_transforms[id] if id == live_node_id else None)
@@ -2931,10 +3042,13 @@ def compile_graph(graph, reload=False, *, live_transforms=None, live_poses=None,
             author_materialx_rules(stage,node,files,procedural_graph=graph.get('proceduralGraph'),selected_out=sel_out)
             if mx_selections_out is not None and node.get('materialXRules') is not None:
                 mx_selections_out[id] = sel_out
-        if operation == 'light':apply_light_overrides(stage,node.get('lightOverrides',[]))
+        if operation == 'light':apply_light_overrides(stage,node.get('lightOverrides',[]),spatial_scale=node.get('scale',1.0),intensity_scale=node.get('lightIntensityScale',1.0))
         if operation == 'hdri':apply_hdri(stage,node.get('hdri'),files)
         if operation == 'hair':apply_hair(stage,node.get('hair'))
         if operation == 'cache_edit':apply_cache_edit(stage,node.get('cacheEdit'))
+        if operation == 'pose':
+            from pose_node import apply_pose
+            apply_pose(stage, node, files, keepalive, reload, live_poses=live_poses)
         results[id] = stage
 
     for id in order:
@@ -2948,6 +3062,7 @@ def compile_graph(graph, reload=False, *, live_transforms=None, live_poses=None,
             and id not in live_hair_nodes
             and op not in ('application', 'assetOverride', 'light', 'hdri')
             and not (live_poses is not None and op == 'pose')
+            and not (live_grooms is not None and op == 'character')
             and not skip_sim_active
             and not (mx_selections_out is not None and node.get('materialXRules') is not None)
         )
@@ -3036,7 +3151,17 @@ def _filter_min_spacing(positions, normals, min_spacing, max_count):
     return positions[idx_arr], (normals[idx_arr] if normals is not None else None)
 
 
-def _sample_surface_points(surface_stages, surface_prim_path, max_slope_deg, up_vec, sample_count, rng):
+def _sample_surface_points(
+    surface_stages,
+    surface_prim_path,
+    min_slope_deg,
+    max_slope_deg,
+    up_vec,
+    sample_count,
+    rng,
+    height_min=None,
+    height_max=None,
+):
     import numpy as np
     from pxr import Sdf, Usd, UsdGeom
 
@@ -3127,15 +3252,24 @@ def _sample_surface_points(surface_stages, surface_prim_path, max_slope_deg, up_
 
     cos_angle = np.clip(normals @ up_vec, -1.0, 1.0)
     slope_deg = np.degrees(np.arccos(cos_angle))
-    slope_mask = slope_deg <= max_slope_deg
-    if not np.any(slope_mask):
+    tri_mask = (slope_deg >= min_slope_deg) & (slope_deg <= max_slope_deg)
+
+    up_idx = 2 if up_vec[2] > 0.5 else 1
+    if height_min is not None:
+        tri_max_h = np.maximum(np.maximum(v0[:, up_idx], v1[:, up_idx]), v2[:, up_idx])
+        tri_mask &= tri_max_h >= height_min
+    if height_max is not None:
+        tri_min_h = np.minimum(np.minimum(v0[:, up_idx], v1[:, up_idx]), v2[:, up_idx])
+        tri_mask &= tri_min_h <= height_max
+
+    if not np.any(tri_mask):
         return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.float32)
 
-    v0 = v0[slope_mask]
-    v1 = v1[slope_mask]
-    v2 = v2[slope_mask]
-    normals = normals[slope_mask]
-    weights = area2[slope_mask]
+    v0 = v0[tri_mask]
+    v1 = v1[tri_mask]
+    v2 = v2[tri_mask]
+    normals = normals[tri_mask]
+    weights = area2[tri_mask]
 
     cdf = np.cumsum(weights)
     cdf /= cdf[-1]
@@ -3151,6 +3285,16 @@ def _sample_surface_points(surface_stages, surface_prim_path, max_slope_deg, up_
 
     pos = (b0 * v0[tri_idx] + b1 * v1[tri_idx] + b2 * v2[tri_idx]).astype(np.float32)
     nrm = normals[tri_idx].astype(np.float32)
+
+    if height_min is not None or height_max is not None:
+        pt_mask = np.ones(len(pos), dtype=bool)
+        if height_min is not None:
+            pt_mask &= pos[:, up_idx] >= height_min
+        if height_max is not None:
+            pt_mask &= pos[:, up_idx] <= height_max
+        pos = pos[pt_mask]
+        nrm = nrm[pt_mask]
+
     return pos, nrm
 
 
@@ -3204,12 +3348,39 @@ def apply_scatter(stage, node, inputs):
     ax = max(0.0, float(area[0])) if len(area) > 0 else 20.0
     ay = max(0.0, float(area[1])) if len(area) > 1 else 0.0
     az = max(0.0, float(area[2])) if len(area) > 2 else 20.0
+    area_offset = cfg.get('areaOffset') or [0.0, 0.0, 0.0]
+    ox = float(area_offset[0]) if len(area_offset) > 0 else 0.0
+    oy = float(area_offset[1]) if len(area_offset) > 1 else 0.0
+    oz = float(area_offset[2]) if len(area_offset) > 2 else 0.0
+    grid_jitter = max(0.0, min(1.0, float(cfg.get('gridJitter', 0.0))))
+    inner_radius_ratio = max(0.0, min(1.0, float(cfg.get('innerRadiusRatio', 0.0))))
+    circle_align = str(cfg.get('circleAlign') or 'none').strip()
+    if circle_align not in ('none', 'outward', 'inward', 'tangent'):
+        circle_align = 'none'
+    circle_even_spacing = bool(cfg.get('circleEvenSpacing', False))
+
+    scale_uniform = bool(cfg.get('scaleUniform', True))
     scale_min = max(0.01, float(cfg.get('scaleMin', 0.8)))
     scale_max = max(scale_min, float(cfg.get('scaleMax', 1.2)))
+    raw_smin_vec = cfg.get('scaleMinVec') or [scale_min, scale_min, scale_min]
+    raw_smax_vec = cfg.get('scaleMaxVec') or [scale_max, scale_max, scale_max]
+    scale_min_vec = [max(0.01, float(raw_smin_vec[i]) if i < len(raw_smin_vec) else scale_min) for i in range(3)]
+    scale_max_vec = [max(scale_min_vec[i], float(raw_smax_vec[i]) if i < len(raw_smax_vec) else scale_max) for i in range(3)]
+
     random_yaw = bool(cfg.get('randomYaw', True))
+    raw_rot_off = cfg.get('rotationOffset') or [0.0, 0.0, 0.0]
+    rot_offset = [float(raw_rot_off[i]) if i < len(raw_rot_off) else 0.0 for i in range(3)]
+    rot_min_cfg = cfg.get('rotationMin')
+    rot_max_cfg = cfg.get('rotationMax')
+
     surface_prim_path = str(cfg.get('surfacePrimPath') or '').strip()
+    surface_offset = float(cfg.get('surfaceOffset', 0.0))
     align_to_normal = bool(cfg.get('alignToNormal', False))
-    max_slope_deg = max(0.0, min(180.0, float(cfg.get('maxSlopeDeg', 90.0))))
+    align_strength = max(0.0, min(1.0, float(cfg.get('alignStrength', 1.0))))
+    min_slope_deg = max(0.0, min(180.0, float(cfg.get('minSlopeDeg', 0.0))))
+    max_slope_deg = max(min_slope_deg, min(180.0, float(cfg.get('maxSlopeDeg', 90.0))))
+    height_min = float(cfg['heightMin']) if cfg.get('heightMin') is not None else None
+    height_max = float(cfg['heightMax']) if cfg.get('heightMax') is not None else None
     min_spacing = max(0.0, float(cfg.get('minSpacing', 0.0)))
 
     if distribution == 'surface' and not surface_prim_path and len(inputs) >= 2:
@@ -3223,21 +3394,23 @@ def apply_scatter(stage, node, inputs):
     instancer = UsdGeom.PointInstancer.Define(stage, '/Scene/Scatter')
     UsdGeom.Scope.Define(stage, '/Scene/Scatter/Prototypes')
     proto_paths = []
+    proto_weights = []
     if raw_prototypes:
-        enabled_paths = [
-            str(item.get('primPath') or '').strip()
+        enabled_items = [
+            (str(item.get('primPath') or '').strip(), max(0.0, float(item.get('weight', 1.0))))
             for item in raw_prototypes
             if isinstance(item, dict) and item.get('enabled', True) and str(item.get('primPath') or '').strip()
         ]
-        if not enabled_paths:
+        if not enabled_items:
             raise ValueError('Enable at least one prototype prim in Scatter, or clear the prototype table')
         search_inputs = proto_inputs + [item for item in inputs if item not in proto_inputs]
-        for idx, prim_path_str in enumerate(enabled_paths):
+        for idx, (prim_path_str, weight) in enumerate(enabled_items):
             target_upstream, target_prim = _resolve_scatter_prototype_prim(search_inputs, prim_path_str)
             proto_path = Sdf.Path(f'/Scene/Scatter/Prototypes/Proto_{idx}')
             proto_prim = stage.OverridePrim(proto_path)
             proto_prim.GetReferences().AddReference(target_upstream.GetRootLayer().identifier, target_prim.GetPath())
             proto_paths.append(proto_path)
+            proto_weights.append(weight)
     else:
         for idx, (_, upstream) in enumerate(proto_inputs):
             proto_path = Sdf.Path(f'/Scene/Scatter/Prototypes/Proto_{idx}')
@@ -3250,6 +3423,7 @@ def apply_scatter(stage, node, inputs):
                 if children:
                     proto_prim.GetReferences().AddReference(upstream.GetRootLayer().identifier, children[0].GetPath())
             proto_paths.append(proto_path)
+            proto_weights.append(1.0)
     instancer.CreatePrototypesRel().SetTargets(proto_paths)
 
     up_is_z = UsdGeom.GetStageUpAxis(stage) == UsdGeom.Tokens.z
@@ -3257,81 +3431,189 @@ def apply_scatter(stage, node, inputs):
 
     rng = np.random.default_rng(seed)
     normals = None
+    circle_dirs = None
+    offset_vec = np.array([ox, oy, oz], dtype=np.float32)
+
     if distribution == 'surface':
-        sample_n = min(count * 4, 250_000) if min_spacing > 0.0 else count
+        needs_oversample = min_spacing > 0.0 or height_min is not None or height_max is not None
+        sample_n = min(count * 4, 250_000) if needs_oversample else count
         positions, normals = _sample_surface_points(
-            surface_stages, surface_prim_path, max_slope_deg, up_vec, sample_n, rng
+            surface_stages,
+            surface_prim_path,
+            min_slope_deg,
+            max_slope_deg,
+            up_vec,
+            sample_n,
+            rng,
+            height_min=height_min,
+            height_max=height_max,
         )
-        if min_spacing > 0.0:
+        if surface_offset != 0.0 and normals is not None and len(positions) > 0:
+            positions = positions + normals * np.float32(surface_offset)
+        if min_spacing > 0.0 and len(positions) > 0:
             positions, normals = _filter_min_spacing(positions, normals, min_spacing, count)
+        elif len(positions) > count:
+            positions = positions[:count]
+            normals = normals[:count]
     elif distribution == 'grid':
         cols = max(1, int(math.ceil(math.sqrt(count))))
         rows = max(1, int(math.ceil(count / cols)))
         gx = np.linspace(-ax * 0.5, ax * 0.5, cols, dtype=np.float32) if cols > 1 else np.zeros(1, dtype=np.float32)
         gz = np.linspace(-az * 0.5, az * 0.5, rows, dtype=np.float32) if rows > 1 else np.zeros(1, dtype=np.float32)
         xx, zz = np.meshgrid(gx, gz)
-        px = xx.ravel()[:count]
-        pz = zz.ravel()[:count]
+        px = xx.ravel()[:count].copy()
+        pz = zz.ravel()[:count].copy()
+        if grid_jitter > 0.0:
+            cell_x = (ax / float(cols - 1)) if cols > 1 else ax
+            cell_z = (az / float(rows - 1)) if rows > 1 else az
+            px += rng.uniform(-0.5, 0.5, size=count).astype(np.float32) * np.float32(grid_jitter * cell_x)
+            pz += rng.uniform(-0.5, 0.5, size=count).astype(np.float32) * np.float32(grid_jitter * cell_z)
         py = rng.uniform(-ay * 0.5, ay * 0.5, size=count).astype(np.float32) if ay > 0 else np.zeros(count, dtype=np.float32)
-        positions = np.column_stack((px, py, pz))
+        positions = np.column_stack((px, py, pz)) + offset_vec
     elif distribution == 'circle':
-        radii = np.sqrt(rng.uniform(0.0, 1.0, size=count)).astype(np.float32)
-        angles = rng.uniform(0.0, 2.0 * math.pi, size=count).astype(np.float32)
-        px = radii * np.cos(angles) * (ax * 0.5)
-        pz = radii * np.sin(angles) * (az * 0.5)
-        py = rng.uniform(-ay * 0.5, ay * 0.5, size=count).astype(np.float32) if ay > 0 else np.zeros(count, dtype=np.float32)
-        positions = np.column_stack((px, py, pz))
+        sample_n = count if circle_even_spacing else (min(count * 4, 250_000) if min_spacing > 0.0 else count)
+        if inner_radius_ratio >= 1.0:
+            radii = np.ones(sample_n, dtype=np.float32)
+        else:
+            r_sq_min = inner_radius_ratio * inner_radius_ratio
+            radii = np.sqrt(rng.uniform(r_sq_min, 1.0, size=sample_n)).astype(np.float32)
+        if circle_even_spacing:
+            angles = np.linspace(0.0, 2.0 * math.pi, sample_n, endpoint=False, dtype=np.float32)
+        else:
+            angles = rng.uniform(0.0, 2.0 * math.pi, size=sample_n).astype(np.float32)
+        rx_semi = ax * 0.5
+        rz_semi = az * 0.5
+        px = radii * np.cos(angles) * rx_semi
+        pz = radii * np.sin(angles) * rz_semi
+        py = rng.uniform(-ay * 0.5, ay * 0.5, size=sample_n).astype(np.float32) if ay > 0 else np.zeros(sample_n, dtype=np.float32)
+        positions = np.column_stack((px, py, pz)) + offset_vec
+        if circle_align != 'none':
+            nx_s = max(rx_semi, 1e-6)
+            nz_s = max(rz_semi, 1e-6)
+            if circle_align == 'outward':
+                dx = nz_s * np.cos(angles)
+                dz = nx_s * np.sin(angles)
+            elif circle_align == 'inward':
+                dx = -nz_s * np.cos(angles)
+                dz = -nx_s * np.sin(angles)
+            else:
+                dx = -nx_s * np.sin(angles)
+                dz = nz_s * np.cos(angles)
+            circle_dirs = np.column_stack((dx, np.zeros(sample_n, dtype=np.float32), dz)).astype(np.float32)
+        if min_spacing > 0.0:
+            positions, circle_dirs = _filter_min_spacing(positions, circle_dirs, min_spacing, count)
     else:
         sample_n = min(count * 4, 250_000) if min_spacing > 0.0 else count
         px = rng.uniform(-ax * 0.5, ax * 0.5, size=sample_n).astype(np.float32)
         py = rng.uniform(-ay * 0.5, ay * 0.5, size=sample_n).astype(np.float32) if ay > 0 else np.zeros(sample_n, dtype=np.float32)
         pz = rng.uniform(-az * 0.5, az * 0.5, size=sample_n).astype(np.float32)
-        positions = np.column_stack((px, py, pz))
+        positions = np.column_stack((px, py, pz)) + offset_vec
         if min_spacing > 0.0:
             positions, _ = _filter_min_spacing(positions, None, min_spacing, count)
 
     actual_count = len(positions)
-    proto_indices = rng.integers(0, len(proto_paths), size=actual_count, dtype=np.int32)
-    uniform_scales = rng.uniform(scale_min, scale_max, size=actual_count).astype(np.float32)
-    scales = np.column_stack((uniform_scales, uniform_scales, uniform_scales)) if actual_count > 0 else np.zeros((0, 3), dtype=np.float32)
-
-    if random_yaw and actual_count > 0:
-        half_angles = rng.uniform(0.0, math.pi, size=actual_count).astype(np.float32)
-        qw_y = np.cos(half_angles)
-        q_sin_y = np.sin(half_angles)
+    if actual_count > 0:
+        w_arr = np.asarray(proto_weights, dtype=np.float64)
+        w_sum = float(np.sum(w_arr))
+        if len(proto_paths) > 1 and w_sum > 0.0 and not np.allclose(w_arr, w_arr[0]):
+            proto_indices = rng.choice(len(proto_paths), size=actual_count, p=(w_arr / w_sum)).astype(np.int32)
+        else:
+            proto_indices = rng.integers(0, len(proto_paths), size=actual_count, dtype=np.int32)
     else:
-        qw_y = np.ones(actual_count, dtype=np.float32)
-        q_sin_y = np.zeros(actual_count, dtype=np.float32)
+        proto_indices = np.zeros(0, dtype=np.int32)
 
-    zeros = np.zeros(actual_count, dtype=np.float32)
-    qx_y, qy_y, qz_y = (zeros, zeros, q_sin_y) if up_is_z else (zeros, q_sin_y, zeros)
-
-    if align_to_normal and normals is not None and actual_count > 0:
-        n64 = normals.astype(np.float64)
-        dots = np.clip(n64 @ up_vec, -1.0, 1.0)
-        axes = np.cross(up_vec, n64)
-        qw_a = 1.0 + dots
-        qx_a, qy_a, qz_a = axes[:, 0], axes[:, 1], axes[:, 2]
-        anti = dots < -0.9999
-        if np.any(anti):
-            qx_a[anti] = 1.0
-            qy_a[anti] = 0.0
-            qz_a[anti] = 0.0
-            qw_a[anti] = 0.0
-        norm_a = np.sqrt(qx_a * qx_a + qy_a * qy_a + qz_a * qz_a + qw_a * qw_a)
-        norm_a = np.maximum(norm_a, 1e-12)
-        qx_a /= norm_a
-        qy_a /= norm_a
-        qz_a /= norm_a
-        qw_a /= norm_a
-
-        # Hamilton product q_align * q_yaw
-        qx = qw_a * qx_y + qx_a * qw_y + qy_a * qz_y - qz_a * qy_y
-        qy = qw_a * qy_y - qx_a * qz_y + qy_a * qw_y + qz_a * qx_y
-        qz = qw_a * qz_y + qx_a * qy_y - qy_a * qx_y + qz_a * qw_y
-        qw = qw_a * qw_y - qx_a * qx_y - qy_a * qy_y - qz_a * qz_y
+    if actual_count > 0:
+        if scale_uniform:
+            uniform_scales = rng.uniform(scale_min, scale_max, size=actual_count).astype(np.float32)
+            scales = np.column_stack((uniform_scales, uniform_scales, uniform_scales))
+        else:
+            sx = rng.uniform(scale_min_vec[0], scale_max_vec[0], size=actual_count).astype(np.float32)
+            sy = rng.uniform(scale_min_vec[1], scale_max_vec[1], size=actual_count).astype(np.float32)
+            sz = rng.uniform(scale_min_vec[2], scale_max_vec[2], size=actual_count).astype(np.float32)
+            scales = np.column_stack((sx, sy, sz))
     else:
-        qx, qy, qz, qw = qx_y, qy_y, qz_y, qw_y
+        scales = np.zeros((0, 3), dtype=np.float32)
+
+    if rot_min_cfg is None and rot_max_cfg is None:
+        if random_yaw:
+            rot_min = [0.0, 0.0, 0.0]
+            rot_max = [0.0, 0.0, 360.0] if up_is_z else [0.0, 360.0, 0.0]
+        else:
+            rot_min = [0.0, 0.0, 0.0]
+            rot_max = [0.0, 0.0, 0.0]
+    else:
+        rmin_src = rot_min_cfg if rot_min_cfg is not None else [0.0, 0.0, 0.0]
+        rmax_src = rot_max_cfg if rot_max_cfg is not None else rmin_src
+        rot_min = [float(rmin_src[i]) if i < len(rmin_src) else 0.0 for i in range(3)]
+        rot_max = [max(rot_min[i], float(rmax_src[i]) if i < len(rmax_src) else rot_min[i]) for i in range(3)]
+
+    if actual_count > 0:
+        def _sample_axis_rad(axis_i):
+            lo, hi = rot_min[axis_i], rot_max[axis_i]
+            deg = rng.uniform(lo, hi, size=actual_count) if hi > lo else np.full(actual_count, lo, dtype=np.float64)
+            return np.radians(deg + rot_offset[axis_i])
+
+        rx = _sample_axis_rad(0)
+        ry = _sample_axis_rad(1)
+        rz = _sample_axis_rad(2)
+
+        cx, sx_r = np.cos(rx * 0.5), np.sin(rx * 0.5)
+        cy, sy_r = np.cos(ry * 0.5), np.sin(ry * 0.5)
+        cz, sz_r = np.cos(rz * 0.5), np.sin(rz * 0.5)
+
+        # Euler XYZ quaternion: q_local = q_z * q_y * q_x
+        qw_l = cx * cy * cz + sx_r * sy_r * sz_r
+        qx_l = sx_r * cy * cz - cx * sy_r * sz_r
+        qy_l = cx * sy_r * cz + sx_r * cy * sz_r
+        qz_l = cx * cy * sz_r - sx_r * sy_r * cz
+
+        if align_to_normal and align_strength > 0.0 and normals is not None:
+            n64 = normals.astype(np.float64)
+            dots = np.clip(n64 @ up_vec, -1.0, 1.0)
+            angles = np.arccos(dots) * align_strength
+            axes = np.cross(up_vec, n64)
+            axis_len = np.linalg.norm(axes, axis=1)
+            unit_axes = np.zeros_like(axes)
+            nonzero = axis_len > 1e-8
+            unit_axes[nonzero] = axes[nonzero] / axis_len[nonzero, None]
+            anti = (~nonzero) & (dots < 0.0)
+            if np.any(anti):
+                unit_axes[anti, 0] = 1.0
+            half_a = angles * 0.5
+            sin_a = np.sin(half_a)
+            qw_a = np.cos(half_a)
+            qx_a = unit_axes[:, 0] * sin_a
+            qy_a = unit_axes[:, 1] * sin_a
+            qz_a = unit_axes[:, 2] * sin_a
+
+            # Hamilton product q_align * q_local
+            qx = (qw_a * qx_l + qx_a * qw_l + qy_a * qz_l - qz_a * qy_l).astype(np.float32)
+            qy = (qw_a * qy_l - qx_a * qz_l + qy_a * qw_l + qz_a * qx_l).astype(np.float32)
+            qz = (qw_a * qz_l + qx_a * qy_l - qy_a * qx_l + qz_a * qw_l).astype(np.float32)
+            qw = (qw_a * qw_l - qx_a * qx_l - qy_a * qy_l - qz_a * qz_l).astype(np.float32)
+        elif circle_dirs is not None:
+            arc_yaw = np.arctan2(circle_dirs[:, 0].astype(np.float64), circle_dirs[:, 2].astype(np.float64))
+            half_arc = arc_yaw * 0.5
+            qw_a = np.cos(half_arc)
+            sin_arc = np.sin(half_arc)
+            zeros_a = np.zeros(actual_count, dtype=np.float64)
+            qx_a, qy_a, qz_a = (zeros_a, zeros_a, sin_arc) if up_is_z else (zeros_a, sin_arc, zeros_a)
+
+            # Hamilton product q_arc * q_local
+            qx = (qw_a * qx_l + qx_a * qw_l + qy_a * qz_l - qz_a * qy_l).astype(np.float32)
+            qy = (qw_a * qy_l - qx_a * qz_l + qy_a * qw_l + qz_a * qx_l).astype(np.float32)
+            qz = (qw_a * qz_l + qx_a * qy_l - qy_a * qx_l + qz_a * qw_l).astype(np.float32)
+            qw = (qw_a * qw_l - qx_a * qx_l - qy_a * qy_l - qz_a * qz_l).astype(np.float32)
+        else:
+            qx = qx_l.astype(np.float32)
+            qy = qy_l.astype(np.float32)
+            qz = qz_l.astype(np.float32)
+            qw = qw_l.astype(np.float32)
+    else:
+        qx = np.zeros(0, dtype=np.float32)
+        qy = np.zeros(0, dtype=np.float32)
+        qz = np.zeros(0, dtype=np.float32)
+        qw = np.zeros(0, dtype=np.float32)
 
     # Gf.Quath memory layout for FromNumpy is (imag_x, imag_y, imag_z, real_w).
     orientations_np = np.column_stack((qx, qy, qz, qw)).astype(np.float16) if actual_count > 0 else np.zeros((0, 4), dtype=np.float16)
@@ -3346,6 +3628,165 @@ def apply_scatter(stage, node, inputs):
             instancer.CreateOrientationsAttr().Set(Vt.QuathArray([Gf.Quath(float(w), float(x), float(y), float(z)) for x, y, z, w in zip(qx, qy, qz, qw)]))
     else:
         instancer.CreateOrientationsAttr().Set(Vt.QuathArray([Gf.Quath(float(w), float(x), float(y), float(z)) for x, y, z, w in zip(qx, qy, qz, qw)]))
+
+    # Per-instance primvars (OpenUSD PointInstancer vertex interpolation = per-instance)
+    scatter_random = rng.uniform(0.0, 1.0, size=actual_count).astype(np.float32) if actual_count > 0 else np.zeros(0, dtype=np.float32)
+    pv_api = UsdGeom.PrimvarsAPI(instancer.GetPrim())
+    pv_api.CreatePrimvar('scatterRandom', Sdf.ValueTypeNames.FloatArray, UsdGeom.Tokens.vertex).Set(
+        Vt.FloatArray.FromNumpy(scatter_random)
+    )
+
+    color_var_enabled = bool(cfg.get('colorVariationEnabled', False))
+    if color_var_enabled:
+        colors_np = _compute_scatter_colors(rng, actual_count, scatter_random, cfg)
+        pv_api.CreatePrimvar('displayColor', Sdf.ValueTypeNames.Color3fArray, UsdGeom.Tokens.vertex).Set(
+            Vt.Vec3fArray.FromNumpy(colors_np)
+        )
+        if bool(cfg.get('colorApplyToMaterials', True)):
+            _inject_scatter_display_color_tint(stage, proto_paths)
+
+
+def _compute_scatter_colors(rng, actual_count, scatter_random, cfg):
+    import colorsys
+    import numpy as np
+
+    if actual_count <= 0:
+        return np.zeros((0, 3), dtype=np.float32)
+
+    mode = str(cfg.get('colorVariationMode') or 'hsv').strip()
+    if mode == 'ramp':
+        raw_a = cfg.get('colorRampA') or [0.85, 0.95, 0.75]
+        raw_b = cfg.get('colorRampB') or [0.95, 0.75, 0.55]
+        a = np.array([float(raw_a[i]) if i < len(raw_a) else 1.0 for i in range(3)], dtype=np.float32)
+        b = np.array([float(raw_b[i]) if i < len(raw_b) else 1.0 for i in range(3)], dtype=np.float32)
+        t = scatter_random[:, None]
+        return np.clip((1.0 - t) * a[None, :] + t * b[None, :], 0.0, 1.0).astype(np.float32)
+
+    raw_base = cfg.get('colorTintBase') or [1.0, 1.0, 1.0]
+    br = max(0.0, min(1.0, float(raw_base[0]) if len(raw_base) > 0 else 1.0))
+    bg = max(0.0, min(1.0, float(raw_base[1]) if len(raw_base) > 1 else 1.0))
+    bb = max(0.0, min(1.0, float(raw_base[2]) if len(raw_base) > 2 else 1.0))
+    h0, s0, v0 = colorsys.rgb_to_hsv(br, bg, bb)
+
+    hue_j = max(0.0, min(180.0, float(cfg.get('colorHueJitter', 15.0)))) / 360.0
+    sat_j = max(0.0, min(1.0, float(cfg.get('colorSatJitter', 0.15))))
+    val_j = max(0.0, min(1.0, float(cfg.get('colorValJitter', 0.15))))
+
+    h = (h0 + (rng.uniform(-hue_j, hue_j, size=actual_count) if hue_j > 0.0 else 0.0)) % 1.0
+    s = np.clip(s0 + (rng.uniform(-sat_j, sat_j, size=actual_count) if sat_j > 0.0 else 0.0), 0.0, 1.0)
+    v = np.clip(v0 + (rng.uniform(-val_j, val_j, size=actual_count) if val_j > 0.0 else 0.0), 0.0, 1.0)
+
+    h6 = h * 6.0
+    hi = np.floor(h6).astype(np.int32) % 6
+    f = h6 - np.floor(h6)
+    p = v * (1.0 - s)
+    q = v * (1.0 - f * s)
+    t = v * (1.0 - (1.0 - f) * s)
+
+    r = np.select([hi == 0, hi == 1, hi == 2, hi == 3, hi == 4, hi == 5], [v, q, p, p, t, v], default=v)
+    g = np.select([hi == 0, hi == 1, hi == 2, hi == 3, hi == 4, hi == 5], [t, v, v, q, p, p], default=v)
+    b = np.select([hi == 0, hi == 1, hi == 2, hi == 3, hi == 4, hi == 5], [p, p, t, v, v, q], default=v)
+    return np.clip(np.column_stack((r, g, b)), 0.0, 1.0).astype(np.float32)
+
+
+def _inject_scatter_display_color_tint(stage, proto_paths):
+    from pxr import Gf, Sdf, Usd, UsdGeom, UsdShade
+
+    bound_by_mat = {}
+    ancestor_bound_mats = set()
+    scatter_prefix = Sdf.Path('/Scene/Scatter')
+    for proto_path in proto_paths:
+        proto_prim = stage.GetPrimAtPath(proto_path)
+        if not proto_prim or not proto_prim.IsValid():
+            continue
+        for prim in Usd.PrimRange(proto_prim, Usd.TraverseInstanceProxies()):
+            if not (prim.IsA(UsdGeom.Gprim) or prim.IsA(UsdGeom.Subset) or prim == proto_prim):
+                continue
+            api = UsdShade.MaterialBindingAPI(prim)
+            bind_target = prim
+            while bind_target and bind_target.IsInstanceProxy():
+                bind_target = bind_target.GetParent()
+            if not bind_target or not bind_target.IsValid():
+                continue
+            for purpose in ('', 'full', 'preview'):
+                mat, rel = api.ComputeBoundMaterial(materialPurpose=purpose)
+                if mat and mat.GetPrim().IsValid():
+                    mat_path = mat.GetPath()
+                    if mat.GetPrim().IsInstanceProxy():
+                        continue
+                    if rel and rel.IsValid() and scatter_prefix.HasPrefix(rel.GetPrim().GetPath()):
+                        ancestor_bound_mats.add(mat_path)
+                    bound_by_mat.setdefault(mat_path, []).append((bind_target, purpose))
+
+    if not bound_by_mat:
+        return
+
+    materials_scope_defined = False
+    for idx, (orig_mat_path, bindings) in enumerate(bound_by_mat.items()):
+        if orig_mat_path.HasPrefix(scatter_prefix) or orig_mat_path in ancestor_bound_mats:
+            target_mat_prim = stage.GetPrimAtPath(orig_mat_path)
+        else:
+            if not materials_scope_defined:
+                UsdGeom.Scope.Define(stage, '/Scene/Scatter/Materials')
+                materials_scope_defined = True
+            cloned_path = Sdf.Path(f'/Scene/Scatter/Materials/TintMat_{idx}')
+            target_mat = UsdShade.Material.Define(stage, cloned_path)
+            target_mat_prim = target_mat.GetPrim()
+            target_mat_prim.GetReferences().AddInternalReference(orig_mat_path)
+            seen_binds = set()
+            for prim, purpose in bindings:
+                key = (str(prim.GetPath()), purpose)
+                if key in seen_binds:
+                    continue
+                seen_binds.add(key)
+                bind_api = UsdShade.MaterialBindingAPI.Apply(prim)
+                if purpose:
+                    bind_api.Bind(target_mat, UsdShade.Tokens.strongerThanDescendants, materialPurpose=purpose)
+                else:
+                    bind_api.Bind(target_mat, UsdShade.Tokens.strongerThanDescendants)
+
+        if not target_mat_prim or not target_mat_prim.IsValid():
+            continue
+
+        mat_path = target_mat_prim.GetPath()
+        for child in list(target_mat_prim.GetChildren()):
+            if not child.IsA(UsdShade.Shader):
+                continue
+            sh = UsdShade.Shader(child)
+            sid = str(sh.GetIdAttr().Get() or '')
+            if sid == 'ND_standard_surface_surfaceshader' or 'standard_surface' in sid:
+                reader_path = mat_path.AppendChild('ScatterDisplayColor')
+                reader = UsdShade.Shader.Define(stage, reader_path)
+                reader.CreateIdAttr('ND_geompropvalue_color3')
+                reader.CreateInput('geomprop', Sdf.ValueTypeNames.String).Set('displayColor')
+                reader.CreateInput('default', Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(1.0, 1.0, 1.0))
+                reader_out = reader.CreateOutput('out', Sdf.ValueTypeNames.Color3f)
+
+                mul_path = mat_path.AppendChild('ScatterTintMul')
+                mul = UsdShade.Shader.Define(stage, mul_path)
+                mul.CreateIdAttr('ND_multiply_color3')
+                mul_out = mul.CreateOutput('out', Sdf.ValueTypeNames.Color3f)
+
+                base_in = sh.GetInput('base_color') or sh.CreateInput('base_color', Sdf.ValueTypeNames.Color3f)
+                if base_in.HasConnectedSource():
+                    src_api, src_name, _src_type = base_in.GetConnectedSource()
+                    mul.CreateInput('in1', Sdf.ValueTypeNames.Color3f).ConnectToSource(src_api, src_name)
+                else:
+                    val = base_in.Get()
+                    base_rgb = Gf.Vec3f(float(val[0]), float(val[1]), float(val[2])) if val is not None else Gf.Vec3f(0.8, 0.8, 0.8)
+                    mul.CreateInput('in1', Sdf.ValueTypeNames.Color3f).Set(base_rgb)
+                mul.CreateInput('in2', Sdf.ValueTypeNames.Color3f).ConnectToSource(reader_out)
+                base_in.ConnectToSource(mul_out)
+            elif sid == 'UsdPreviewSurface':
+                diff_in = sh.GetInput('diffuseColor') or sh.CreateInput('diffuseColor', Sdf.ValueTypeNames.Color3f)
+                if not diff_in.HasConnectedSource():
+                    pv_path = mat_path.AppendChild('ScatterPreviewDisplayColor')
+                    pv = UsdShade.Shader.Define(stage, pv_path)
+                    pv.CreateIdAttr('UsdPrimvarReader_float3')
+                    pv.CreateInput('varname', Sdf.ValueTypeNames.Token).Set('displayColor')
+                    pv.CreateInput('fallback', Sdf.ValueTypeNames.Float3).Set(Gf.Vec3f(1.0, 1.0, 1.0))
+                    pv_out = pv.CreateOutput('result', Sdf.ValueTypeNames.Float3)
+                    diff_in.ConnectToSource(pv_out)
 
 
 def normalize_handoff_selection(selection):
@@ -4237,7 +4678,17 @@ def materialx_rule_selection(stage,rules):
     from pxr import Usd,UsdGeom,UsdShade
     import re
     if not isinstance(rules,list) or len(rules)>256:raise ValueError('MaterialX supports up to 256 rules')
-    candidates=[p for p in stage.Traverse(Usd.TraverseInstanceProxies()) if p.IsInstance() or p.IsA(UsdGeom.Gprim) or p.IsA(UsdGeom.Subset)]
+    has_active_rule=any(r.get('enabled',True) and r.get('query') for r in rules if isinstance(r,dict))
+    candidate_infos=[]
+    if has_active_rule:
+        for p in stage.Traverse(Usd.TraverseInstanceProxies()):
+            if not (p.IsInstance() or p.IsA(UsdGeom.Gprim) or p.IsA(UsdGeom.Subset)):
+                continue
+            path=str(p.GetPath())
+            bound=UsdShade.MaterialBindingAPI(p).GetDirectBinding().GetMaterial()
+            mname=bound.GetPrim().GetName() if bound else ''
+            mpath=str(bound.GetPath()) if bound else ''
+            candidate_infos.append((path, path.casefold(), mname, mname.casefold(), mpath, mpath.casefold(), p.IsInstanceProxy()))
     selected={};stats=[]
     for index,rule in enumerate(rules):
         query=rule.get('query','');mode=rule.get('searchType')
@@ -4248,28 +4699,25 @@ def materialx_rule_selection(stage,rules):
             except re.error as error:raise ValueError('MaterialX row '+str(index+1)+' regex: '+str(error))
         paths=[];proxies=0;proxy_paths=[]
         if rule.get('enabled',True) and query:
-            for prim in candidates:
-                path=str(prim.GetPath())
-                bound=UsdShade.MaterialBindingAPI(prim).GetDirectBinding().GetMaterial()
-                mname=bound.GetPrim().GetName() if bound else ''
-                mpath=str(bound.GetPath()) if bound else ''
+            terms=[t.strip().casefold() for t in query.split(',') if t.strip()] if mode!='regex' else None
+            for path, path_cf, mname, mname_cf, mpath, mpath_cf, is_proxy in candidate_infos:
                 if mode=='regex':
                     matched=bool(pattern.search(path) or (mname and pattern.search(mname)) or (mpath and pattern.search(mpath)))
+                    matching_q=''
                 else:
-                    terms=[t.strip().casefold() for t in query.split(',') if t.strip()]
                     matched=False
                     matching_q=''
                     for q in terms:
-                        if q=='*' or q in path.casefold() or (mname and q in mname.casefold()) or (mpath and q in mpath.casefold()):
+                        if q=='*' or q in path_cf or (mname_cf and q in mname_cf) or (mpath_cf and q in mpath_cf):
                             matched=True
                             matching_q=q
                             break
                 if not matched:continue
-                if prim.IsInstanceProxy():
+                if is_proxy:
                     proxies+=1
                     proxy_paths.append(path)
                     continue
-                display_path=f"{path} (material: {mname})" if (mode!='regex' and matching_q and mname and matching_q in mname.casefold() and matching_q not in path.casefold()) else path
+                display_path=f"{path} (material: {mname})" if (mode!='regex' and matching_q and mname and matching_q in mname_cf and matching_q not in path_cf) else path
                 paths.append(display_path);selected[path]=index
         stats.append({'id':rule.get('id'),'matched':len(paths),'instanceProxyMatches':proxies,'paths':paths[:200],'proxyPaths':proxy_paths[:50]})
     for index,row in enumerate(stats):row['effective']=sum(owner==index for owner in selected.values())
@@ -4564,10 +5012,23 @@ def decompose_camera_transform(matrix, stage=None, time_code=None):
     }
 
 
-def apply_light_overrides(stage, overrides):
+def apply_light_overrides(stage, overrides, spatial_scale=1.0, intensity_scale=1.0):
+    import math
     from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux
     if not isinstance(overrides, list):
         return
+    try:
+        pos_scale = float(spatial_scale)
+        if not math.isfinite(pos_scale) or pos_scale <= 0.0:
+            pos_scale = 1.0
+    except (TypeError, ValueError):
+        pos_scale = 1.0
+    try:
+        int_scale = float(intensity_scale)
+        if not math.isfinite(int_scale) or int_scale <= 0.0:
+            int_scale = 1.0
+    except (TypeError, ValueError):
+        int_scale = 1.0
     valid_types = {
         'DistantLight', 'RectLight', 'DiskLight', 'SphereLight', 'CylinderLight', 'DomeLight'
     }
@@ -4648,7 +5109,7 @@ def apply_light_overrides(stage, overrides):
         if hasattr(UsdLux, 'LightAPI') and not prim.HasAPI(UsdLux.LightAPI):
             UsdLux.LightAPI.Apply(prim)
 
-        # Apply transform if specified
+        # Apply transform if specified (positions scale by pos_scale)
         t_val = item.get('translate')
         r_val = item.get('rotate')
         s_val = item.get('scale')
@@ -4657,7 +5118,11 @@ def apply_light_overrides(stage, overrides):
             xformable.ClearXformOpOrder()
             xform_api = UsdGeom.XformCommonAPI(prim)
             if isinstance(t_val, list) and len(t_val) == 3:
-                xform_api.SetTranslate(Gf.Vec3d(float(t_val[0]), float(t_val[1]), float(t_val[2])))
+                xform_api.SetTranslate(Gf.Vec3d(
+                    float(t_val[0]) * pos_scale,
+                    float(t_val[1]) * pos_scale,
+                    float(t_val[2]) * pos_scale,
+                ))
             if isinstance(r_val, list) and len(r_val) == 3:
                 xform_api.SetRotate(
                     Gf.Vec3f(float(r_val[0]), float(r_val[1]), float(r_val[2])),
@@ -4665,6 +5130,20 @@ def apply_light_overrides(stage, overrides):
                 )
             if isinstance(s_val, list) and len(s_val) == 3:
                 xform_api.SetScale(Gf.Vec3f(float(s_val[0]), float(s_val[1]), float(s_val[2])))
+        elif abs(pos_scale - 1.0) > 1e-9:
+            try:
+                local_mat = UsdGeom.Xformable(prim).GetLocalTransformation(Usd.TimeCode.Default())
+                xform_data = decompose_camera_transform(local_mat)
+                tx, ty, tz = xform_data['translate']
+                rx, ry, rz = xform_data['rotate']
+                if abs(tx) > 1e-9 or abs(ty) > 1e-9 or abs(tz) > 1e-9:
+                    xformable = UsdGeom.Xformable(prim)
+                    xformable.ClearXformOpOrder()
+                    xform_api = UsdGeom.XformCommonAPI(prim)
+                    xform_api.SetTranslate(Gf.Vec3d(tx * pos_scale, ty * pos_scale, tz * pos_scale))
+                    xform_api.SetRotate(Gf.Vec3f(rx, ry, rz), UsdGeom.XformCommonAPI.RotationOrderXYZ)
+            except Exception:
+                pass
 
         enabled = item.get('enabled', True)
         if not enabled:
@@ -4677,7 +5156,18 @@ def apply_light_overrides(stage, overrides):
             continue
 
         if item.get('intensity') is not None:
-            val = float(item['intensity'])
+            val = float(item['intensity']) * int_scale
+            attr = prim.GetAttribute('inputs:intensity') if prim.HasAttribute('inputs:intensity') else prim.CreateAttribute('inputs:intensity', Sdf.ValueTypeNames.Float)
+            attr.Set(val)
+            if prim.HasAttribute('intensity'):
+                prim.GetAttribute('intensity').Set(val)
+        elif abs(int_scale - 1.0) > 1e-9:
+            base_val = None
+            if prim.HasAttribute('inputs:intensity'):
+                base_val = prim.GetAttribute('inputs:intensity').Get()
+            elif prim.HasAttribute('intensity'):
+                base_val = prim.GetAttribute('intensity').Get()
+            val = float(base_val if base_val is not None else 1.0) * int_scale
             attr = prim.GetAttribute('inputs:intensity') if prim.HasAttribute('inputs:intensity') else prim.CreateAttribute('inputs:intensity', Sdf.ValueTypeNames.Float)
             attr.Set(val)
             if prim.HasAttribute('intensity'):
@@ -4713,14 +5203,14 @@ def apply_light_overrides(stage, overrides):
             if prim.HasAttribute('colorTemperature'):
                 prim.GetAttribute('colorTemperature').Set(val)
 
-        for field, attr_name in (
-            ('width', 'inputs:width'),
-            ('height', 'inputs:height'),
-            ('radius', 'inputs:radius'),
-            ('angle', 'inputs:angle'),
+        for field, attr_name, scale_linear in (
+            ('width', 'inputs:width', True),
+            ('height', 'inputs:height', True),
+            ('radius', 'inputs:radius', True),
+            ('angle', 'inputs:angle', False),
         ):
             if item.get(field) is not None:
-                val = float(item[field])
+                val = float(item[field]) * (pos_scale if scale_linear else 1.0)
                 attr = prim.GetAttribute(attr_name) if prim.HasAttribute(attr_name) else prim.CreateAttribute(attr_name, Sdf.ValueTypeNames.Float)
                 attr.Set(val)
 
@@ -4975,7 +5465,16 @@ def inspect_stage_skeletons(request):
                         stage, alive = c_stage, c_alive
         if stage is None:
             live_poses = {}
-            stage, alive, _ = compile_graph(graph, reload_flag, live_poses=live_poses)
+            inspect_graph = dict(graph)
+            target_id = inspect_graph.get('targetNodeId')
+            if target_id and isinstance(inspect_graph.get('nodes'), list):
+                inspect_graph['nodes'] = [
+                    {**n, '_includeAllCharacterInputs': True}
+                    if n.get('id') == target_id and n.get('operation') == 'character'
+                    else n
+                    for n in inspect_graph['nodes']
+                ]
+            stage, alive, _ = compile_graph(inspect_graph, reload_flag, live_poses=live_poses)
             _SKELETON_INSPECT_CACHE = (graph, stage, alive, live_poses)
     cache = UsdSkel.Cache()
     for p in stage.Traverse():
@@ -5044,6 +5543,7 @@ def inspect_stage_skeletons(request):
                 'name': prim.GetName(),
                 'typeName': prim.GetTypeName(),
                 'isMesh': bool(prim.IsA(UsdGeom.Mesh)),
+                'isCurves': bool(prim.IsA(UsdGeom.BasisCurves)),
             })
     return {'skeletons': skeletons, 'animations': animations, 'prims': prims}
 
@@ -5066,6 +5566,132 @@ def _build_offset_matrix(translation, rotation_deg, scale):
     mat = mat * rot_mat
     mat.SetTranslateOnly(Gf.Vec3d(tx, ty, tz))
     return mat
+
+
+def _build_axis_scale_matrix(axis_token='preserve', front_token='preserve', scale=1.0):
+    import math
+    from pxr import Gf
+
+    s = float(scale if scale is not None else 1.0)
+    scale_mat = Gf.Matrix4d(1.0)
+    if abs(s - 1.0) > 1e-9:
+        scale_mat.SetScale(Gf.Vec3d(s, s, s))
+    rot = Gf.Matrix4d(1.0)
+    ax = str(axis_token or 'preserve')
+    if ax == 'Z':
+        rot.SetRotate(Gf.Rotation(Gf.Vec3d(1, 0, 0), -90))
+    elif ax == '-Z':
+        rot.SetRotate(Gf.Rotation(Gf.Vec3d(1, 0, 0), 90))
+    elif ax == '-Y':
+        rot.SetRotate(Gf.Rotation(Gf.Vec3d(1, 0, 0), 180))
+    elif ax == 'X':
+        rot.SetRotate(Gf.Rotation(Gf.Vec3d(0, 0, 1), 90))
+    elif ax == '-X':
+        rot.SetRotate(Gf.Rotation(Gf.Vec3d(0, 0, 1), -90))
+    ft = str(front_token or 'preserve')
+    if ft != 'preserve':
+        axis_dirs = {
+            'X': Gf.Vec3d(1, 0, 0), '-X': Gf.Vec3d(-1, 0, 0),
+            'Y': Gf.Vec3d(0, 1, 0), '-Y': Gf.Vec3d(0, -1, 0),
+            'Z': Gf.Vec3d(0, 0, 1), '-Z': Gf.Vec3d(0, 0, -1),
+        }
+        if ft in axis_dirs:
+            v_up = rot.TransformDir(axis_dirs[ft])
+            if abs(v_up[0]) >= 1e-6 or abs(v_up[2]) >= 1e-6:
+                yaw_deg = -math.degrees(math.atan2(v_up[0], v_up[2]))
+                front_rot = Gf.Matrix4d(1.0)
+                front_rot.SetRotate(Gf.Rotation(Gf.Vec3d(0, 1, 0), yaw_deg))
+                rot = rot * front_rot
+    return scale_mat * rot
+
+
+def _character_query_matches(raw_query, prim_path_str):
+    if _hair_query_matches(raw_query, prim_path_str):
+        return True
+    # Also match paths copied from a single-input Source/Hair node (/Scene/...)
+    # against multi-input Character branch paths (/Scene/Branch_<hash>/...).
+    parts = prim_path_str.split('/')
+    if len(parts) >= 4 and parts[1] == 'Scene' and parts[2].startswith('Branch_'):
+        unbranched = '/Scene/' + '/'.join(parts[3:])
+        return _hair_query_matches(raw_query, unbranched)
+    return False
+
+
+def _prune_unreferenced_character_branches(stage, base_branch_path, referenced_prims):
+    from pxr import Usd, UsdShade
+
+    root = stage.GetPrimAtPath('/Scene')
+    if not root or not root.IsValid():
+        return
+
+    ref_by_branch = {}
+    for rp in referenced_prims:
+        if not rp or not rp.IsValid():
+            continue
+        parts = str(rp.GetPath()).split('/')
+        if len(parts) >= 4 and parts[1] == 'Scene' and parts[2].startswith('Branch_'):
+            bpath = f'/Scene/{parts[2]}'
+            ref_by_branch.setdefault(bpath, []).append(rp)
+
+    branch_paths = [
+        str(child.GetPath())
+        for child in root.GetChildren()
+        if child.GetName().startswith('Branch_')
+    ]
+
+    for branch_path in branch_paths:
+        if branch_path == base_branch_path:
+            continue
+        branch_prim = stage.GetPrimAtPath(branch_path)
+        if not branch_prim or not branch_prim.IsValid():
+            continue
+
+        matched_prims = ref_by_branch.get(branch_path)
+        if not matched_prims:
+            # No active rule references anything in this non-base branch:
+            # disable pass-through by deactivating the branch.
+            branch_prim.SetActive(False)
+            continue
+
+        keep_paths = {branch_path}
+        for mp in matched_prims:
+            if not mp.IsValid():
+                continue
+            cur = mp
+            while cur and cur.IsValid() and str(cur.GetPath()) != '/':
+                keep_paths.add(str(cur.GetPath()))
+                if str(cur.GetPath()) == branch_path:
+                    break
+                cur = cur.GetParent()
+            for desc in Usd.PrimRange(mp):
+                keep_paths.add(str(desc.GetPath()))
+
+        # Preserve material definitions & their ancestor scopes so bindings remain valid
+        for sub in Usd.PrimRange(branch_prim):
+            if sub.IsA(UsdShade.Material):
+                cur = sub
+                while cur and cur.IsValid() and str(cur.GetPath()) != '/':
+                    keep_paths.add(str(cur.GetPath()))
+                    if str(cur.GetPath()) == branch_path:
+                        break
+                    cur = cur.GetParent()
+                for desc in Usd.PrimRange(sub):
+                    keep_paths.add(str(desc.GetPath()))
+
+        to_deactivate = [
+            str(sub.GetPath())
+            for sub in Usd.PrimRange(branch_prim)
+            if str(sub.GetPath()) not in keep_paths
+        ]
+        to_deactivate.sort()
+        deactivated_prefixes = []
+        for path_str in to_deactivate:
+            if any(path_str == pref or path_str.startswith(pref + '/') for pref in deactivated_prefixes):
+                continue
+            prim = stage.GetPrimAtPath(path_str)
+            if prim and prim.IsValid() and prim.IsActive():
+                prim.SetActive(False)
+                deactivated_prefixes.append(path_str)
 
 
 def _filter_outermost_prims(prims):
@@ -5097,7 +5723,466 @@ def _find_joint_index(joint_order, wanted_name):
     return None
 
 
-def compose_character_node(inputs, node, files=None, reload=False, wrap_fn=None):
+def _find_head_joint_index(joint_order, wanted_name):
+    if str(wanted_name or '').strip():
+        return _find_joint_index(joint_order, wanted_name)
+    preferred = (
+        'head',
+        'head_01',
+        'head_m',
+        'bip01_head',
+        'def-head',
+        'facial_c_facialroot',
+        'j_bip_c_head',
+        'neck_02',
+    )
+    leaves = []
+    for idx, j in enumerate(joint_order):
+        leaf = str(j).lower().rsplit('/', 1)[-1].split(':')[-1]
+        leaves.append((idx, leaf))
+    for target in preferred:
+        for idx, leaf in leaves:
+            if leaf == target:
+                return idx
+    for idx, leaf in leaves:
+        if 'head' in leaf and not any(skip in leaf for skip in ('headend', 'head_end', 'headtop', 'head_top')):
+            return idx
+    for idx, leaf in leaves:
+        if 'head' in leaf:
+            return idx
+    return None
+
+
+def _find_head_mesh_prim(stage, wanted_path):
+    from pxr import UsdGeom
+
+    cand = str(wanted_path or '').strip()
+    if cand:
+        p = stage.GetPrimAtPath(cand)
+        if p and p.IsValid() and p.IsActive() and p.IsA(UsdGeom.Mesh):
+            return p
+        for prim in stage.Traverse():
+            if prim.IsActive() and prim.IsA(UsdGeom.Mesh) and str(prim.GetPath()).endswith(cand):
+                return prim
+        return None
+
+    meshes = [p for p in stage.Traverse() if p.IsActive() and p.IsA(UsdGeom.Mesh)]
+    if not meshes:
+        return None
+    best = None
+    best_score = -1
+    for m in meshes:
+        name_low = m.GetName().lower()
+        path_low = str(m.GetPath()).lower()
+        score = 0
+        if any(k in name_low for k in ('head', 'scalp', 'face')):
+            score += 10
+        elif any(k in path_low for k in ('head', 'scalp', 'face')):
+            score += 5
+        if 'lod0' in name_low or 'head_lod0' in name_low:
+            score += 3
+        if any(k in name_low for k in ('eye', 'lash', 'teeth', 'tooth', 'saliva', 'cartilage', 'cornea', 'brow', 'beard')):
+            score -= 6
+        if score > best_score:
+            best_score = score
+            best = m
+    return best or meshes[0]
+
+
+def _triangulate_mesh_indices(mesh_prim):
+    import numpy as np
+    from pxr import UsdGeom
+
+    mesh = UsdGeom.Mesh(mesh_prim)
+    counts = mesh.GetFaceVertexCountsAttr().Get()
+    indices = mesh.GetFaceVertexIndicesAttr().Get()
+    if not counts or not indices:
+        return np.zeros((0, 3), dtype=np.int32)
+    counts_np = np.asarray(counts, dtype=np.int32)
+    indices_np = np.asarray(indices, dtype=np.int32)
+    tris = []
+    offset = 0
+    for c in counts_np:
+        c = int(c)
+        if c >= 3 and offset + c <= len(indices_np):
+            v0 = indices_np[offset]
+            for k in range(1, c - 1):
+                tris.append((v0, indices_np[offset + k], indices_np[offset + k + 1]))
+        offset += c
+    if not tris:
+        return np.zeros((0, 3), dtype=np.int32)
+    return np.asarray(tris, dtype=np.int32)
+
+
+def _evaluate_mesh_world_points(prim, tc, xform_cache, skin_entry, rest_only=False):
+    import numpy as np
+    from pxr import Usd, UsdGeom, Vt
+
+    src_mesh = UsdGeom.Mesh(prim)
+    query_tc = Usd.TimeCode.Default() if rest_only else tc
+    pts = src_mesh.GetPointsAttr().Get(query_tc)
+    if not pts:
+        pts = src_mesh.GetPointsAttr().Get()
+    if not pts:
+        return np.zeros((0, 3), dtype=np.float64)
+
+    xform_cache.SetTime(query_tc)
+    if not rest_only and skin_entry is not None:
+        sq_skin, sq, bs_query = skin_entry
+        pts = Vt.Vec3fArray(pts)
+        if bs_query is not None:
+            try:
+                anim_q = sq.GetAnimQuery()
+                weights = anim_q.ComputeBlendShapeWeights(tc) if anim_q else None
+                if weights:
+                    bs_mapper = sq_skin.GetBlendShapeMapper()
+                    if bs_mapper:
+                        weights = bs_mapper.Remap(weights)
+                    if weights:
+                        sub_weights = bs_query.ComputeSubShapeWeights(weights)
+                        if sub_weights:
+                            bs_query.ComputeDeformedPoints(
+                                sub_weights[0],
+                                sub_weights[1],
+                                sub_weights[2],
+                                bs_query.ComputeBlendShapePointIndices(),
+                                bs_query.ComputeSubShapePointOffsets(),
+                                pts,
+                            )
+            except Exception:
+                pass
+        xforms = sq.ComputeSkinningTransforms(tc)
+        if xforms:
+            mapper = sq_skin.GetJointMapper()
+            if mapper:
+                xforms = mapper.RemapTransforms(xforms)
+            sq_skin.ComputeSkinnedPoints(xforms, pts, tc)
+            world_mat = xform_cache.GetLocalToWorldTransform(sq.GetPrim())
+        else:
+            world_mat = xform_cache.GetLocalToWorldTransform(prim)
+    else:
+        world_mat = xform_cache.GetLocalToWorldTransform(prim)
+
+    pts_np = np.asarray(pts, dtype=np.float64)
+    mat_np = np.asarray(world_mat, dtype=np.float64)
+    return pts_np @ mat_np[:3, :3] + mat_np[3, :3]
+
+
+def _closest_point_on_triangles_batch(points, v0, v1, v2):
+    """Vectorized closest-point-on-triangle for points (S,1,3) against candidate tris (S,K,3)."""
+    import numpy as np
+
+    ab = v1 - v0
+    ac = v2 - v0
+    ap = points - v0
+
+    d1 = np.sum(ab * ap, axis=-1)
+    d2 = np.sum(ac * ap, axis=-1)
+    bp = points - v1
+    d3 = np.sum(ab * bp, axis=-1)
+    d4 = np.sum(ac * bp, axis=-1)
+    cp = points - v2
+    d5 = np.sum(ab * cp, axis=-1)
+    d6 = np.sum(ac * cp, axis=-1)
+
+    vc = d1 * d4 - d3 * d2
+    vb = d5 * d2 - d1 * d6
+    va = d3 * d6 - d5 * d4
+
+    # Default to interior region
+    denom = va + vb + vc
+    safe_denom = np.where(np.abs(denom) > 1e-12, denom, 1.0)
+    w1 = vb / safe_denom
+    w2 = vc / safe_denom
+    w0 = 1.0 - w1 - w2
+
+    # Region A (vertex 0)
+    m_a = (d1 <= 0.0) & (d2 <= 0.0)
+    w0 = np.where(m_a, 1.0, w0)
+    w1 = np.where(m_a, 0.0, w1)
+    w2 = np.where(m_a, 0.0, w2)
+
+    # Region B (vertex 1)
+    m_b = (d3 >= 0.0) & (d4 <= d3)
+    w0 = np.where(m_b, 0.0, w0)
+    w1 = np.where(m_b, 1.0, w1)
+    w2 = np.where(m_b, 0.0, w2)
+
+    # Region C (vertex 2)
+    m_c = (d6 >= 0.0) & (d5 <= d6)
+    w0 = np.where(m_c, 0.0, w0)
+    w1 = np.where(m_c, 0.0, w1)
+    w2 = np.where(m_c, 1.0, w2)
+
+    # Edge AB
+    m_ab = (vc <= 0.0) & (d1 >= 0.0) & (d3 <= 0.0) & (~m_a) & (~m_b)
+    v_ab = np.clip(d1 / np.where(np.abs(d1 - d3) > 1e-12, d1 - d3, 1.0), 0.0, 1.0)
+    w0 = np.where(m_ab, 1.0 - v_ab, w0)
+    w1 = np.where(m_ab, v_ab, w1)
+    w2 = np.where(m_ab, 0.0, w2)
+
+    # Edge AC
+    m_ac = (vb <= 0.0) & (d2 >= 0.0) & (d6 <= 0.0) & (~m_a) & (~m_c)
+    v_ac = np.clip(d2 / np.where(np.abs(d2 - d6) > 1e-12, d2 - d6, 1.0), 0.0, 1.0)
+    w0 = np.where(m_ac, 1.0 - v_ac, w0)
+    w1 = np.where(m_ac, 0.0, w1)
+    w2 = np.where(m_ac, v_ac, w2)
+
+    # Edge BC
+    m_bc = (va <= 0.0) & ((d4 - d3) >= 0.0) & ((d5 - d6) >= 0.0) & (~m_b) & (~m_c)
+    num_bc = d4 - d3
+    den_bc = (d4 - d3) + (d5 - d6)
+    v_bc = np.clip(num_bc / np.where(np.abs(den_bc) > 1e-12, den_bc, 1.0), 0.0, 1.0)
+    w0 = np.where(m_bc, 0.0, w0)
+    w1 = np.where(m_bc, 1.0 - v_bc, w1)
+    w2 = np.where(m_bc, v_bc, w2)
+
+    closest = w0[..., None] * v0 + w1[..., None] * v1 + w2[..., None] * v2
+    diff = points - closest
+    dist2 = np.sum(diff * diff, axis=-1)
+    return dist2, w0, w1, w2
+
+
+def _bind_roots_to_triangles(roots_np, verts_rest, tris):
+    import numpy as np
+
+    num_strands = roots_np.shape[0]
+    num_tris = tris.shape[0]
+    if num_strands == 0 or num_tris == 0:
+        return np.zeros((num_strands,), dtype=np.int32), np.zeros((num_strands, 3), dtype=np.float64)
+
+    centroids = (verts_rest[tris[:, 0]] + verts_rest[tris[:, 1]] + verts_rest[tris[:, 2]]) / 3.0
+    k = min(24, num_tris)
+
+    try:
+        from scipy.spatial import cKDTree
+
+        tree = cKDTree(centroids)
+        _, cand_idx = tree.query(roots_np, k=k)
+        if k == 1:
+            cand_idx = cand_idx[:, None]
+    except Exception:
+        # Pure-NumPy chunked nearest-centroid fallback
+        cand_idx = np.empty((num_strands, k), dtype=np.int32)
+        chunk = 1024
+        for start in range(0, num_strands, chunk):
+            end = min(start + chunk, num_strands)
+            diff = roots_np[start:end, None, :] - centroids[None, :, :]
+            d2 = np.sum(diff * diff, axis=-1)
+            if k < num_tris:
+                part = np.argpartition(d2, k - 1, axis=1)[:, :k]
+            else:
+                part = np.broadcast_to(np.arange(num_tris, dtype=np.int32), (end - start, num_tris))
+            cand_idx[start:end] = part
+
+    best_tri = np.zeros((num_strands,), dtype=np.int32)
+    best_bary = np.zeros((num_strands, 3), dtype=np.float64)
+    chunk = 2048
+    for start in range(0, num_strands, chunk):
+        end = min(start + chunk, num_strands)
+        c_idx = cand_idx[start:end]
+        t_verts = tris[c_idx]
+        v0 = verts_rest[t_verts[..., 0]]
+        v1 = verts_rest[t_verts[..., 1]]
+        v2 = verts_rest[t_verts[..., 2]]
+        pts = roots_np[start:end, None, :]
+        dist2, w0, w1, w2 = _closest_point_on_triangles_batch(pts, v0, v1, v2)
+        pick = np.argmin(dist2, axis=1)
+        ar = np.arange(end - start)
+        best_tri[start:end] = c_idx[ar, pick]
+        best_bary[start:end, 0] = w0[ar, pick]
+        best_bary[start:end, 1] = w1[ar, pick]
+        best_bary[start:end, 2] = w2[ar, pick]
+    return best_tri, best_bary
+
+
+def _triangle_frames(verts, tris_sel):
+    import numpy as np
+
+    v0 = verts[tris_sel[:, 0]]
+    v1 = verts[tris_sel[:, 1]]
+    v2 = verts[tris_sel[:, 2]]
+    e1 = v1 - v0
+    e2 = v2 - v0
+    t_len = np.linalg.norm(e1, axis=-1, keepdims=True)
+    t_vec = np.where(t_len > 1e-8, e1 / np.where(t_len > 1e-8, t_len, 1.0), np.array([1.0, 0.0, 0.0]))
+    n_raw = np.cross(e1, e2)
+    n_len = np.linalg.norm(n_raw, axis=-1, keepdims=True)
+    n_vec = np.where(n_len > 1e-8, n_raw / np.where(n_len > 1e-8, n_len, 1.0), np.array([0.0, 1.0, 0.0]))
+    b_vec = np.cross(n_vec, t_vec)
+    b_len = np.linalg.norm(b_vec, axis=-1, keepdims=True)
+    b_vec = np.where(b_len > 1e-8, b_vec / np.where(b_len > 1e-8, b_len, 1.0), np.array([0.0, 0.0, 1.0]))
+    return v0, v1, v2, t_vec, b_vec, n_vec
+
+
+def _apply_surface_bound_groom(curves_prim, offset_mat, head_mesh_prim, timecodes, xform_cache, skin_entry):
+    import numpy as np
+    from pxr import Usd, UsdGeom, Vt
+
+    curves = UsdGeom.BasisCurves(curves_prim)
+    counts = curves.GetCurveVertexCountsAttr().Get()
+    pts_rest_vt = curves.GetPointsAttr().Get(Usd.TimeCode.Default())
+    if not pts_rest_vt:
+        pts_rest_vt = curves.GetPointsAttr().Get()
+    if not counts or not pts_rest_vt:
+        return
+
+    counts_np = np.asarray(counts, dtype=np.int32)
+    total_verts = int(np.sum(counts_np))
+    pts_rest_local = np.asarray(pts_rest_vt, dtype=np.float64)
+    if pts_rest_local.shape[0] < total_verts or len(counts_np) == 0:
+        return
+    pts_rest_local = pts_rest_local[:total_verts]
+
+    tris = _triangulate_mesh_indices(head_mesh_prim)
+    if tris.shape[0] == 0:
+        return
+    verts_rest = _evaluate_mesh_world_points(head_mesh_prim, Usd.TimeCode.Default(), xform_cache, skin_entry, rest_only=True)
+    if verts_rest.shape[0] == 0:
+        return
+
+    xform_cache.SetTime(Usd.TimeCode.Default())
+    curves_world_rest = xform_cache.GetLocalToWorldTransform(curves_prim)
+    rest_mat = np.asarray(curves_world_rest * offset_mat, dtype=np.float64)
+    pts_world_rest = pts_rest_local @ rest_mat[:3, :3] + rest_mat[3, :3]
+
+    root_offsets = np.zeros(len(counts_np), dtype=np.int32)
+    if len(counts_np) > 1:
+        root_offsets[1:] = np.cumsum(counts_np[:-1])
+    roots_rest = pts_world_rest[root_offsets]
+
+    tri_idx, bary = _bind_roots_to_triangles(roots_rest, verts_rest, tris)
+    tris_sel = tris[tri_idx]
+
+    v0_r, v1_r, v2_r, t_r, b_r, n_r = _triangle_frames(verts_rest, tris_sel)
+    attach_rest = bary[:, 0:1] * v0_r + bary[:, 1:2] * v1_r + bary[:, 2:3] * v2_r
+
+    strand_of_vert = np.repeat(np.arange(len(counts_np), dtype=np.int32), counts_np)
+    rel_rest = pts_world_rest - attach_rest[strand_of_vert]
+    c_t = np.sum(rel_rest * t_r[strand_of_vert], axis=-1, keepdims=True)
+    c_b = np.sum(rel_rest * b_r[strand_of_vert], axis=-1, keepdims=True)
+    c_n = np.sum(rel_rest * n_r[strand_of_vert], axis=-1, keepdims=True)
+
+    pts_attr = curves.GetPointsAttr()
+    for tc in timecodes:
+        verts_def = _evaluate_mesh_world_points(head_mesh_prim, tc, xform_cache, skin_entry, rest_only=False)
+        if verts_def.shape[0] != verts_rest.shape[0]:
+            continue
+        v0_d, v1_d, v2_d, t_d, b_d, n_d = _triangle_frames(verts_def, tris_sel)
+        attach_def = bary[:, 0:1] * v0_d + bary[:, 1:2] * v1_d + bary[:, 2:3] * v2_d
+        pts_world_def = (
+            attach_def[strand_of_vert]
+            + c_t * t_d[strand_of_vert]
+            + c_b * b_d[strand_of_vert]
+            + c_n * n_d[strand_of_vert]
+        )
+        xform_cache.SetTime(tc)
+        inv_curves_world = np.asarray(xform_cache.GetLocalToWorldTransform(curves_prim).GetInverse(), dtype=np.float64)
+        pts_local_def = pts_world_def @ inv_curves_world[:3, :3] + inv_curves_world[3, :3]
+        pts_attr.Set(Vt.Vec3fArray.FromNumpy(pts_local_def.astype(np.float32)), tc)
+
+
+def groom_xform_only_changes(prev_graph, next_graph, live_grooms):
+    """Return list of (node_id, groom_id, next_groom) if graphs differ ONLY in rigid head-groom transforms."""
+    if not isinstance(prev_graph, dict) or not isinstance(next_graph, dict) or not live_grooms:
+        return None
+    target_id = next_graph.get('targetNodeId')
+    if not target_id or prev_graph.get('targetNodeId') != target_id:
+        return None
+    if any(
+        prev_graph.get(k) != next_graph.get(k)
+        for k in set(prev_graph.keys()) | set(next_graph.keys())
+        if k != 'nodes'
+    ):
+        return None
+    prev_nodes = prev_graph.get('nodes')
+    next_nodes = next_graph.get('nodes')
+    if not isinstance(prev_nodes, list) or not isinstance(next_nodes, list) or len(prev_nodes) != len(next_nodes):
+        return None
+
+    changed_grooms = []
+    for pn, nn in zip(prev_nodes, next_nodes):
+        if pn == nn:
+            continue
+        if (
+            not isinstance(pn, dict)
+            or not isinstance(nn, dict)
+            or pn.get('id') != nn.get('id')
+            or pn.get('operation') != 'character'
+            or nn.get('operation') != 'character'
+        ):
+            return None
+        if any(pn.get(k) != nn.get(k) for k in set(pn.keys()) | set(nn.keys()) if k != 'character'):
+            return None
+        pc = pn.get('character') or {}
+        nc = nn.get('character') or {}
+        if any(pc.get(k) != nc.get(k) for k in set(pc.keys()) | set(nc.keys()) if k != 'headGrooms'):
+            return None
+        pgs = pc.get('headGrooms') or []
+        ngs = nc.get('headGrooms') or []
+        if len(pgs) != len(ngs):
+            return None
+        node_id = nn.get('id')
+        for pg, ng in zip(pgs, ngs):
+            if pg == ng:
+                continue
+            if not isinstance(pg, dict) or not isinstance(ng, dict):
+                return None
+            if (
+                pg.get('id') != ng.get('id')
+                or not ng.get('enabled', True)
+                or pg.get('attachMode', 'joint') != 'joint'
+                or ng.get('attachMode', 'joint') != 'joint'
+            ):
+                return None
+            allowed = {'offsetTranslation', 'offsetRotation', 'offsetScale'}
+            if ng.get('sourceMode', 'file') == 'upstream':
+                allowed |= {'scale', 'axis', 'frontAxis'}
+            for k in set(pg.keys()) | set(ng.keys()):
+                if k not in allowed and pg.get(k) != ng.get(k):
+                    return None
+            if (node_id, ng.get('id')) not in live_grooms:
+                return None
+            changed_grooms.append((node_id, ng.get('id'), ng))
+
+    return changed_grooms if changed_grooms else None
+
+
+def apply_live_groom_xforms(changed_grooms, live_grooms):
+    """Apply updated head-groom transforms in-place and return [(prim_path, [(tc, mat), ...])]."""
+    from pxr import Gf
+
+    prim_updates = []
+    for node_id, groom_id, ng in changed_grooms:
+        entry = live_grooms.get((node_id, groom_id))
+        if not entry:
+            continue
+        offset_mat = _build_offset_matrix(
+            ng.get('offsetTranslation'),
+            ng.get('offsetRotation'),
+            ng.get('offsetScale'),
+        )
+        if ng.get('sourceMode', 'file') == 'upstream':
+            extra_scale_rot = _build_axis_scale_matrix(
+                ng.get('axis', 'preserve'),
+                ng.get('frontAxis', 'preserve'),
+                ng.get('scale', 1.0),
+            )
+            combined_offset = extra_scale_rot * offset_mat
+        else:
+            combined_offset = offset_mat
+        for pe in entry.get('prim_entries') or []:
+            mat_op = pe['mat_op']
+            tc_mats = []
+            for tc, pre_mat, post_mat in pe['samples']:
+                local_mat = pre_mat * combined_offset * post_mat
+                mat_op.Set(local_mat, tc)
+                tc_mats.append((tc, local_mat))
+            prim_updates.append((pe['prim_path'], tc_mats))
+    return prim_updates
+
+
+def compose_character_node(inputs, node, files=None, reload=False, wrap_fn=None, live_grooms=None):
     from pxr import Gf, Sdf, Usd, UsdGeom, UsdSkel
 
     stage = Usd.Stage.CreateInMemory()
@@ -5136,6 +6221,7 @@ def compose_character_node(inputs, node, files=None, reload=False, wrap_fn=None)
 
     cfg = node.get('character') or {}
     base_skel_path = str(cfg.get('baseSkeletonPath') or '').strip()
+    referenced_prims = []
 
     def _resolve_skeleton(path_str):
         cand = str(path_str or '').strip() or base_skel_path
@@ -5178,6 +6264,7 @@ def compose_character_node(inputs, node, files=None, reload=False, wrap_fn=None)
             skel_binding = UsdSkel.BindingAPI.Apply(target_skel)
             if mode == 'clip':
                 skel_binding.CreateAnimationSourceRel().SetTargets([anim_prim.GetPath()])
+                referenced_prims.append(anim_prim)
             else:
                 pose_time = float(rule.get('poseTime', 0.0))
                 src_anim = UsdSkel.Animation(anim_prim)
@@ -5216,6 +6303,7 @@ def compose_character_node(inputs, node, files=None, reload=False, wrap_fn=None)
             and _hair_query_matches(query, str(p.GetPath()))
         ]
         for m_prim in _filter_outermost_prims(matched):
+            referenced_prims.append(m_prim)
             for sub in Usd.PrimRange(m_prim):
                 if deactivate_src and (sub.IsA(UsdSkel.Skeleton) or sub.IsA(UsdSkel.Animation)):
                     if sub.GetPath() != target_skel.GetPath() and str(sub.GetPath()) not in target_anims:
@@ -5263,6 +6351,7 @@ def compose_character_node(inputs, node, files=None, reload=False, wrap_fn=None)
             outermost = _filter_outermost_prims(matched)
             if not outermost:
                 continue
+            referenced_prims.extend(outermost)
 
             anim_query = skel_query.GetAnimQuery()
             anim_samples = anim_query.GetJointTransformTimeSamples() if anim_query else []
@@ -5374,6 +6463,253 @@ def compose_character_node(inputs, node, files=None, reload=False, wrap_fn=None)
                     stage.SetStartTimeCode(min(stage.GetStartTimeCode(), c_start))
                     stage.SetEndTimeCode(max(stage.GetEndTimeCode(), c_end))
 
+    # 4. Head Grooms (external .abc/.usd files or connected upstream prims attached to head joint or head mesh surface)
+    head_grooms = [
+        r for r in (cfg.get('headGrooms') or [])
+        if r.get('enabled', True)
+        and (
+            (str(r.get('sourceMode') or 'file') == 'file' and str(r.get('dependencyId') or '').strip())
+            or (str(r.get('sourceMode') or 'file') == 'upstream' and str(r.get('targetQuery') or '').strip())
+        )
+    ]
+    if head_grooms:
+        skel_cache = UsdSkel.Cache()
+        skel_cache.Populate(UsdSkel.Root(root), Usd.TraverseInstanceProxies())
+        xform_cache = UsdGeom.XformCache()
+        start_tc = stage.GetStartTimeCode()
+        end_tc = stage.GetEndTimeCode()
+
+        def _timecodes_for_skel_query(sq):
+            anim_q = sq.GetAnimQuery() if sq else None
+            anim_samples = anim_q.GetJointTransformTimeSamples() if anim_q else []
+            if len(anim_samples) > 1:
+                if end_tc > start_tc and (end_tc - start_tc) <= 1000:
+                    frames = [float(f) for f in range(int(round(start_tc)), int(round(end_tc)) + 1)]
+                    return sorted(set(float(t) for t in anim_samples) | set(frames))
+                return sorted(float(t) for t in anim_samples)
+            if end_tc > start_tc and (end_tc - start_tc) <= 1000 and anim_q and anim_q.JointTransformsMightBeTimeVarying():
+                return [float(f) for f in range(int(round(start_tc)), int(round(end_tc)) + 1)]
+            return [Usd.TimeCode.Default()]
+
+        for idx, hg in enumerate(head_grooms):
+            source_mode = str(hg.get('sourceMode') or 'file')
+            attach_mode = str(hg.get('attachMode') or 'joint')
+            offset_mat = _build_offset_matrix(
+                hg.get('offsetTranslation'),
+                hg.get('offsetRotation'),
+                hg.get('offsetScale'),
+            )
+
+            groom_prims = []
+            extra_scale_rot = Gf.Matrix4d(1.0)
+            if source_mode == 'file':
+                if not files:
+                    continue
+                dep_id = str(hg.get('dependencyId') or '').strip()
+                groom_path = files.get(dep_id)
+                if not groom_path:
+                    continue
+                if not os.path.isfile(groom_path):
+                    raise ValueError(f'Head groom file does not exist: {groom_path}')
+                src_stage = _open_source_stage(groom_path, reload=reload)
+                keepalive.append(src_stage)
+                axis = str(hg.get('axis') or 'preserve')
+                front_axis = str(hg.get('frontAxis') or 'preserve')
+                scale = float(hg.get('scale', 1.0))
+                if wrap_fn is not None:
+                    norm_path = os.path.normcase(os.path.abspath(groom_path))
+                    mtime = os.path.getmtime(groom_path)
+                    wrapped = wrap_fn(
+                        src_stage,
+                        instanced=False,
+                        norm_path=norm_path,
+                        mtime=mtime,
+                        axis=axis,
+                        front_axis=front_axis,
+                        node_scale=scale,
+                    )
+                else:
+                    wrapped = src_stage
+                keepalive.append(wrapped)
+
+                groom_prim_path = root.GetPath().AppendChild(f'HeadGroom_{idx}')
+                groom_prim = UsdGeom.Xform.Define(stage, groom_prim_path).GetPrim()
+                default_prim = wrapped.GetDefaultPrim()
+                target_prim_path = (
+                    default_prim.GetPath()
+                    if default_prim and default_prim.IsValid()
+                    else wrapped.GetPseudoRoot().GetChildren()[0].GetPath()
+                )
+                groom_prim.GetReferences().AddReference(
+                    wrapped.GetRootLayer().identifier,
+                    target_prim_path,
+                )
+                mark_reference_instanceable(groom_prim, wrapped, enable=False)
+                groom_prims = [groom_prim]
+            else:
+                query = str(hg.get('targetQuery') or '').strip()
+                matched = [
+                    p for p in stage.Traverse()
+                    if str(p.GetPath()) != '/Scene'
+                    and p.IsA(UsdGeom.Xformable)
+                    and not p.IsA(UsdSkel.Skeleton)
+                    and not p.IsA(UsdSkel.Animation)
+                    and _character_query_matches(query, str(p.GetPath()))
+                ]
+                groom_prims = _filter_outermost_prims(matched)
+                if groom_prims:
+                    referenced_prims.extend(groom_prims)
+                extra_scale_rot = _build_axis_scale_matrix(
+                    hg.get('axis', 'preserve'),
+                    hg.get('frontAxis', 'preserve'),
+                    hg.get('scale', 1.0),
+                )
+
+            if not groom_prims:
+                continue
+
+            combined_offset = extra_scale_rot * offset_mat
+
+            if attach_mode == 'surface':
+                head_mesh = _find_head_mesh_prim(stage, hg.get('headMeshPath'))
+                if not head_mesh:
+                    continue
+                skin_entry = None
+                skel_query_for_mesh = None
+                if head_mesh.HasAPI(UsdSkel.BindingAPI):
+                    sq_skin = skel_cache.GetSkinningQuery(head_mesh)
+                    if sq_skin:
+                        rel = UsdSkel.BindingAPI(head_mesh).GetSkeletonRel()
+                        targets = rel.GetTargets() if rel else []
+                        skel_prim = stage.GetPrimAtPath(targets[0]) if targets else None
+                        if skel_prim and skel_prim.IsValid() and skel_prim.IsA(UsdSkel.Skeleton):
+                            sq = skel_cache.GetSkelQuery(UsdSkel.Skeleton(skel_prim))
+                            if sq:
+                                bs_query = None
+                                try:
+                                    if sq_skin.HasBlendShapes():
+                                        bs_query = UsdSkel.BlendShapeQuery(UsdSkel.BindingAPI(head_mesh))
+                                except Exception:
+                                    bs_query = None
+                                skin_entry = (sq_skin, sq, bs_query)
+                                skel_query_for_mesh = sq
+                timecodes = _timecodes_for_skel_query(skel_query_for_mesh)
+                curve_prims = []
+                for gp in groom_prims:
+                    for sub in Usd.PrimRange(gp):
+                        if sub.IsActive() and sub.IsA(UsdGeom.BasisCurves):
+                            curve_prims.append(sub)
+                for cp in curve_prims:
+                    _apply_surface_bound_groom(cp, combined_offset, head_mesh, timecodes, xform_cache, skin_entry)
+            else:
+                target_skel = _resolve_skeleton(hg.get('skeletonPath'))
+                if not target_skel:
+                    continue
+                skel_query = skel_cache.GetSkelQuery(UsdSkel.Skeleton(target_skel))
+                if not skel_query:
+                    continue
+                joint_idx = _find_head_joint_index(skel_query.GetJointOrder(), hg.get('headJointName'))
+                if joint_idx is None:
+                    continue
+
+                timecodes = _timecodes_for_skel_query(skel_query)
+                preserve_rest = bool(hg.get('preserveRestPosition', True))
+
+                # Compute rest/bind joint world transform once for world-aligned head-pivot attachment
+                joint_rest_world = None
+                xform_cache.SetTime(Usd.TimeCode.Default())
+                skel_world_rest = xform_cache.GetLocalToWorldTransform(target_skel)
+                bind_xforms = skel_query.GetJointWorldBindTransforms()
+                if bind_xforms and joint_idx < len(bind_xforms):
+                    joint_rest_world = bind_xforms[joint_idx] * skel_world_rest
+                else:
+                    rest_xforms = UsdSkel.Skeleton(target_skel).GetRestTransformsAttr().Get()
+                    if rest_xforms:
+                        topo = skel_query.GetTopology()
+                        concat = UsdSkel.ConcatJointTransforms(topo, rest_xforms)
+                        if concat and joint_idx < len(concat):
+                            joint_rest_world = concat[joint_idx] * skel_world_rest
+
+                if joint_rest_world is not None:
+                    head_pivot_pos = joint_rest_world.ExtractTranslation()
+                    head_pivot_mat = Gf.Matrix4d(1.0).SetTranslate(head_pivot_pos)
+                    head_pivot_inv = Gf.Matrix4d(1.0).SetTranslate(-head_pivot_pos)
+                    joint_rest_inv = joint_rest_world.GetInverse()
+                else:
+                    head_pivot_pos = Gf.Vec3d(0.0, 0.0, 0.0)
+                    head_pivot_mat = Gf.Matrix4d(1.0)
+                    head_pivot_inv = Gf.Matrix4d(1.0)
+                    joint_rest_inv = Gf.Matrix4d(1.0)
+
+                live_prim_entries = []
+                head_world_pos_sample = [float(head_pivot_pos[0]), float(head_pivot_pos[1]), float(head_pivot_pos[2])]
+
+                for prim in groom_prims:
+                    if prim.HasAPI(UsdSkel.BindingAPI):
+                        rel = prim.GetRelationship('skel:skeleton')
+                        if rel and rel.HasAuthoredTargets():
+                            rel.ClearTargets(True)
+                    xform_cache.SetTime(Usd.TimeCode.Default())
+                    orig_world = xform_cache.GetLocalToWorldTransform(prim)
+                    orig_linear = Gf.Matrix4d(orig_world)
+                    orig_linear.SetTranslateOnly(Gf.Vec3d(0.0, 0.0, 0.0))
+                    xf = UsdGeom.Xformable(prim)
+                    xf.ClearXformOpOrder()
+                    mat_op = xf.AddTransformOp()
+                    sample_records = []
+                    for tc in timecodes:
+                        xform_cache.SetTime(tc)
+                        joint_skel_xforms = skel_query.ComputeJointSkelTransforms(tc)
+                        if not joint_skel_xforms or joint_idx >= len(joint_skel_xforms):
+                            continue
+                        skel_world = xform_cache.GetLocalToWorldTransform(target_skel)
+                        joint_world = joint_skel_xforms[joint_idx] * skel_world
+                        if not sample_records:
+                            hp = joint_world.ExtractTranslation()
+                            head_world_pos_sample = [float(hp[0]), float(hp[1]), float(hp[2])]
+                        parent = prim.GetParent()
+                        parent_world = (
+                            xform_cache.GetLocalToWorldTransform(parent)
+                            if parent and parent.GetPath() != Sdf.Path.absoluteRootPath
+                            else Gf.Matrix4d(1.0)
+                        )
+                        if joint_rest_world is not None:
+                            pre_mat = (orig_world * head_pivot_inv) if preserve_rest else orig_linear
+                            post_mat = head_pivot_mat * joint_rest_inv * joint_world * parent_world.GetInverse()
+                        else:
+                            pre_mat = orig_linear
+                            post_mat = joint_world * parent_world.GetInverse()
+                        local_mat = pre_mat * combined_offset * post_mat
+                        mat_op.Set(local_mat, tc)
+                        sample_records.append((tc, pre_mat, post_mat))
+                    if live_grooms is not None:
+                        live_prim_entries.append({
+                            'prim_path': str(prim.GetPath()),
+                            'mat_op': mat_op,
+                            'samples': sample_records,
+                        })
+                if live_grooms is not None and live_prim_entries:
+                    live_grooms[(node.get('id'), hg.get('id'))] = {
+                        'prim_entries': live_prim_entries,
+                        'head_world_pos': head_world_pos_sample,
+                    }
+
+    # Disable pass-through for non-base connected inputs: only keep the base character
+    # branch (owning the base skeleton) and prims explicitly referenced by active rules.
+    if not node.get('_includeAllCharacterInputs'):
+        base_skel = _resolve_skeleton('')
+        base_branch_path = None
+        if base_skel and base_skel.IsValid():
+            parts = str(base_skel.GetPath()).split('/')
+            if len(parts) >= 3 and parts[1] == 'Scene' and parts[2].startswith('Branch_'):
+                base_branch_path = f'/Scene/{parts[2]}'
+        if base_branch_path is None:
+            for child in root.GetChildren():
+                if child.GetName().startswith('Branch_'):
+                    base_branch_path = str(child.GetPath())
+                    break
+        _prune_unreferenced_character_branches(stage, base_branch_path, referenced_prims)
+
     return stage, keepalive
 
 
@@ -5392,12 +6728,12 @@ def export_character_body(request):
 
     graph = dict(request['graph'])
     target_id = graph.get('targetNodeId')
-    # Strip clothCaches from the target Character node so we export only the body/props,
-    # not previously simulated cloth caches.
+    # Strip clothCaches and headGrooms from the target Character node so we export only the body/props,
+    # not previously simulated cloth caches or hair grooms.
     graph['nodes'] = [
         {
             **n,
-            'character': {**(n.get('character') or {}), 'clothCaches': []},
+            'character': {**(n.get('character') or {}), 'clothCaches': [], 'headGrooms': []},
         }
         if n.get('id') == target_id and n.get('operation') == 'character'
         else n
@@ -5522,6 +6858,211 @@ def export_character_body(request):
     }
 
 
+def _safe_bridge_slug(name, fallback='scene'):
+    import re
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f\s]+', '_', str(name or '')).strip('._')
+    return cleaned or fallback
+
+
+def export_md_bridge_handoff(request):
+    import json
+    import math
+    import time
+    from pxr import Gf, Usd, UsdGeom, UsdSkel, Vt
+
+    graph = dict(request['graph'])
+    stage, alive, _ = compile_graph(graph, reload=bool(request.get('reload', False)))
+
+    up_axis = str(request.get('upAxis') or 'Y').upper()
+    meters_per_unit = float(request.get('metersPerUnit') or 0.001)
+    if not math.isfinite(meters_per_unit) or meters_per_unit <= 0:
+        meters_per_unit = 0.001
+    extra_scale = float(request.get('scale') or 1.0)
+    if not math.isfinite(extra_scale) or extra_scale <= 0:
+        extra_scale = 1.0
+
+    stage_mpu = float(UsdGeom.GetStageMetersPerUnit(stage) or 1.0)
+    unit_scale = (stage_mpu * extra_scale) / meters_per_unit
+    conv_mat = Gf.Matrix4d().SetScale(unit_scale)
+    if up_axis == 'Z':
+        rot = Gf.Matrix4d(1)
+        rot.SetRotate(Gf.Rotation(Gf.Vec3d(1, 0, 0), 90))
+        conv_mat = conv_mat * rot
+
+    selection = request.get('selection')
+    selected_prefixes = [str(p).rstrip('/') for p in selection] if isinstance(selection, list) else None
+
+    tc = Usd.TimeCode(float(request['timeCode'])) if request.get('timeCode') is not None else Usd.TimeCode.Default()
+
+    skel_cache = UsdSkel.Cache()
+    skin_bindings = {}
+    root = stage.GetDefaultPrim()
+    if root and root.IsValid() and root.IsA(UsdSkel.Root):
+        skel_cache.Populate(UsdSkel.Root(root), Usd.TraverseInstanceProxies())
+    else:
+        for p in stage.Traverse(Usd.TraverseInstanceProxies()):
+            if p.IsA(UsdSkel.Root):
+                skel_cache.Populate(UsdSkel.Root(p), Usd.TraverseInstanceProxies())
+
+    for p in stage.Traverse(Usd.TraverseInstanceProxies()):
+        if p.HasAPI(UsdSkel.BindingAPI):
+            sq_skin = skel_cache.GetSkinningQuery(p)
+            if sq_skin:
+                rel = UsdSkel.BindingAPI(p).GetSkeletonRel()
+                targets = rel.GetTargets() if rel else []
+                skel_prim = stage.GetPrimAtPath(targets[0]) if targets else None
+                if skel_prim and skel_prim.IsValid() and skel_prim.IsA(UsdSkel.Skeleton):
+                    sq = skel_cache.GetSkelQuery(UsdSkel.Skeleton(skel_prim))
+                    if sq:
+                        skin_bindings[str(p.GetPath())] = (sq_skin, sq)
+
+    local_app_data = os.environ.get('LOCALAPPDATA') or os.path.expanduser('~')
+    bridge_dir = os.path.join(local_app_data, 'Sublayer', 'md_bridge')
+    os.makedirs(bridge_dir, exist_ok=True)
+
+    slug = _safe_bridge_slug(request.get('baseName'), fallback='sublayer')
+    obj_path = os.path.join(bridge_dir, f'{slug}_avatar.obj')
+    tmp_obj = f'{obj_path}.{os.getpid()}.tmp'
+    manifest_path = os.path.join(bridge_dir, 'handoff_manifest.json')
+    tmp_manifest = f'{manifest_path}.{os.getpid()}.tmp'
+
+    xform_cache = UsdGeom.XformCache(tc)
+    v_offset = 1
+    vt_offset = 1
+    vn_offset = 1
+    mesh_count = 0
+
+    try:
+        with open(tmp_obj, 'w', encoding='utf-8') as out:
+            out.write('# Sublayer MD Live Bridge Handoff\n')
+            out.write(f'# UpAxis: {up_axis}, MetersPerUnit: {meters_per_unit}, Scale: {extra_scale}\n')
+            for prim in stage.Traverse(Usd.TraverseInstanceProxies()):
+                if not prim.IsActive() or not prim.IsA(UsdGeom.Mesh):
+                    continue
+                prim_path = str(prim.GetPath())
+                if selected_prefixes is not None and not any(
+                    prim_path == pref or prim_path.startswith(pref + '/')
+                    for pref in selected_prefixes
+                ):
+                    continue
+
+                mesh = UsdGeom.Mesh(prim)
+                counts = mesh.GetFaceVertexCountsAttr().Get(tc) or mesh.GetFaceVertexCountsAttr().Get()
+                indices = mesh.GetFaceVertexIndicesAttr().Get(tc) or mesh.GetFaceVertexIndicesAttr().Get()
+                pts = mesh.GetPointsAttr().Get(tc) or mesh.GetPointsAttr().Get()
+                if not counts or not indices or not pts:
+                    continue
+
+                skin_entry = skin_bindings.get(prim_path)
+                if skin_entry is not None:
+                    sq_skin, sq = skin_entry
+                    xforms = sq.ComputeSkinningTransforms(tc)
+                    if xforms:
+                        mapper = sq_skin.GetJointMapper()
+                        if mapper:
+                            xforms = mapper.RemapTransforms(xforms)
+                        pts = Vt.Vec3fArray(pts)
+                        sq_skin.ComputeSkinnedPoints(xforms, pts, tc)
+                        world_mat = xform_cache.GetLocalToWorldTransform(sq.GetPrim()) * conv_mat
+                    else:
+                        world_mat = xform_cache.GetLocalToWorldTransform(prim) * conv_mat
+                else:
+                    world_mat = xform_cache.GetLocalToWorldTransform(prim) * conv_mat
+
+                out.write(f'o {prim.GetName()}_{mesh_count}\n')
+                for p in pts:
+                    tp = world_mat.Transform(Gf.Vec3d(p))
+                    out.write(f'v {tp[0]:.6f} {tp[1]:.6f} {tp[2]:.6f}\n')
+
+                pv_api = UsdGeom.PrimvarsAPI(mesh)
+                st_pv = pv_api.GetPrimvar('st')
+                uv_vals = st_pv.Get(tc) if st_pv else None
+                uv_idx = st_pv.GetIndices(tc) if (st_pv and st_pv.IsIndexed()) else None
+                uv_interp = st_pv.GetInterpolation() if st_pv else None
+                has_uv = bool(uv_vals) and len(uv_vals) > 0
+                if has_uv:
+                    for uv in uv_vals:
+                        out.write(f'vt {uv[0]:.6f} {uv[1]:.6f}\n')
+
+                normals = mesh.GetNormalsAttr().Get(tc) or mesh.GetNormalsAttr().Get()
+                norm_interp = mesh.GetNormalsInterpolation() if normals else None
+                has_norm = bool(normals) and len(normals) > 0
+                if has_norm:
+                    norm_mat = world_mat.GetInverse().GetTranspose()
+                    for n in normals:
+                        tn = norm_mat.TransformDir(Gf.Vec3d(n)).GetNormalized()
+                        out.write(f'vn {tn[0]:.6f} {tn[1]:.6f} {tn[2]:.6f}\n')
+
+                cursor = 0
+                for c in counts:
+                    c_int = int(c)
+                    face_tokens = []
+                    for k in range(c_int):
+                        vi = int(indices[cursor + k])
+                        v_str = str(v_offset + vi)
+                        vt_str = ''
+                        if has_uv:
+                            if uv_interp == UsdGeom.Tokens.faceVarying:
+                                ti = int(uv_idx[cursor + k]) if uv_idx is not None else (cursor + k)
+                            elif uv_interp == UsdGeom.Tokens.vertex:
+                                ti = int(uv_idx[vi]) if uv_idx is not None else vi
+                            else:
+                                ti = 0
+                            if 0 <= ti < len(uv_vals):
+                                vt_str = str(vt_offset + ti)
+                        vn_str = ''
+                        if has_norm:
+                            if norm_interp == UsdGeom.Tokens.faceVarying:
+                                ni = cursor + k
+                            elif norm_interp == UsdGeom.Tokens.vertex:
+                                ni = vi
+                            else:
+                                ni = 0
+                            if 0 <= ni < len(normals):
+                                vn_str = str(vn_offset + ni)
+                        if vn_str:
+                            face_tokens.append(f'{v_str}/{vt_str}/{vn_str}')
+                        elif vt_str:
+                            face_tokens.append(f'{v_str}/{vt_str}')
+                        else:
+                            face_tokens.append(v_str)
+                    out.write('f ' + ' '.join(face_tokens) + '\n')
+                    cursor += c_int
+
+                v_offset += len(pts)
+                if has_uv:
+                    vt_offset += len(uv_vals)
+                if has_norm:
+                    vn_offset += len(normals)
+                mesh_count += 1
+
+        if mesh_count == 0:
+            raise ValueError('No active polygon meshes found to export to MD Bridge')
+        os.replace(tmp_obj, obj_path)
+
+        manifest = {
+            'handoffPath': obj_path,
+            'baseName': slug,
+            'upAxis': up_axis,
+            'metersPerUnit': meters_per_unit,
+            'scale': extra_scale,
+            'meshCount': mesh_count,
+            'exportedAt': int(time.time() * 1000),
+        }
+        with open(tmp_manifest, 'w', encoding='utf-8') as mf:
+            json.dump(manifest, mf, indent=2)
+        os.replace(tmp_manifest, manifest_path)
+    finally:
+        for tp in (tmp_obj, tmp_manifest):
+            if os.path.exists(tp):
+                try:
+                    os.remove(tp)
+                except OSError:
+                    pass
+
+    return manifest
+
+
 def inspect_stage_curves(request):
     from pxr import Usd, UsdGeom
 
@@ -5607,9 +7148,6 @@ def apply_hair(stage, hair_cfg):
 
     raw_query = str(cfg.get('targetQuery') or '').strip()
 
-    if not width_is_identity:
-        _apply_hair_widths(stage, raw_query, width_mode, width, taper, root_scale)
-
     if sim_enabled:
         import os
         import sys
@@ -5625,6 +7163,9 @@ def apply_hair(stage, hair_cfg):
                 break
         from hair_sim import apply_hair_simulation
         apply_hair_simulation(stage, cfg, _hair_query_matches)
+
+    if not width_is_identity:
+        _apply_hair_widths(stage, raw_query, width_mode, width, taper, root_scale)
 
 
 def _apply_hair_widths(stage, raw_query, width_mode, width, taper, root_scale):

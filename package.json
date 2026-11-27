@@ -10,6 +10,8 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "bundle:win": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/bundle-windows.ps1",
+    "launch": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-and-launch.ps1",
+    "launch:fast": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-and-launch.ps1 -NoBuild",
     "test": "node --experimental-strip-types --test tests/*.test.mjs"
   },
   "dependencies": {

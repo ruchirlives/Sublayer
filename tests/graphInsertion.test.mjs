@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import {insertToolbarNode} from "../src/graphInsertion.ts";
+import {detachNodeFromEdges, insertExistingNodeOnEdge, insertToolbarNode} from "../src/graphInsertion.ts";
 const node=(id,operation,x,y=0)=>({id,type:"stage",position:{x,y},data:{operation}});
 const project=()=>({version:2,viewport:{pinnedNodeId:"d"},dependencies:[],nodes:[node("s","source",0),node("a","transform",350),node("b","output",700,50),node("d","output",1050),node("other","source",0,400)],edges:[{id:"sa",source:"s",target:"a",sourceHandle:"out",targetHandle:"in"},{id:"ab",source:"a",target:"b"},{id:"ad",source:"a",target:"d"},{id:"bd",source:"b",target:"d"}]});
 test("edge insertion preserves downstream edge identity, shifts all descendants once, and keeps unrelated nodes",()=>{
@@ -43,4 +43,24 @@ test("empty-canvas drop preserves exact position and missing targets leave proje
  assert.equal(next.edges.length,p.edges.length);
  assert.throws(()=>insertToolbarNode(p,added,{kind:"edge",id:"deleted"}));
  assert.throws(()=>insertToolbarNode(p,node("a","source",0),null));
+});
+test("detachNodeFromEdges removes node links and reconnects upstream to downstream",()=>{
+ const p=project();
+ let n=0;
+ const next=detachNodeFromEdges(p,"a",()=>`re-${++n}`);
+ assert.equal(next.edges.some(e=>e.source==="a"||e.target==="a"),false);
+ assert.equal(next.edges.some(e=>e.source==="s"&&e.target==="b"),true);
+ assert.equal(next.edges.some(e=>e.source==="s"&&e.target==="d"),true);
+ assert.equal(next.edges.some(e=>e.id==="bd"),true);
+});
+test("insertExistingNodeOnEdge splits target edge and rejects cycles",()=>{
+ const p=project();
+ const detached=detachNodeFromEdges(p,"a",()=>"sb");
+ let n=0;
+ const inserted=insertExistingNodeOnEdge(detached,"a","bd",()=>`ins-${++n}`);
+ assert.equal(inserted.edges.some(e=>e.id==="bd"),false);
+ assert.equal(inserted.edges.some(e=>e.source==="b"&&e.target==="a"),true);
+ assert.equal(inserted.edges.some(e=>e.source==="a"&&e.target==="d"),true);
+ const incidentAttempt=insertExistingNodeOnEdge(p,"b","bd",()=>"inc");
+ assert.deepEqual(incidentAttempt.edges,p.edges);
 });

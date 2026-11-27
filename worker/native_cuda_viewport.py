@@ -10,6 +10,11 @@ kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
 d3d11 = ctypes.WinDLL("d3d11", use_last_error=True)
 nvcuda = ctypes.WinDLL("nvcuda", use_last_error=True)
+comctl32 = ctypes.WinDLL("comctl32", use_last_error=True)
+try:
+    comctl32.InitCommonControls()
+except Exception:
+    pass
 
 WS_OVERLAPPEDWINDOW = 0x00CF0000
 WS_CHILD = 0x40000000
@@ -29,6 +34,10 @@ WM_CLOSE = 0x0010
 WM_SIZE = 0x0005
 WM_SETFONT = 0x0030
 WM_COMMAND = 0x0111
+WM_HSCROLL = 0x0114
+TBM_GETPOS = 0x0400
+TBM_SETPOS = 0x0405
+TBM_SETRANGE = 0x0406
 WM_KEYDOWN = 0x0100
 WM_MOUSEMOVE = 0x0200
 WM_LBUTTONDOWN = 0x0201
@@ -74,11 +83,13 @@ TOOLBAR_ITEMS = [
     ("tool:lengthen", "Len+", True, 40),
     ("tool:shorten", "Len-", True, 38),
     ("tool:cut", "Cut", True, 34),
+    ("tool:drawLock", "Draw", True, 40),
     ("tool:add", "Add", True, 36),
     ("tool:delete", "Del", True, 34),
     ("tool:pin", "Pin", True, 32),
     ("tool:unpin", "Unpin", True, 42),
     ("tool:physics", "Phys", True, 38),
+    ("action:smoothAll", "SmoothAll", False, 64),
     ("action:undo", "Undo", False, 42),
     ("toggle:livePhysics", "LivePhys", True, 58),
     ("toggle:showPins", "Pins", True, 38),
@@ -456,6 +467,17 @@ class NativeCudaViewport:
             if msg in (WM_KEYDOWN, WM_MOUSEWHEEL) and self.on_input is not None and self._canvas_hwnd:
                 self._emit_win32_input(self._canvas_hwnd, msg, wp, lp)
                 return 0
+            if msg == WM_HSCROLL and getattr(self, "_den_hwnd", None) and int(lp) == int(self._den_hwnd):
+                val = max(16, min(300, int(user32.SendMessageW(self._den_hwnd, TBM_GETPOS, 0, 0))))
+                if val != getattr(self, "_draw_density", 120):
+                    self._draw_density = val
+                    if self.on_input is not None:
+                        self.on_input({
+                            "type": "toolbar",
+                            "command": "set:drawDensity",
+                            "drawDensity": val,
+                        })
+                return 0
             if msg == WM_COMMAND:
                 ctrl_id = int(wp) & 0xFFFF
                 notify_code = (int(wp) >> 16) & 0xFFFF
@@ -470,6 +492,20 @@ class NativeCudaViewport:
                             "type": "toolbar",
                             "command": "set:vertexPct",
                             "vertexPct": pct,
+                        })
+                    return 0
+                if ctrl_id == 201 and notify_code == 1 and getattr(self, "_tip_hwnd", None):
+                    sel = int(user32.SendMessageW(self._tip_hwnd, 0x0147, 0, 0))
+                    tip_opts = (10, 25, 50, 75, 100)
+                    tpct = tip_opts[sel] if 0 <= sel < len(tip_opts) else 25
+                    self._draw_tip_pct = tpct
+                    if self._canvas_hwnd:
+                        user32.SetFocus(self._canvas_hwnd)
+                    if self.on_input is not None:
+                        self.on_input({
+                            "type": "toolbar",
+                            "command": "set:drawTipPct",
+                            "drawTipPct": tpct,
                         })
                     return 0
                 idx = ctrl_id - 100
@@ -597,6 +633,37 @@ class NativeCudaViewport:
                 user32.SendMessageW(self._vpct_hwnd, 0x0143, 0, ctypes.addressof(buf))
             user32.SendMessageW(self._vpct_hwnd, 0x014E, 0, 0)
             bx += 60
+        self._draw_tip_pct = 25
+        self._tip_hwnd = user32.CreateWindowExW(
+            0, "COMBOBOX", "", WS_CHILD | WS_VISIBLE | 0x0003,
+            bx + 2, 6, 70, 140,
+            hwnd, ctypes.c_void_p(201), hinst, None,
+        )
+        if self._tip_hwnd:
+            user32.SendMessageW(self._tip_hwnd, WM_SETFONT, gui_font, 1)
+            for opt in ("Tip 10%", "Tip 25%", "Tip 50%", "Tip 75%", "Tip 100%"):
+                buf = ctypes.create_unicode_buffer(opt)
+                user32.SendMessageW(self._tip_hwnd, 0x0143, 0, ctypes.addressof(buf))
+            user32.SendMessageW(self._tip_hwnd, 0x014E, 1, 0)
+            bx += 74
+        self._draw_density = 120
+        self._den_lbl_hwnd = user32.CreateWindowExW(
+            0, "STATIC", "Den", WS_CHILD | WS_VISIBLE,
+            bx + 2, 9, 24, TOOLBAR_H - 16,
+            hwnd, None, hinst, None,
+        )
+        if self._den_lbl_hwnd:
+            user32.SendMessageW(self._den_lbl_hwnd, WM_SETFONT, gui_font, 1)
+            bx += 26
+        self._den_hwnd = user32.CreateWindowExW(
+            0, "msctls_trackbar32", "", WS_CHILD | WS_VISIBLE | 0x0010,
+            bx, 6, 86, TOOLBAR_H - 12,
+            hwnd, ctypes.c_void_p(202), hinst, None,
+        )
+        if self._den_hwnd:
+            user32.SendMessageW(self._den_hwnd, TBM_SETRANGE, 1, (300 << 16) | 16)
+            user32.SendMessageW(self._den_hwnd, TBM_SETPOS, 1, 120)
+            bx += 90
         self._status_hwnd = user32.CreateWindowExW(
             0, "STATIC", "Rad: 0.060 | Str: 1.00 | comb",
             WS_CHILD | WS_VISIBLE,
@@ -783,16 +850,7 @@ class NativeCudaViewport:
             self._pending_status = None
             if self._status_hwnd:
                 user32.SetWindowTextW(self._status_hwnd, st)
-        pending = self._pending_resize
-        if pending is not None:
-            self._pending_resize = None
-            rw, rh = pending
-            _com_call(
-                self._swapchain, 13, ctypes.c_long,
-                [wt.UINT, wt.UINT, wt.UINT, wt.UINT, wt.UINT],
-                0, rw, rh, DXGI_FORMAT_R8G8B8A8_UNORM, 0,
-            )
-
+        self._pending_resize = None
         self._ensure_texture(width, height)
         if self._cu_event:
             _check_cu(nvcuda.cuStreamWaitEvent(None, self._cu_event, 0), "cuStreamWaitEvent")
@@ -829,6 +887,26 @@ class NativeCudaViewport:
                 [ctypes.POINTER(D3D11_TEXTURE2D_DESC)],
                 ctypes.byref(bb_desc),
             )
+            if int(bb_desc.Width) != int(width) or int(bb_desc.Height) != int(height):
+                _com_release(backbuffer.value)
+                backbuffer = ctypes.c_void_p()
+                _com_call(
+                    self._swapchain, 13, ctypes.c_long,
+                    [wt.UINT, wt.UINT, wt.UINT, wt.UINT, wt.UINT],
+                    0, int(width), int(height), DXGI_FORMAT_R8G8B8A8_UNORM, 0,
+                )
+                hr = _com_call(
+                    self._swapchain, 9, ctypes.c_long,
+                    [wt.UINT, ctypes.POINTER(GUID), ctypes.POINTER(ctypes.c_void_p)],
+                    0, ctypes.byref(IID_ID3D11Texture2D), ctypes.byref(backbuffer),
+                )
+                if hr == 0 and backbuffer.value:
+                    _com_call(
+                        backbuffer.value, 10, None,
+                        [ctypes.POINTER(D3D11_TEXTURE2D_DESC)],
+                        ctypes.byref(bb_desc),
+                    )
+        if hr == 0 and backbuffer.value:
             copy_w = min(int(width), int(bb_desc.Width))
             copy_h = min(int(height), int(bb_desc.Height))
             if copy_w > 0 and copy_h > 0:

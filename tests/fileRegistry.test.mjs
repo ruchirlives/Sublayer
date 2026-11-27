@@ -482,3 +482,19 @@ test("native creation without automatic baseline records preparation only",async
  assert.equal(next.dependencies.some(d=>d.path.endsWith(".usdc")),false);
  assert.equal(expandProject(next).nodes[0].data.nativeProject,"I:/native.blend");
 });
+
+test("MetaHuman links DNA assets and carries LOD through previews and relinks", async () => {
+  const {graphPreview} = await import("../src/fileRegistry.ts");
+  const dna = node("dna", "I:/characters/head.dna");
+  dna.data.operation = "metahuman";
+  dna.data.metahumanLod = 3;
+  const project = storeProject([dna], [], [], id);
+  assert.equal(project.dependencies[0].kind, "asset");
+  const updated = editNodeData(project, "dna", {path:"I:/characters/new.dna"});
+  assert.equal(updated.dependencies[0].kind, "asset");
+  assert.equal(expandProject(updated).nodes[0].data.metahumanLod, 3);
+  const graph = JSON.parse(graphPreview(updated, "dna"));
+  assert.equal(graph.nodes[0].metahumanLod, 3);
+  assert.equal(graph.dependencies[0].path, "I:/characters/new.dna");
+  assert.deepEqual(referencedBy(updated, updated.nodes[0].data.inputDependencyId).map(n=>n.id), ["dna"]);
+});
