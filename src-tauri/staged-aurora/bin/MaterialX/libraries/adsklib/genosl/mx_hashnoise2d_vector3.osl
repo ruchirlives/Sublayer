@@ -1,4 +1,0 @@
-void mx_hashnoise2d_vector3(vector2 texcoord, output vector3 result)
-{
-    result = noise("hash", texcoord.x, texcoord.y);
-}

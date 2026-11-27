@@ -20,7 +20,10 @@ Sublayer is a Windows desktop application built with **Tauri 2**, **React / Type
 - **DCC & Application Round Trips**:
   - **Blender**: Importer & `Application` round trips with explicit handoff export, reversible coordinate/axis conversion snapshots, baseline comparison, selective sparse adjustment publishing, upstream reconciliation, and MaterialX node-tree extraction.
   - **Substance 3D Painter 2023+**: One-click `sublayer_bridge` plugin installation, creating/opening `.spp` projects directly from a handoff USD, and exporting/syncing painted PBR textures back into Sublayer as a MaterialX layer (`sp_materials.py`).
-  - **Additional Profile Templates**: ZBrush (GoZ) and Marvelous Designer.
+  - **Marvelous Designer**: Round‑trip workflow that imports clothing meshes (`.obj`/`.fbx`), preserves seam groups and UVs, writes them to a temporary USD stage, allows editing in Sublayer, and exports back to Designer via a generated `.obj`/`.fbx` with retained material assignments. Supports reversible coordinate conversion and preserves original asset links in the project JSON.
+  - **Additional Profile Templates**: ZBrush (GoZ).
+
+![Marvelous Designer round‑trip screenshot](file:///C:/Users/Ruchirlives/.gemini/antigravity/brain/6e37e09b-21d2-4f89-8834-1750ffd7af99/.user_uploaded/media_1795803250260_465ca322.jpg)
 - **Local MCP Server**: `orchflow-mcp` exposes headless USD inspection, stage composition, and rendering over stdio.
 
 ---
