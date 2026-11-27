@@ -5,7 +5,9 @@ Sublayer is a Windows desktop application built with **Tauri 2**, **React / Type
 ## Features
 
 - **Non-Destructive USD Node Graph**: Compose scenes with `Source`, `Transform`, `Group`, `Delete`, `Scatter`, `Asset Override`, and `Output` nodes. Projects save to a single `.sublayer` / `.orchflow` JSON file that links external USD, texture, and DCC files in place without copying or mutating originals.
-- **Multi-Renderer Hydra Viewport**:
+- **Instancer node**: Place multiple instances of a source USD asset with per‑instance transforms, selection, duplicate, delete, and undo/redo. Supports viewport drag‑and‑drop and numeric entry.
+- **Scatter node**: Generate large numbers of instances automatically using grid, radial, or custom distributions, with optional randomization of position, rotation, scale, and seed. Ideal for foliage, crowds, and debris.
+- **Megascans / Fab integration**: Browse, download, and import assets from Quixel Megascans/Fab Library directly into the central library. Drag assets onto the canvas to create Instancer or Scatter nodes, with automatic texture/material linking via MaterialX.- **Multi-Renderer Hydra Viewport**:
   - **OpenUSD Storm**: Upstream Hydra Storm rasterized viewport.
   - **Autodesk Aurora (`hdAurora`)**: Open-source DirectX 12 DXR / Slang path-traced Hydra delegate (bundled in the Windows installer).
   - **NVIDIA Omniverse RTX (`ovrtx` / `ovstage`)**: Optional isolated RTX path-traced renderer.
