@@ -1,6 +1,6 @@
 # Sublayer
 
-![Screenshot](media_1795803704245_d626e336.jpg)
+![Screenshot](media_1795825394713_93521c1d.jpg)
 
 Sublayer is a Windows desktop application built with **Tauri 2**, **React / TypeScript (React Flow)**, **Rust**, and **OpenUSD** for non-destructive USD scene composition, lookdev, simulation, DCC round‑tripping, and real‑time Hydra viewport rendering.
 
@@ -146,3 +146,15 @@ Connect a scene to an **Instancer** node and preview its output. Select the node
 The inspector defaults to **Ground plane**, preserving starting height along the active Y/Z up axis. Choose Free, X/Y/Z only, or custom axis locks; constraints affect world‑space translation, while rotation/scale remain available. The instance list provides visibility, source prim relinking, numeric transforms and Duplicate/Delete. Numeric coordinates allow explicit placement. **Edit instances** disables/enables these viewport tools; an unrelated pinned preview offers **Preview this node**.
 
 Original objects pass through, geometry/materials remain referenced, and placement records live in the single project JSON. Picking inside an existing USD instance selects its containing instance root. Skeletal/skinned subtrees and individual PointInstancer points are unsupported and report errors. Storm/RTX rendering and picking have headless coverage; desktop gesture feel and large‑scene drag performance still require manual verification.
+
+## Fog node
+
+Connect a scene (including an existing `.vdb` Source) to **Fog**, then preview its output with **NVIDIA RTX**. The inspector separates atmospheric distance/height haze from imported VDB density shading. Both can be enabled independently; bypass disables the entire node. Settings and optional absolute Volume prim targets persist in the one project JSON and participate in Undo/Redo.
+
+Atmospheric controls expose linear color, intensity, distance density/start/end, plane height, height density and falloff. This uses NVIDIA's simple exponential haze approximation, without light scattering. Downstream enabled Fog settings win within the previewed subgraph; disconnected branches do not affect the preview.
+
+For VDB shading use **RTX Path Tracing**. Density multiplier, scattering albedo and anisotropy override only targeted density-volume materials; surface materials remain intact. This first version supports static OpenVDB float `density` grids, not level sets, temperature/fire shading or animated field files. Volume instance proxies are rejected with an editable-input instruction; existing reference sharing is preserved. A Source whose default prim is the Volume itself can remain instanced.
+
+RTX needs an MDL volume boundary rather than a bare USD Volume. Sublayer builds that boundary and resolves the installed SDK's `Volume/OmniVolumeDensity.mdl` only in private preview layers. Auto bounds read bounded metadata from seekable OpenVDB formats 222–224 with supported linear maps. Unsupported maps or missing active-voxel metadata report an error; disable **Automatic VDB bounds** and supply a local center/size. Bounds describe the density grid for preview framing and its boundary; use Transform nodes to reposition/scale the volume. Original USD/VDB files are never changed or copied. Exported USD retains the USD Volume, fields, MDL binding and boundary settings; the generated RTX preview boundary and atmospheric render-product settings are not portable renderer-neutral USD fog.
+
+Storm and Aurora show a renderer limitation message. Fog was checked with real OpenUSD composition and headless RTX rendering on RTX 3090 (including the [OpenVDB smoke sample](https://www.openvdb.org/download/)); desktop controls still require manual acceptance. NVIDIA's [simple fog documentation](https://docs.omniverse.nvidia.com/materials-and-rendering/latest/rtx-renderer_common.html#simple-fog) describes the atmospheric approximation.
