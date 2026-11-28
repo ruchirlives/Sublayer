@@ -1,8 +1,32 @@
 # Sublayer
 
-![Screenshot](media_1795825394713_93521c1d.jpg)
+**Create, assemble and preview OpenUSD scenes through a visual, non-destructive node graph.**
 
-Sublayer is a Windows desktop application built with **Tauri 2**, **React / TypeScript (React Flow)**, **Rust**, and **OpenUSD** for non-destructive USD scene composition, lookdev, simulation, DCC round‑tripping, and real‑time Hydra viewport rendering.
+Sublayer is an **open-source Windows desktop app** for connecting USD assets, scene layouts, materials and creative tools. Keep your original files in place, preview scenes with Hydra renderers, and use explicit workflows to move between Blender, Substance 3D Painter and USD.
+
+[**Download for Windows**](https://github.com/ruchirlives/Sublayer/releases) · [**15-minute quickstart**](docs/QUICKSTART.md) · [**Report a problem**](https://github.com/ruchirlives/Sublayer/issues/new/choose) · [**Contribute**](CONTRIBUTING.md)
+
+> **Before installing:** Check the latest release for an attached Windows installer. First-run setup downloads the OpenUSD/Storm runtime separately; NVIDIA Omniverse RTX is optional. Sublayer is evolving, and some advanced workflows are experimental or headless-tested rather than fully desktop-verified. [Read setup and limitations](#installation).
+
+![Sublayer node graph and viewport](media_1795825394713_93521c1d.jpg)
+
+### What you can do
+
+- **Build USD scenes visually:** Connect Source, Transform, Instancer, Scatter and Output nodes without overwriting source assets.
+- **Preview with multiple renderers:** Use Storm for interactive rasterised preview, Aurora for path tracing, or optional NVIDIA Omniverse RTX.
+- **Bridge creative tools:** Use documented Blender handoff and publishing workflows and the Substance 3D Painter bridge.
+- **Author and bind materials:** Work with MaterialX and a UsdPreviewSurface fallback, while checking renderer-specific limits.
+- **Automate USD operations:** Use the local MCP server for headless inspection, composition and rendering.
+
+**New here?** Start with [Source → Transform → Output](docs/QUICKSTART.md) and save a `.sublayer` project. It links external USD, textures and native DCC projects instead of copying them.
+
+### Who it's for
+
+USD-curious 3D artists, technical artists and small studios working across applications. Sublayer complements existing DCC tools; it is **not a replacement for Blender, Houdini or a production pipeline**.
+
+### Under the hood
+
+Built with Tauri 2, React/TypeScript (React Flow), Rust and upstream OpenUSD. Licensed GPL-3.0-or-later, with separately installed optional proprietary render runtimes as described below.
 
 ## Features
 
