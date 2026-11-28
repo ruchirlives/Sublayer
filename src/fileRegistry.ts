@@ -749,6 +749,19 @@ export type InstancerSettings = {
 };
 export const defaultInstancer: InstancerSettings = { movement: "ground", lockedAxes: [false, false, false], instances: [] };
 
+export type FogSettings = {
+  enabled: boolean; atmosphereEnabled: boolean; volumesEnabled: boolean;
+  color: [number, number, number]; intensity: number; distanceDensity: number;
+  startDistance: number; endDistance: number; height: number; heightDensity: number; heightFalloff: number;
+  volumePaths: string[]; volumeAutoBounds: boolean; volumeCenter: [number, number, number]; volumeSize: [number, number, number]; densityScale: number; volumeColor: [number, number, number]; anisotropy: number;
+};
+export const defaultFog: FogSettings = {
+  enabled: true, atmosphereEnabled: true, volumesEnabled: true,
+  color: [0.75, 0.75, 0.75], intensity: 1, distanceDensity: 0.1,
+  startDistance: 0, endDistance: 100, height: 0, heightDensity: 0.1, heightFalloff: 1,
+  volumePaths: [], volumeAutoBounds: true, volumeCenter: [0, 0, 0], volumeSize: [2, 2, 2], densityScale: 1, volumeColor: [0.9, 0.9, 0.9], anisotropy: 0,
+};
+
 export type Data = {
   blenderSelections?: string[];
   blenderScene?: string | null;
@@ -764,6 +777,7 @@ export type Data = {
   lightIntensityScale?: number;
   hdri?: HdriSettings;
   postFx?: PostFxSettings;
+  fog?: FogSettings;
   hair?: HairSettings;
   cacheEdit?: CacheEditSettings;
   metahumanLod?: number;
@@ -1359,6 +1373,7 @@ export function graphPreview(
       ...(n.data.operation==="material_bind" ? {materialBindings:n.data.materialBindings || []}:{}),
       ...(n.data.operation==="light" ? {lightOverrides:n.data.lightOverrides || [], ...(typeof n.data.lightIntensityScale === "number" && n.data.lightIntensityScale > 0 ? {lightIntensityScale: n.data.lightIntensityScale} : {})}:{}),
       ...(n.data.operation==="hdri" && n.data.hdri ? {hdri: n.data.hdri}:{}),
+      ...(n.data.operation==="fog" ? {fog: n.data.fog || defaultFog}:{}),
       ...(n.data.operation==="postfx" ? {postFx: n.data.postFx || defaultPostFx}:{}),
       ...(n.data.operation==="hair" && n.data.hair ? {hair: n.data.hair}:{}),
       ...(n.data.operation==="cache_edit" ? {cacheEdit: n.data.cacheEdit || defaultCacheEditSettings}:{}),

@@ -2445,9 +2445,13 @@ def graph_after_groom_commit(graph, node_id, deltas):
     lookup = {node['id']: node for node in nodes}
     target = graph.get('targetNodeId')
     visited = set()
-    # Single-input material overlays preserve the curve prim paths, geometry
-    # and transforms. Live point edits already reach those same prims.
-    geometry_passthrough = ('output', 'camera', 'materialx', 'material_bind')
+    # Single-input shading, lighting, atmosphere, and post overlays preserve the
+    # curve prim paths, geometry, and transforms. Live point/topology edits already
+    # reach those same prims without needing a full OpenUSD graph recompile.
+    geometry_passthrough = (
+        'output', 'camera', 'materialx', 'material_bind',
+        'hdri', 'light', 'fog', 'postfx', 'sky', 'environment',
+    )
     while target != node_id:
         if target in visited or lookup.get(target, {}).get('operation') not in geometry_passthrough:
             return None
@@ -2555,7 +2559,7 @@ def compile_graph(graph, reload=False, *, live_transforms=None, live_poses=None,
         and not live_hair_nodes
         and all(lookup[nid].get('loadPayloads', True) is not False for nid in needed)
         and not any(lookup[nid].get('useAsPayload') for nid in needed)
-        and not any(lookup[nid].get('operation') in ('blender', 'metahuman', 'instancer') for nid in needed)
+        and not any(lookup[nid].get('operation') in ('blender', 'metahuman', 'instancer', 'fog') for nid in needed)
         and not any(lookup[nid].get('operation') == 'application' and lookup[nid].get('liveAdjustment') for nid in needed)
     )
     graph_cache_paths = _compiled_graph_cache_paths(graph, needed, lookup, files, target) if can_disk_cache else None
@@ -2940,10 +2944,22 @@ def compile_graph(graph, reload=False, *, live_transforms=None, live_poses=None,
                 inputs.insert(0, ('own-source', source_stage(usd_dep, instanced=instanced, node_scale=node.get('scale', 1.0))))
             elif not inputs:
                 raise ValueError(f'Blender node "{node.get("label", id)}" needs a linked .blend file.')
-        elif operation not in ('source', 'blender', 'transform', 'group', 'output', 'assetOverride', 'materialx', 'material_bind', 'light', 'hdri', 'postfx', 'hair', 'cache_edit', 'camera', 'delete', 'scatter', 'instancer', 'character', 'pose'):
+        elif operation not in ('source', 'blender', 'transform', 'group', 'output', 'assetOverride', 'materialx', 'material_bind', 'light', 'hdri', 'fog', 'postfx', 'hair', 'cache_edit', 'camera', 'delete', 'scatter', 'instancer', 'character', 'pose'):
             raise ValueError(f'Unsupported USD graph operation: {operation}')
         if not inputs:
             raise ValueError(f'{operation.title()} node needs a linked USD file or incoming USD connection')
+        if operation == 'fog' and len(inputs) == 1:
+            from fog import apply_volumes
+            upstream = inputs[0][1]
+            overlay = Sdf.Layer.CreateAnonymous('fog.usda')
+            overlay.subLayerPaths = [upstream.GetRootLayer().identifier]
+            stage = Usd.Stage.Open(overlay)
+            inherit_stage_metrics(stage, upstream)
+            stage.SetDefaultPrim(stage.GetPrimAtPath(upstream.GetDefaultPrim().GetPath()))
+            apply_volumes(stage, node)
+            keepalive.extend([upstream, overlay, stage])
+            results[id] = stage
+            return
         if operation == 'pose' and len(inputs) == 1:
             upstream = inputs[0][1]
             overlay = Sdf.Layer.CreateAnonymous('pose.usda')
@@ -3134,7 +3150,7 @@ def compile_graph(graph, reload=False, *, live_transforms=None, live_poses=None,
             # Transform ops live on the enclosing Scene prim. Descendants remain
             # read-only instance proxies unless upstream has uninstanced prims or node disabled instancing.
             has_instances = stage_has_instances(upstream)
-            mark_reference_instanceable(prim, upstream, enable=node.get('instanced', True) and has_instances)
+            mark_reference_instanceable(prim, upstream, enable=operation != 'fog' and node.get('instanced', True) and has_instances)
         if operation == 'transform':
             apply_transform(stage,node,root,live_transforms[id] if id == live_node_id else None)
         if operation == 'delete':apply_delete(stage,node.get('deletePaths',[]))
@@ -3144,6 +3160,9 @@ def compile_graph(graph, reload=False, *, live_transforms=None, live_poses=None,
             if mx_selections_out is not None and node.get('materialXRules') is not None:
                 mx_selections_out[id] = sel_out
         if operation == 'light':apply_light_overrides(stage,node.get('lightOverrides',[]),spatial_scale=node.get('scale',1.0),intensity_scale=node.get('lightIntensityScale',1.0))
+        if operation == 'fog':
+            from fog import apply_volumes
+            apply_volumes(stage, node)
         if operation == 'hdri':apply_hdri(stage,node.get('hdri'),files)
         if operation == 'hair':apply_hair(stage,node.get('hair'))
         if operation == 'cache_edit':apply_cache_edit(stage,node.get('cacheEdit'))
@@ -7545,10 +7564,10 @@ def _read_vdb_grid_names(path):
     try:
         with open(path, 'rb') as f:
             magic = f.read(8)
-            if magic != b' VDB\x00\x00\x00\x00':
+            if magic != b' BDV\x00\x00\x00\x00':
                 return ['density']
             file_ver, lib_major, lib_minor, has_grid_offsets = struct.unpack('<III?', f.read(13))
-            f.read(16)  # 16-byte UUID
+            f.read(36)  # UUID string
             if file_ver >= 224:
                 pass
             # Read file-level metadata count

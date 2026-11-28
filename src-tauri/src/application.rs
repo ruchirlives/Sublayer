@@ -449,6 +449,7 @@ if n.data.operation=="camera"{if let Some(cam)=&n.data.camera{value["camera"]=se
         if n.data.operation=="material_bind"{if let Some(bindings)=&n.data.material_bindings {value["materialBindings"]=serde_json::to_value(bindings).unwrap();}}
         if n.data.operation=="light"{if let Some(overrides)=&n.data.light_overrides {value["lightOverrides"]=serde_json::to_value(overrides).unwrap();}if let Some(ls)=n.data.light_intensity_scale {value["lightIntensityScale"]=serde_json::to_value(ls).unwrap();}}
         if n.data.operation=="hdri"{if let Some(hdri)=&n.data.hdri {value["hdri"]=serde_json::to_value(hdri).unwrap();}}
+        if n.data.operation=="fog" {if let Some(fog)=&n.data.fog {value["fog"]=serde_json::to_value(fog).unwrap();}}
         if n.data.operation=="postfx"{if let Some(post_fx)=&n.data.post_fx {value["postFx"]=serde_json::to_value(post_fx).unwrap();}}
         if n.data.operation=="hair"{if let Some(hair)=&n.data.hair {value["hair"]=serde_json::to_value(hair).unwrap();}}
         if n.data.operation=="cache_edit"{if let Some(ce)=&n.data.cache_edit {value["cacheEdit"]=serde_json::to_value(ce).unwrap();}}

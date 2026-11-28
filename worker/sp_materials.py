@@ -170,30 +170,44 @@ def build_sp_material_layer(upstream_stage: Usd.Stage, manifest: dict[str, Any])
     if not isinstance(texture_sets, dict) or not texture_sets:
         raise ValueError("Substance Painter manifest contains no textureSets.")
 
-    # Index upstream materials and meshes
+    # Index upstream materials and meshes (supporting instanceable roots like Megascans)
     mat_to_prims: dict[str, list[Sdf.Path]] = {}
     mesh_by_name: dict[str, list[Sdf.Path]] = {}
     all_meshes: list[Sdf.Path] = []
     skipped_proxies: list[str] = []
 
-    for prim in upstream_stage.Traverse():
-        if prim.IsInstanceProxy():
-            if prim.IsA(UsdGeom.Mesh):
-                skipped_proxies.append(str(prim.GetPath()))
+    def _add_unique(bucket: dict[str, list[Sdf.Path]], key: str, path: Sdf.Path) -> None:
+        lst = bucket.setdefault(key, [])
+        if path not in lst:
+            lst.append(path)
+
+    for prim in upstream_stage.Traverse(Usd.TraverseInstanceProxies()):
+        if not (prim.IsA(UsdGeom.Mesh) or prim.IsA(UsdGeom.Subset)):
             continue
-        if prim.IsA(UsdGeom.Mesh) or prim.IsA(UsdGeom.Subset):
-            path = prim.GetPath()
-            if prim.IsA(UsdGeom.Mesh):
+        target_prim = prim
+        if prim.IsInstanceProxy():
+            # Bind on the enclosing instance root prim so instancing is preserved
+            p = prim
+            while p and p.IsInstanceProxy():
+                p = p.GetParent()
+            if not p or not p.IsValid() or p.IsPseudoRoot():
+                skipped_proxies.append(str(prim.GetPath()))
+                continue
+            target_prim = p
+        path = target_prim.GetPath()
+        if prim.IsA(UsdGeom.Mesh):
+            if path not in all_meshes:
                 all_meshes.append(path)
-                mesh_by_name.setdefault(prim.GetName().lower(), []).append(path)
-            binding_api = UsdShade.MaterialBindingAPI(prim)
-            bound_mat, _ = binding_api.ComputeBoundMaterial()
-            if bound_mat and bound_mat.GetPrim().IsValid():
-                mat_name = bound_mat.GetPrim().GetName().lower()
-                mat_to_prims.setdefault(mat_name, []).append(path)
-                mat_base = re.sub(r"_[0-9a-f]{8,}$", "", mat_name)
-                if mat_base and mat_base != mat_name:
-                    mat_to_prims.setdefault(mat_base, []).append(path)
+            _add_unique(mesh_by_name, prim.GetName().lower(), path)
+            _add_unique(mesh_by_name, target_prim.GetName().lower(), path)
+        binding_api = UsdShade.MaterialBindingAPI(prim)
+        bound_mat, _ = binding_api.ComputeBoundMaterial()
+        if bound_mat and bound_mat.GetPrim().IsValid():
+            mat_name = bound_mat.GetPrim().GetName().lower()
+            _add_unique(mat_to_prims, mat_name, path)
+            mat_base = re.sub(r"_[0-9a-f]{8,}$", "", mat_name)
+            if mat_base and mat_base != mat_name:
+                _add_unique(mat_to_prims, mat_base, path)
 
     layer = Sdf.Layer.CreateAnonymous("sp_materials.usda")
     layer.customLayerData = {
@@ -272,4 +286,76 @@ def build_sp_material_layer(upstream_stage: Usd.Stage, manifest: dict[str, Any])
             "textureSetCount": len(applied),
             "boundPrimCount": bound_count,
         },
+    }
+
+
+def extract_stage_pbr_maps(stage: Usd.Stage) -> dict[str, dict[str, str]]:
+    """Extract {materialName: {channel: resolvedTexturePath}} from materials on the stage."""
+    import os
+
+    def _find_file_attr(shader: UsdShade.Shader, depth: int = 0) -> str | None:
+        if depth > 4 or not shader or not shader.GetPrim().IsValid():
+            return None
+        file_in = shader.GetInput("file")
+        if file_in:
+            val = file_in.Get()
+            if val is not None:
+                p = getattr(val, "resolvedPath", "") or getattr(val, "path", "")
+                if p and os.path.isfile(p):
+                    return os.path.abspath(p).replace("\\", "/")
+        for inp in shader.GetInputs():
+            for src in inp.GetConnectedSources()[0]:
+                if src.source and src.source.GetPrim().IsA(UsdShade.Shader):
+                    found = _find_file_attr(UsdShade.Shader(src.source.GetPrim()), depth + 1)
+                    if found:
+                        return found
+        return None
+
+    channel_inputs = {
+        "baseColor": ("base_color", "diffuseColor"),
+        "roughness": ("specular_roughness", "roughness"),
+        "metallic": ("metalness", "metallic"),
+        "normal": ("normal",),
+        "opacity": ("opacity",),
+        "emissive": ("emission_color", "emissiveColor"),
+        "ao": ("occlusion",),
+    }
+
+    pbr_maps: dict[str, dict[str, str]] = {}
+    for prim in stage.Traverse(Usd.TraverseInstanceProxies()):
+        if not prim.IsA(UsdShade.Material):
+            continue
+        mat = UsdShade.Material(prim)
+        mat_name = prim.GetName()
+        channels: dict[str, str] = {}
+        for ctx in ("mtlx", ""):
+            surf, _, _ = mat.ComputeSurfaceSource(ctx) if ctx else mat.ComputeSurfaceSource()
+            if not surf or not surf.GetPrim().IsValid():
+                continue
+            for channel, input_names in channel_inputs.items():
+                if channel in channels:
+                    continue
+                for inp_name in input_names:
+                    inp = surf.GetInput(inp_name)
+                    if not inp:
+                        continue
+                    for src in inp.GetConnectedSources()[0]:
+                        if src.source and src.source.GetPrim().IsA(UsdShade.Shader):
+                            found = _find_file_attr(UsdShade.Shader(src.source.GetPrim()))
+                            if found:
+                                channels[channel] = found
+                                break
+                    if channel in channels:
+                        break
+        if channels:
+            pbr_maps[mat_name] = channels
+    return pbr_maps
+
+
+def extract_stage_normal_maps(stage: Usd.Stage) -> dict[str, str]:
+    """Extract {materialName: resolvedNormalMapPath} from bound materials on the stage."""
+    return {
+        mat_name: ch["normal"]
+        for mat_name, ch in extract_stage_pbr_maps(stage).items()
+        if "normal" in ch
     }

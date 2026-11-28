@@ -31,6 +31,7 @@ try:
     import substance_painter.export as sp_export
     import substance_painter.logging as sp_log
     import substance_painter.project as sp_project
+    import substance_painter.resource as sp_resource
     import substance_painter.textureset as sp_textureset
     import substance_painter.ui as sp_ui
 except ImportError:  # Allows importing outside SP for unit tests
@@ -39,6 +40,7 @@ except ImportError:  # Allows importing outside SP for unit tests
     sp_export = None
     sp_log = None
     sp_project = None
+    sp_resource = None
     sp_textureset = None
     sp_ui = None
 
@@ -391,6 +393,85 @@ def _handle_project_open(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _handle_import_normal_map(payload: dict[str, Any]) -> dict[str, Any]:
+    if not sp_project.is_open():
+        raise RuntimeError("No Substance Painter project is currently open.")
+    normal_path = str(payload.get("normalPath") or "").strip()
+    if not normal_path or not os.path.isfile(normal_path):
+        raise ValueError(f"Normal map file not found: {normal_path}")
+    target_ts = str(payload.get("textureSet") or "").strip()
+
+    res = sp_resource.import_project_resource(normal_path, sp_resource.Usage.TEXTURE)
+    all_ts = list(sp_textureset.all_texture_sets())
+    target_lower = target_ts.lower()
+    target_base = re.sub(r"_[0-9a-f]{8,}$", "", target_lower)
+    assigned: list[str] = []
+    for ts in all_ts:
+        ts_lower = ts.name().lower()
+        ts_base = re.sub(r"_[0-9a-f]{8,}$", "", ts_lower)
+        if target_ts and not (
+            ts_lower == target_lower
+            or ts_base == target_base
+            or len(all_ts) == 1
+        ):
+            continue
+        ts.set_mesh_map_resource(sp_textureset.MeshMapUsage.Normal, res.identifier())
+        assigned.append(ts.name())
+    if not assigned:
+        raise ValueError(f"No matching texture set found for '{target_ts}'.")
+
+    return {
+        "ok": True,
+        "normalPath": os.path.abspath(normal_path).replace("\\", "/"),
+        "assignedTextureSets": assigned,
+    }
+
+
+def _handle_import_pbr_maps(payload: dict[str, Any]) -> dict[str, Any]:
+    if not sp_project.is_open():
+        raise RuntimeError("No Substance Painter project is currently open.")
+    pbr_maps = payload.get("pbrMaps") or {}
+    if not isinstance(pbr_maps, dict) or not pbr_maps:
+        raise ValueError("pbrMaps is required and must be non-empty.")
+
+    all_ts = list(sp_textureset.all_texture_sets())
+    imported_count = 0
+    assigned_mesh_maps: list[str] = []
+
+    for mat_name, channels in pbr_maps.items():
+        if not isinstance(channels, dict):
+            continue
+        mat_lower = str(mat_name).lower()
+        mat_base = re.sub(r"_[0-9a-f]{8,}$", "", mat_lower)
+        matching_ts = [
+            ts
+            for ts in all_ts
+            if ts.name().lower() == mat_lower
+            or re.sub(r"_[0-9a-f]{8,}$", "", ts.name().lower()) == mat_base
+            or len(all_ts) == 1
+        ]
+
+        for ch_name, tex_path in channels.items():
+            if not tex_path or not os.path.isfile(str(tex_path)):
+                continue
+            res = sp_resource.import_project_resource(str(tex_path), sp_resource.Usage.TEXTURE)
+            imported_count += 1
+            if ch_name == "normal":
+                for ts in matching_ts:
+                    ts.set_mesh_map_resource(sp_textureset.MeshMapUsage.Normal, res.identifier())
+                    assigned_mesh_maps.append(f"{ts.name()}:Normal")
+            elif ch_name == "ao" and hasattr(sp_textureset.MeshMapUsage, "AO"):
+                for ts in matching_ts:
+                    ts.set_mesh_map_resource(sp_textureset.MeshMapUsage.AO, res.identifier())
+                    assigned_mesh_maps.append(f"{ts.name()}:AO")
+
+    return {
+        "ok": True,
+        "importedCount": imported_count,
+        "assignedMeshMaps": assigned_mesh_maps,
+    }
+
+
 def _handle_export_textures(payload: dict[str, Any]) -> dict[str, Any]:
     if not sp_project.is_open():
         raise RuntimeError("No Substance Painter project is currently open.")
@@ -511,6 +592,12 @@ class _BridgeHandler(BaseHTTPRequestHandler):
                 res = _handle_project_create(payload)
             elif self.path == "/project/open":
                 res = _run_on_main_thread(lambda: _handle_project_open(payload))
+            elif self.path == "/project/import-normal":
+                _wait_until_not_busy(60.0)
+                res = _run_on_main_thread(lambda: _handle_import_normal_map(payload))
+            elif self.path == "/project/import-pbr":
+                _wait_until_not_busy(60.0)
+                res = _run_on_main_thread(lambda: _handle_import_pbr_maps(payload))
             elif self.path == "/export/textures":
                 _wait_until_not_busy(120.0)
                 res = _run_on_main_thread(lambda: _handle_export_textures(payload))

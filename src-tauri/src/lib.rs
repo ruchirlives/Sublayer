@@ -380,6 +380,46 @@ async fn open_sp_project(path: String, app: tauri::AppHandle) -> Result<serde_js
 }
 
 #[tauri::command]
+async fn import_sp_normal_map(
+    path: String,
+    texture_set: Option<String>,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        substance_painter::import_sp_normal_map(&path, texture_set.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn send_sp_upstream_normal_maps(
+    project: Project,
+    node_id: String,
+    service: tauri::State<'_, std::sync::Arc<usd::UsdService>>,
+) -> Result<serde_json::Value, String> {
+    let service = service.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        substance_painter::send_upstream_normal_maps(&project, &node_id, &service)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn send_sp_upstream_pbr_maps(
+    project: Project,
+    node_id: String,
+    service: tauri::State<'_, std::sync::Arc<usd::UsdService>>,
+) -> Result<serde_json::Value, String> {
+    let service = service.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        substance_painter::send_upstream_pbr_maps(&project, &node_id, &service)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 async fn sync_sp_materials(
     project: Project,
     node_id: String,
@@ -1545,6 +1585,9 @@ pub fn run() {
             install_sp_plugin,
             create_sp_project,
             open_sp_project,
+            import_sp_normal_map,
+            send_sp_upstream_normal_maps,
+            send_sp_upstream_pbr_maps,
             sync_sp_materials,
             inspect_blender_file,
             export_blender_to_usd,

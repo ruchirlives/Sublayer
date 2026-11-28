@@ -55,7 +55,7 @@ try {
         }
         New-Item -ItemType Junction -Path $stagedJunction -Target $stagedAurora | Out-Null
         $confJson = $originalConf | ConvertFrom-Json
-        $confJson.bundle.resources | Add-Member -NotePropertyName 'staged-aurora/**/*' -NotePropertyValue 'renderers/aurora/' -Force
+        $confJson.bundle.resources | Add-Member -NotePropertyName 'staged-aurora/' -NotePropertyValue 'renderers/aurora/' -Force
         [System.IO.File]::WriteAllText($tauriConfPath, ($confJson | ConvertTo-Json -Depth 10), [System.Text.UTF8Encoding]::new($false))
         Write-Host "Staged Autodesk Aurora (open-source build) into installer resources."
     }

@@ -344,6 +344,108 @@ pub fn open_sp_project(spp_path: &str, catalog: &Catalog) -> Result<serde_json::
     }))
 }
 
+pub fn import_sp_normal_map(
+    normal_path: &str,
+    texture_set: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    let target = Path::new(normal_path);
+    if !target.is_file() {
+        return Err(format!("Normal map file not found: {normal_path}"));
+    }
+    bridge_request(
+        "POST",
+        "/project/import-normal",
+        Some(&serde_json::json!({
+            "normalPath": normal_path,
+            "textureSet": texture_set.unwrap_or(""),
+        })),
+        60,
+    )
+}
+
+pub fn send_upstream_normal_maps(
+    project: &Project,
+    node_id: &str,
+    usd_service: &UsdService,
+) -> Result<serde_json::Value, String> {
+    project.validate()?;
+    let graph = application::evaluation_graph(project, node_id, true)?;
+    let extracted = usd_service.request(serde_json::json!({
+        "operation": "sp_extract_normal_maps",
+        "graph": graph,
+    }))?;
+    if let Some(err) = extracted.get("error").and_then(|v| v.as_str()) {
+        return Err(err.to_string());
+    }
+    let map = extracted
+        .get("normalMaps")
+        .and_then(|v| v.as_object())
+        .ok_or("No normal maps found on upstream materials.")?;
+    if map.is_empty() {
+        return Err("No normal maps found on upstream materials.".into());
+    }
+
+    let mut assigned: Vec<String> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    for (mat_name, path_val) in map {
+        if let Some(path) = path_val.as_str() {
+            match import_sp_normal_map(path, Some(mat_name)) {
+                Ok(res) => {
+                    if let Some(arr) = res.get("assignedTextureSets").and_then(|v| v.as_array()) {
+                        for item in arr {
+                            if let Some(name) = item.as_str() {
+                                assigned.push(name.to_string());
+                            }
+                        }
+                    }
+                }
+                Err(_) => skipped.push(mat_name.clone()),
+            }
+        }
+    }
+    if assigned.is_empty() {
+        return Err(format!(
+            "Found {} upstream normal map(s), but none matched the open SP texture sets.",
+            map.len()
+        ));
+    }
+    Ok(serde_json::json!({
+        "ok": true,
+        "assignedTextureSets": assigned,
+        "skippedMaterials": skipped,
+    }))
+}
+
+pub fn send_upstream_pbr_maps(
+    project: &Project,
+    node_id: &str,
+    usd_service: &UsdService,
+) -> Result<serde_json::Value, String> {
+    project.validate()?;
+    let graph = application::evaluation_graph(project, node_id, true)?;
+    let extracted = usd_service.request(serde_json::json!({
+        "operation": "sp_extract_pbr_maps",
+        "graph": graph,
+    }))?;
+    if let Some(err) = extracted.get("error").and_then(|v| v.as_str()) {
+        return Err(err.to_string());
+    }
+    let pbr_maps = extracted
+        .get("pbrMaps")
+        .and_then(|v| v.as_object())
+        .ok_or("No PBR texture maps found on upstream materials.")?;
+    if pbr_maps.is_empty() {
+        return Err("No PBR texture maps found on upstream materials.".into());
+    }
+
+    bridge_request(
+        "POST",
+        "/project/import-pbr",
+        Some(&serde_json::json!({ "pbrMaps": pbr_maps })),
+        120,
+    )
+}
+
 pub fn sync_sp_materials(
     project: &Project,
     node_id: &str,

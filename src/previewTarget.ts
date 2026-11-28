@@ -17,6 +17,19 @@ export function sceneHierarchyKey(graph?: string): string {
         if (node?.operation === "postfx") {
           return { ...node, postFx: null };
         }
+        if (node?.operation === "hdri") {
+          return { ...node, hdri: null };
+        }
+        if (node?.operation === "light") {
+          const overrides = Array.isArray(node.lightOverrides)
+            ? (node.lightOverrides as Record<string, unknown>[]).map((o) => ({
+                lightPath: o?.lightPath ?? "",
+                lightType: o?.lightType ?? "",
+                mode: o?.mode ?? "",
+              }))
+            : [];
+          return { ...node, lightOverrides: overrides, scale: 1, lightIntensityScale: 1 };
+        }
         return node;
       });
     }

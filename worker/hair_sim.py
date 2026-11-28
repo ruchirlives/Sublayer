@@ -81,13 +81,26 @@ class _BrushCurveIndex:
         return self.paths
 
 
+def _is_created_hair_path(path_str: str) -> bool:
+    return path_str == "/Scene/CreatedHair" or path_str.endswith("/CreatedHair")
+
+
+def _hair_matches_or_created(query_matcher, raw_query, path_str: str) -> bool:
+    if _is_created_hair_path(path_str):
+        raw_low = str(raw_query or "").lower()
+        if "!/scene/createdhair" in raw_low or "!createdhair" in raw_low:
+            return False
+        return True
+    return query_matcher(raw_query, path_str)
+
+
 def _brush_curve_paths(stage, raw_query, query_matcher):
     global _BRUSH_CURVE_INDEX
     if _BRUSH_CURVE_INDEX is None or _BRUSH_CURVE_INDEX.stage is not stage:
         if _BRUSH_CURVE_INDEX is not None:
             _BRUSH_CURVE_INDEX.notice.Revoke()
         _BRUSH_CURVE_INDEX = _BrushCurveIndex(stage)
-    return tuple(path for path in _BRUSH_CURVE_INDEX.curve_paths() if query_matcher(raw_query, path))
+    return tuple(path for path in _BRUSH_CURVE_INDEX.curve_paths() if _hair_matches_or_created(query_matcher, raw_query, path))
 
 
 def reset_hair_sessions():
@@ -143,7 +156,7 @@ def export_session_groom_deltas(stage, hair_cfg, query_matcher, *, local_updates
         paths = updated_points.keys()
         deltas_out = dict(cfg.get("groomDeltas") or {})
     for p_str in paths:
-        if not query_matcher(raw_query, p_str):
+        if not _hair_matches_or_created(query_matcher, raw_query, p_str):
             continue
         sess = _ACTIVE_SIM_SESSIONS.get(p_str)
         if sess is None:
@@ -151,13 +164,15 @@ def export_session_groom_deltas(stage, hair_cfg, query_matcher, *, local_updates
         base_local = sess.get("base_settled_local_np")
         if base_local is None:
             continue
+        delta_key = "/Scene/CreatedHair" if _is_created_hair_path(p_str) else p_str
         deltas_out.pop(p_str, None)
+        deltas_out.pop(delta_key, None)
         local_np = updated_points.get(p_str)
         if local_np is None:
             local_np = _session_local_points(sess, np)
         if sess.get("topology_dirty"):
             zero_delta = np.zeros_like(local_np, dtype=np.float32)
-            deltas_out[p_str] = _encode_groom_delta(
+            deltas_out[delta_key] = _encode_groom_delta(
                 zero_delta,
                 sess["num_strands"],
                 np,
@@ -168,9 +183,9 @@ def export_session_groom_deltas(stage, hair_cfg, query_matcher, *, local_updates
         elif local_np.shape == base_local.shape:
             delta = local_np - base_local
             if delta.size and float(np.max(np.abs(delta))) > 1e-6:
-                deltas_out[p_str] = _encode_groom_delta(delta, sess["num_strands"], np)
+                deltas_out[delta_key] = _encode_groom_delta(delta, sess["num_strands"], np)
         if acknowledge:
-            sess["synced_groom_sig"] = _groom_signature(deltas_out.get(p_str))
+            sess["synced_groom_sig"] = _groom_signature(deltas_out.get(delta_key))
             sess["dirty_groom"] = False
     return deltas_out
 
@@ -246,7 +261,7 @@ def apply_hair_simulation(stage, hair_cfg, query_matcher):
     for prim in stage.Traverse():
         if prim.IsInstanceProxy():
             continue
-        if prim.IsA(UsdGeom.BasisCurves) and query_matcher(raw_query, str(prim.GetPath())):
+        if prim.IsA(UsdGeom.BasisCurves) and _hair_matches_or_created(query_matcher, raw_query, str(prim.GetPath())):
             curve_prims.append(prim)
         elif prim.IsA(UsdGeom.Mesh) and collider_query != "__none__":
             if query_matcher(collider_query, str(prim.GetPath())):
@@ -257,7 +272,7 @@ def apply_hair_simulation(stage, hair_cfg, query_matcher):
     saved_deltas = cfg.get("groomDeltas") if isinstance(cfg.get("groomDeltas"), dict) else {}
     existing_curve_paths = {str(p.GetPath()) for p in curve_prims}
     for d_path, d_val in saved_deltas.items():
-        if d_path in existing_curve_paths or not query_matcher(raw_query, d_path):
+        if d_path in existing_curve_paths or not _hair_matches_or_created(query_matcher, raw_query, d_path):
             continue
         if _decode_topology_override(d_val, np) is not None:
             from pxr import Gf, Sdf, UsdShade
@@ -925,61 +940,66 @@ def step_hair_brush(
     # Ensure active GPU sessions exist for matching BasisCurves
     matching_paths = _brush_curve_paths(stage, raw_query, query_matcher)
     if (
-        not matching_paths
-        and not settle_only
+        not settle_only
         and tool == "drawlock"
         and isinstance(brush.get("drawCurve"), (list, tuple))
         and len(brush["drawCurve"]) >= 2
     ):
-        # Bootstrap a new BasisCurves prim on a mesh-only scene when dragging over a 3D object
-        from hair_topology_brushes import _build_scene_draw_mesh
-        wp_coll = _build_scene_draw_mesh(stage, wp, np, device, Usd, UsdGeom)
-        if wp_coll is None:
-            return []
-        meters_per_unit = float(UsdGeom.GetStageMetersPerUnit(stage) or 1.0)
-        stage_unit_scale = 1.0 / max(meters_per_unit, 1e-6)
-        sim_scale = max(float(cfg.get("simScale", 1.0)), 1e-4)
-        unit_scale = stage_unit_scale * sim_scale
-        new_path = "/Scene/CreatedHair"
-        if not stage.GetPrimAtPath("/Scene").IsValid():
-            UsdGeom.Xform.Define(stage, "/Scene")
-        UsdGeom.BasisCurves.Define(stage, new_path)
-        scaled_margin = float(cfg.get("collisionMargin", 0.004)) * unit_scale
-        boot_sess = {
-            "_bootstrap_only": True,
-            "num_strands": 0,
-            "total_verts": 0,
-            "counts_np": np.zeros(0, dtype=np.int32),
-            "wp_collider": wp_coll,
-            "unit_scale": unit_scale,
-            "scaled_margin": scaled_margin,
-            "max_query_dist": max(0.5 * unit_scale, scaled_margin * 20.0),
-        }
-        radius = max(float(brush.get("radius", 0.06)), 0.005)
-        strength = max(0.05, min(2.0, float(brush.get("strength", 0.65))))
-        tip_pct = float(brush.get("drawTipPct", 25.0))
-        density = brush.get("drawDensity")
-        created = _apply_draw_lock_brush(
-            stage, new_path, boot_sess, brush["drawCurve"], radius * unit_scale, strength,
-            cam_basis, wp, np, device, Vt, UsdGeom, tip_pct=tip_pct, density=density,
-        )
-        if not created:
-            stage.RemovePrim(new_path)
-            return []
-        global _BRUSH_CURVE_INDEX
-        if _BRUSH_CURVE_INDEX is not None:
-            _BRUSH_CURVE_INDEX.paths = None
-        apply_hair_simulation(stage, {**cfg, "settleSteps": 0, "gravity": 0.0}, query_matcher)
-        sess_new = _ACTIVE_SIM_SESSIONS.get(new_path)
-        if sess_new is None:
-            return []
-        sess_new["topology_dirty"] = True
-        sess_new["needs_stage_repopulate"] = True
-        sess_new["dirty_groom"] = True
-        sess_new["_brush_scene_collider"] = wp_coll
-        sess_new["_brush_scene_collider_checked"] = True
-        local_np = _session_local_points(sess_new, np)
-        return [(new_path, local_np)]
+        created_paths = tuple(p for p in matching_paths if _is_created_hair_path(p))
+        if created_paths:
+            matching_paths = created_paths
+        else:
+            # Always create drawn hair locks in /Scene/CreatedHair so Draw Lock works even
+            # when Target curves points at eyelashes/eyebrows, is None, or the preview is
+            # pinned downstream of a multi-input merge.
+            from hair_topology_brushes import _build_scene_draw_mesh
+            wp_coll = _build_scene_draw_mesh(stage, wp, np, device, Usd, UsdGeom)
+            if wp_coll is None:
+                return []
+            meters_per_unit = float(UsdGeom.GetStageMetersPerUnit(stage) or 1.0)
+            stage_unit_scale = 1.0 / max(meters_per_unit, 1e-6)
+            sim_scale = max(float(cfg.get("simScale", 1.0)), 1e-4)
+            unit_scale = stage_unit_scale * sim_scale
+            new_path = "/Scene/CreatedHair"
+            if not stage.GetPrimAtPath("/Scene").IsValid():
+                UsdGeom.Xform.Define(stage, "/Scene")
+            UsdGeom.BasisCurves.Define(stage, new_path)
+            scaled_margin = float(cfg.get("collisionMargin", 0.004)) * unit_scale
+            boot_sess = {
+                "_bootstrap_only": True,
+                "num_strands": 0,
+                "total_verts": 0,
+                "counts_np": np.zeros(0, dtype=np.int32),
+                "wp_collider": wp_coll,
+                "unit_scale": unit_scale,
+                "scaled_margin": scaled_margin,
+                "max_query_dist": max(0.5 * unit_scale, scaled_margin * 20.0),
+            }
+            radius = max(float(brush.get("radius", 0.06)), 0.005)
+            strength = max(0.05, min(2.0, float(brush.get("strength", 0.65))))
+            tip_pct = float(brush.get("drawTipPct", 25.0))
+            density = brush.get("drawDensity")
+            created = _apply_draw_lock_brush(
+                stage, new_path, boot_sess, brush["drawCurve"], radius * unit_scale, strength,
+                cam_basis, wp, np, device, Vt, UsdGeom, tip_pct=tip_pct, density=density,
+            )
+            if not created:
+                stage.RemovePrim(new_path)
+                return []
+            global _BRUSH_CURVE_INDEX
+            if _BRUSH_CURVE_INDEX is not None:
+                _BRUSH_CURVE_INDEX.paths = None
+            apply_hair_simulation(stage, {**cfg, "settleSteps": 0, "gravity": 0.0}, query_matcher)
+            sess_new = _ACTIVE_SIM_SESSIONS.get(new_path)
+            if sess_new is None:
+                return []
+            sess_new["topology_dirty"] = True
+            sess_new["needs_stage_repopulate"] = True
+            sess_new["dirty_groom"] = True
+            sess_new["_brush_scene_collider"] = wp_coll
+            sess_new["_brush_scene_collider_checked"] = True
+            local_np = _session_local_points(sess_new, np)
+            return [(new_path, local_np)]
 
     if any(path not in _ACTIVE_SIM_SESSIONS for path in matching_paths):
         apply_hair_simulation(stage, cfg, query_matcher)
@@ -1985,7 +2005,7 @@ def pop_topology_changed(stage, hair_cfg, query_matcher):
     raw_query = str(cfg.get("targetQuery") or "").strip()
     changed = False
     for p_str, sess in _ACTIVE_SIM_SESSIONS.items():
-        if not sess.get("needs_stage_repopulate") or not query_matcher(raw_query, p_str):
+        if not sess.get("needs_stage_repopulate") or not _hair_matches_or_created(query_matcher, raw_query, p_str):
             continue
         prim = stage.GetPrimAtPath(p_str)
         if not prim or not prim.IsActive() or not prim.IsLoaded() or not prim.IsDefined() or prim.IsAbstract():

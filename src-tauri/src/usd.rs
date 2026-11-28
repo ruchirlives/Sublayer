@@ -200,6 +200,25 @@ struct Worker {
     input: ChildStdin,
     responses: Receiver<WorkerResponse>,
 }
+
+fn create_ovrtx_scratch() -> Result<tempfile::TempDir, String> {
+    // Runtime binaries may live in Program Files. Preview data belongs to the
+    // current user, regardless of which runtime installation was discovered.
+    let scratch_root = crate::runtime_setup::runtimes_root().join("ovrtx/scratch");
+    std::fs::create_dir_all(&scratch_root)
+        .and_then(|_| {
+            tempfile::Builder::new()
+                .prefix("preview-")
+                .tempdir_in(&scratch_root)
+        })
+        .map_err(|e| {
+            format!(
+                "Cannot create NVIDIA preview folder in {}: {e}",
+                scratch_root.display()
+            )
+        })
+}
+
 impl Worker {
     fn start(status_listener: Option<StatusListener>) -> Result<Self, String> {
         let python = crate::runtime_setup::find_imaging_python()
@@ -256,28 +275,17 @@ impl Worker {
             "Cannot find Omniverse RTX Python executable. Run Sublayer Runtime Setup or scripts/setup-ovrtx.ps1."
                 .to_string()
         })?;
+        let python = std::path::absolute(python)
+            .map_err(|e| format!("Cannot resolve Omniverse RTX Python path: {e}"))?;
         let script = find_ovrtx_worker_script();
         let runtime = crate::runtime_setup::find_ovrtx_root();
-        let scratch_root = runtime.join("scratch");
-        let scratch = std::fs::create_dir_all(&scratch_root)
-            .and_then(|_| {
-                tempfile::Builder::new()
-                    .prefix("preview-")
-                    .tempdir_in(&scratch_root)
-            })
-            .map_err(|e| {
-                format!(
-                    "Cannot create NVIDIA preview folder in {}: {e}",
-                    scratch_root.display()
-                )
-            })?;
+        let scratch = create_ovrtx_scratch()?;
         let mut command = Command::new(python);
-        if let Some(parent) = script.parent().and_then(|p| p.parent()) {
-            if parent.exists() {
-                command.current_dir(parent);
-            }
-        }
+        let script = std::path::absolute(script)
+            .map_err(|e| format!("Cannot resolve Omniverse RTX worker path: {e}"))?;
         command
+            .current_dir(scratch.path())
+            .env("PYTHONDONTWRITEBYTECODE", "1")
             .env("ORCHFLOW_OVRTX_ROOT", &runtime)
             .env("ORCHFLOW_OVRTX_SCRATCH", scratch.path())
             .arg("-u")
@@ -494,6 +502,8 @@ impl UsdService {
             Some("reset_hair"),
             Some("convert_source_to_usd"),
             Some("sp_build_materials"),
+            Some("sp_extract_normal_maps"),
+            Some("sp_extract_pbr_maps"),
         ]
         .contains(&op)
         {
@@ -678,6 +688,16 @@ impl UsdService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ovrtx_preview_uses_writable_user_storage_and_cleans_up() {
+        let scratch = create_ovrtx_scratch().unwrap();
+        let path = scratch.path().to_path_buf();
+        assert!(path.starts_with(crate::runtime_setup::runtimes_root().join("ovrtx/scratch")));
+        std::fs::write(path.join("preview.usda"), b"#usda 1.0\n").unwrap();
+        drop(scratch);
+        assert!(!path.exists());
+    }
+
     #[test]
     fn ovrtx_discovery_finds_runtime_and_venv() {
         assert!(is_ovrtx_available());
@@ -874,14 +894,17 @@ mod worker_job_tests {
     #[ignore = "requires installed NVIDIA GPU runtime and explicit render-test authorization"]
     fn rtx_scene_replacement_uses_fresh_workers() {
         let service = UsdService::default();
+        let scene = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../samples/cube.usda");
         for key in ["scene-a", "scene-b", "scene-a"] {
-            let response = service.request(serde_json::json!({
-                "operation":"render", "renderer":"OmniverseRTX", "graphKey":key,
-                "graph": {"namespaceVersion":2,"targetNodeId":"source",
-                    "nodes":[{"id":"source","operation":"source","inputDependencyId":"asset"}],
-                    "edges":[],"dependencies":[{"id":"asset","kind":"usd","path":"I:/AI/OrchFlow-build/ovrtx-navigation/plane-cubes.usda"}]},
-                "width":320,"height":180,"yaw":35,"pitch":25,"zoom":1,"interactive":true
-            })).unwrap();
+            let response = service
+                .request(serde_json::json!({
+                    "operation":"render", "renderer":"OmniverseRTX", "graphKey":key,
+                    "graph": {"namespaceVersion":2,"targetNodeId":"source",
+                        "nodes":[{"id":"source","operation":"source","inputDependencyId":"asset"}],
+                        "edges":[],"dependencies":[{"id":"asset","kind":"usd","path":scene}]},
+                    "width":320,"height":180,"yaw":35,"pitch":25,"zoom":1,"interactive":true
+                }))
+                .unwrap();
             assert_eq!(response["width"], 320);
             assert!(
                 response["image"]

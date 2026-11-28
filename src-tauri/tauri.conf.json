@@ -29,9 +29,10 @@
                    "resources":  {
                                      "../worker/*.py":  "worker/",
                                      "../scripts/installer-runtimes.ps1":  "scripts/installer-runtimes.ps1",
+                                     "../worker/requirements-ovrtx.txt":  "scripts/requirements-ovrtx.txt",
                                      "../LICENSE":  "LICENSE",
                                      "../LICENSE-EXCEPTION.md":  "LICENSE-EXCEPTION.md",
-                                     "staged-aurora/**/*":  "renderers/aurora/"
+                                     "staged-aurora/":  "renderers/aurora/"
                                  },
                    "windows":  {
                                    "nsis":  {

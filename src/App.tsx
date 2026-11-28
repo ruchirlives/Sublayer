@@ -1,3 +1,4 @@
+import { FogInspector } from "./FogInspector";
 import type { PoseEditing } from "./PoseViewportEditor";
 import {InspectorHint} from "./InspectorHint";
 import {HdriInspector} from "./HdriInspector";
@@ -36,6 +37,7 @@ import {
   identityTransform,
   defaultScatter,
   defaultPostFx,
+  defaultFog,
   registerFiles,
   editNodeData,
   expandProject,
@@ -335,7 +337,7 @@ const Card = memo(function Card({ id, data, selected }: NodeProps<StageNode>) {
       <div className="card-body">
         <strong>{data.label}</strong>
         <p>
-          {["delete", "scatter", "instancer", "transform", "group", "output", "assetOverride", "materialx", "material_bind", "light", "hdri", "postfx", "hair", "cache_edit", "pose", "character"].includes(data.operation)
+          {["delete", "scatter", "instancer", "transform", "group", "output", "assetOverride", "materialx", "material_bind", "light", "hdri", "fog", "postfx", "hair", "cache_edit", "pose", "character"].includes(data.operation)
             ? "Combined USD inputs"
             : data.operation === "blender"
               ? (data.nativeProject?.split(/[\\/]/).pop() || "No .blend linked")
@@ -385,6 +387,8 @@ const Card = memo(function Card({ id, data, selected }: NodeProps<StageNode>) {
           ? `${(data.pose?.mappings || []).filter(r => r.enabled !== false && r.entryId).length} skeleton mappings`
           : data.operation === "character"
           ? `${(data.character?.animationOverrides || []).filter((r) => r.enabled).length} anim · ${(data.character?.skeletonBindings || []).filter((r) => r.enabled).length} skel · ${(data.character?.jointAttachments || []).filter((r) => r.enabled).length} joint`
+          : data.operation === "fog"
+          ? ((data.fog?.enabled ?? true) ? "Atmosphere / VDB shading" : "Fog bypassed")
           : data.operation === "postfx"
           ? (() => {
               const fx = { ...defaultPostFx, ...(data.postFx || {}) };
@@ -975,7 +979,7 @@ function Workspace() {
       const label=operation === "materialx"?"MaterialX":operation === "material_bind"?"Material Bind":operation === "light"?"Light":operation === "hdri"?"HDRI":operation === "postfx"?"PostFX":operation === "hair"?"Hair":operation === "cache_edit"?"Cache Sculptor":operation === "character"?"Character":operation === "camera"?"Camera":operation === "metahuman"?"MetaHuman":operation === "blender"?"Blender":operation === "assetOverride"?"Asset Override":operation === "source"?"Source stage":operation[0].toUpperCase()+operation.slice(1);
       const defaultCamera = { yaw: 35, pitch: 20, zoom: 1, panX: 0, panY: 0, fov: 45, dofEnabled: false, focusDistance: 5, fStop: 5.6 };
       const initialCamera = { ...defaultCamera, ...(projectRef.current.viewport?.camera ?? {}) };
-      const added=storeProject([{...seed[0],id,position,data:{...seed[0].data,label,operation,transform:structuredClone(identityTransform),...(operation === "application" ? defaultApplicationFields() : {}),...(operation === "postfx" ? { postFx: structuredClone(defaultPostFx) } : {}),...(operation === "cache_edit" ? { cacheEdit: structuredClone(defaultCacheEditSettings) } : {}),...(operation === "character" ? { character: structuredClone(defaultCharacterSettings) } : {}),...(operation === "camera" ? { cameraViews: [{ id: crypto.randomUUID(), name: "Camera 1", camera: initialCamera }] } : {})}}],[],[]).nodes[0];
+      const added=storeProject([{...seed[0],id,position,data:{...seed[0].data,label,operation,transform:structuredClone(identityTransform),...(operation === "application" ? defaultApplicationFields() : {}),...(operation === "fog" ? { fog: structuredClone(defaultFog) } : {}),...(operation === "postfx" ? { postFx: structuredClone(defaultPostFx) } : {}),...(operation === "cache_edit" ? { cacheEdit: structuredClone(defaultCacheEditSettings) } : {}),...(operation === "character" ? { character: structuredClone(defaultCharacterSettings) } : {}),...(operation === "camera" ? { cameraViews: [{ id: crypto.randomUUID(), name: "Camera 1", camera: initialCamera }] } : {})}}],[],[]).nodes[0];
       try {
         const target=targetAt(event.target);
         applyProject(insertToolbarNode(projectRef.current,added,target),"Insert node");select(id);
@@ -1112,7 +1116,7 @@ function Workspace() {
           operation,
           transform: structuredClone(identityTransform),
           ...(operation === "application" ? defaultApplicationFields() : {}),
-          ...(operation === "postfx" ? { postFx: structuredClone(defaultPostFx) } : {}),
+          ...(operation === "fog" ? { fog: structuredClone(defaultFog) } : {}),...(operation === "postfx" ? { postFx: structuredClone(defaultPostFx) } : {}),
           ...(operation === "cache_edit" ? { cacheEdit: structuredClone(defaultCacheEditSettings) } : {}),
           ...(operation === "camera"
             ? {
@@ -1424,6 +1428,7 @@ function Workspace() {
                 let settings: Record<string, unknown> | undefined;
                 if (op === "light") settings = { lightOverrides: d.lightOverrides ?? [], scale: d.scale ?? 1, lightIntensityScale: d.lightIntensityScale ?? 1 };
                 else if (op === "hdri") settings = { hdri: d.hdri ?? null };
+                else if (op === "fog") settings = { fog: d.fog ?? defaultFog };
                 else if (op === "postfx") settings = { postFx: d.postFx ?? null };
                 else if (op === "materialx") settings = d.materialXRules ? { materialXRules: d.materialXRules } : { materialX: d.materialX ?? null };
                 else if (op === "transform") settings = { transform: d.transform ?? null, transformTargets: d.transformTargets ?? null };
@@ -2118,6 +2123,7 @@ function Workspace() {
                 ["material_bind", "Material Bind"],
                 ["light", "Light"],
                 ["hdri", "HDRI"],
+                ["fog", "Fog"],
                 ["postfx", "PostFX"],
                 ["hair", "Hair"],
                 ["cache_edit", "Cache Sculptor"],
@@ -2537,6 +2543,8 @@ function Workspace() {
                     onStatus={reportStatus}
                   />
                 )}
+
+                {node.data.operation === "fog" && <FogInspector value={node.data.fog} onChange={fog => update({ fog })} />}
 
                 {node.data.operation === "postfx" && (
                   <PostFxInspector

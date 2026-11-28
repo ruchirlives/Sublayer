@@ -477,6 +477,8 @@ pub struct NodeData {
     pub hdri: Option<HdriSettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub post_fx: Option<PostFxSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fog: Option<FogSettings>,
     #[serde(default)]
     pub hair: Option<HairSettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1080,6 +1082,40 @@ fn default_hdri_color() -> [f64; 3] {
 }
 fn default_hdri_format() -> String {
     "latlong".into()
+}
+
+fn valid_fog_prim_path(path: &str) -> bool {
+    path.starts_with('/')
+        && path.len() > 1
+        && path.split('/').skip(1).all(|part| {
+            !part.is_empty()
+                && part.chars().enumerate().all(|(i, c)| {
+                    c == '_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit())
+                })
+        })
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FogSettings {
+    pub enabled: bool,
+    pub atmosphere_enabled: bool,
+    pub volumes_enabled: bool,
+    pub color: [f64; 3],
+    pub intensity: f64,
+    pub distance_density: f64,
+    pub start_distance: f64,
+    pub end_distance: f64,
+    pub height: f64,
+    pub height_density: f64,
+    pub height_falloff: f64,
+    pub volume_paths: Vec<String>,
+    pub volume_auto_bounds: bool,
+    pub volume_center: [f64; 3],
+    pub volume_size: [f64; 3],
+    pub density_scale: f64,
+    pub volume_color: [f64; 3],
+    pub anisotropy: f64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -1840,6 +1876,7 @@ impl Project {
                     "light",
                     "hdri",
                     "postfx",
+                    "fog",
                     "hair",
                     "cache_edit",
                     "camera",
@@ -2435,6 +2472,42 @@ impl Project {
                     }
                 }
             }
+            if let Some(f) = &n.data.fog {
+                if ![
+                    f.intensity,
+                    f.distance_density,
+                    f.start_distance,
+                    f.end_distance,
+                    f.height_density,
+                    f.height_falloff,
+                    f.density_scale,
+                ]
+                .iter()
+                .all(|v| v.is_finite() && *v >= 0.0 && *v <= 1e12)
+                    || !f.height.is_finite()
+                    || f.height.abs() > 1e12
+                    || f.end_distance <= f.start_distance
+                    || !f.anisotropy.is_finite()
+                    || f.anisotropy.abs() > 0.99
+                    || !f
+                        .color
+                        .iter()
+                        .chain(f.volume_color.iter())
+                        .all(|v| v.is_finite() && (0.0..=1.0).contains(v))
+                    || !f
+                        .volume_center
+                        .iter()
+                        .all(|v| v.is_finite() && v.abs() <= 1e12)
+                    || !f
+                        .volume_size
+                        .iter()
+                        .all(|v| v.is_finite() && *v > 0.0 && *v <= 1e12)
+                    || f.volume_paths.len() > 10000
+                    || f.volume_paths.iter().any(|p| !valid_fog_prim_path(p))
+                {
+                    return Err("Invalid Fog settings: check distances, density, color, anisotropy and volume prim paths".into());
+                }
+            }
             if n.data.operation == "postfx" {
                 if let Some(p) = &n.data.post_fx {
                     let valid_ops = [
@@ -2965,6 +3038,34 @@ mod tests {
         p.nodes[0].data.instancer.as_mut().unwrap().instances.pop();
         p.nodes[0].data.instancer.as_mut().unwrap().movement = "invalid".into();
         assert!(p.validate().is_err());
+    }
+
+    #[test]
+    fn fog_validates_and_round_trips_to_domain_graph() {
+        let mut p = project();
+        p.nodes[0].data.operation = "fog".into();
+        let config = serde_json::json!({"enabled":true,"atmosphereEnabled":true,"volumesEnabled":true,
+            "color":[0.75,0.75,0.75],"intensity":1.0,"distanceDensity":0.1,
+            "startDistance":0.0,"endDistance":100.0,"height":0.0,"heightDensity":0.0,"heightFalloff":1.0,
+            "volumePaths":["/Scene/Volume"],"volumeAutoBounds":true,"volumeCenter":[0.0,0.0,0.0],"volumeSize":[2.0,2.0,2.0],
+            "densityScale":2.0,"volumeColor":[0.9,0.9,0.9],"anisotropy":0.0});
+        p.nodes[0].data.fog = Some(serde_json::from_value(config.clone()).unwrap());
+        let restored = Project::from_value(serde_json::to_value(&p).unwrap()).unwrap();
+        let graph = crate::application::evaluation_graph(&restored, &p.nodes[0].id, false).unwrap();
+        assert_eq!(graph["nodes"][0]["fog"], config);
+        for (key, value) in [
+            ("endDistance", serde_json::json!(0)),
+            ("densityScale", serde_json::json!(-1)),
+            ("anisotropy", serde_json::json!(1)),
+            ("color", serde_json::json!([2, 0, 0])),
+            ("volumeSize", serde_json::json!([0, 1, 1])),
+            ("volumePaths", serde_json::json!(["/Scene/../Volume"])),
+        ] {
+            let mut bad = config.clone();
+            bad[key] = value;
+            p.nodes[0].data.fog = Some(serde_json::from_value(bad).unwrap());
+            assert!(p.validate().is_err(), "accepted invalid Fog {key}");
+        }
     }
 
     #[test]

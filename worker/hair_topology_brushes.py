@@ -1211,12 +1211,15 @@ def _apply_draw_lock_brush(stage, p_str, sess, draw_curve, scaled_radius, streng
     # Natural tapered strand widths
     if widths_np is not None and len(widths_np) > 0:
         med_w = float(np.median(widths_np))
-        if widths_interp == "uniform":
+        if widths_interp == "constant" or (len(widths_np) == 1 and num_strands > 1):
+            new_widths = widths_np
+        elif widths_interp == "uniform":
             added_w = np.full(n_spawn, med_w, dtype=np.float32)
+            new_widths = np.concatenate([widths_np, added_w])
         else:
             strand_w = (med_w * (1.25 - 0.75 * (u_t ** 1.35))).astype(np.float32)
             added_w = np.tile(strand_w, n_spawn)
-        new_widths = np.concatenate([widths_np, added_w])
+            new_widths = np.concatenate([widths_np, added_w])
     else:
         base_w = 0.0005 * unit_scale
         strand_w = (base_w * (1.0 - 0.65 * (u_t ** 1.35))).astype(np.float32)

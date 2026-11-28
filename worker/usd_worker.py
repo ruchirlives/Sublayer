@@ -16,6 +16,7 @@ import sys
 import time
 import functools
 import usd_graph
+import fog
 if 'compile_graph' not in globals():
     from usd_graph import compile_graph, coordinate_preflight, export_handoff, materialx_document, materialx_rule_matches, asset_override_inputs, reuse_handoff, inspect_stage_materials, inspect_stage_lights, inspect_stage_curves, inspect_stage_skeletons, export_character_body, export_md_bridge_handoff, convert_source_to_usd, clear_graph_caches, query_scene_children, compute_material_users, resolve_prim_material, _open_source_stage, _build_transform_matrix
 from usd_graph import editable_hair_node_id, graph_after_groom_commit, groom_frame_view, open_hair_preview_stage
@@ -1357,7 +1358,7 @@ class Viewport:
                               + ((f'Solid fallback applied to {len(fallback_materials)} material(s); other materials remain enabled and source USD is unchanged.' if fallback_materials else 'No connected materials affected; scene shading is retained and source USD is unchanged.') if materials == 'auto' else
                                  'Scene materials may render incorrectly or transparently.' if scene_materials else
                                  'Solid preview does not use scene materials.')]
-                             if missing_assets else []) + ([f'{len(self.shader_issues)} invalid shader primvar input(s). '+ ('Affected materials use solid fallback; no UV set was guessed or source USD changed.' if materials=='auto' else 'Solid preview ignores these materials.')] if self.shader_issues else []),
+                             if missing_assets else []) + ([f'{len(self.shader_issues)} invalid shader primvar input(s). '+ ('Affected materials use solid fallback; no UV set was guessed or source USD changed.' if materials=='auto' else 'Solid preview ignores these materials.')] if self.shader_issues else []) + fog.warnings(graph, renderer),
                 'rendererCapabilities': self.renderer_capabilities or {
                     'aovs': [str(aov) for aov in engine.GetRendererAovs()],
                     'pause': engine.IsPauseRendererSupported(),
@@ -1595,6 +1596,20 @@ def dispatch(request):
             raise ValueError('sp_build_materials requires graph and manifest')
         stage, _keepalive, _ = compile_graph(json.loads(graph) if isinstance(graph, str) else graph)
         return build_sp_material_layer(stage, manifest)
+    if operation == 'sp_extract_normal_maps':
+        from sp_materials import extract_stage_normal_maps
+        graph = request.get('graph')
+        if not graph:
+            raise ValueError('sp_extract_normal_maps requires graph')
+        stage, _keepalive, _ = compile_graph(json.loads(graph) if isinstance(graph, str) else graph)
+        return {'normalMaps': extract_stage_normal_maps(stage)}
+    if operation == 'sp_extract_pbr_maps':
+        from sp_materials import extract_stage_pbr_maps
+        graph = request.get('graph')
+        if not graph:
+            raise ValueError('sp_extract_pbr_maps requires graph')
+        stage, _keepalive, _ = compile_graph(json.loads(graph) if isinstance(graph, str) else graph)
+        return {'pbrMaps': extract_stage_pbr_maps(stage)}
     if operation != 'inspect':
         raise ValueError('Unsupported USD worker operation')
     path = request.get('path')

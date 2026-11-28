@@ -202,6 +202,21 @@ export function SubstancePainterPanel({
     });
   }
 
+  async function handleSendPbrMaps() {
+    await runAction(async () => {
+      setMessage("Sending upstream PBR maps to Substance Painter...");
+      const res = await invoke<{ importedCount?: number; assignedMeshMaps?: string[] }>(
+        "send_sp_upstream_pbr_maps",
+        { project, nodeId },
+      );
+      const imported = res.importedCount ?? 0;
+      const assigned = res.assignedMeshMaps?.length ?? 0;
+      const text = `Imported ${imported} PBR texture(s) into SP Project resources${assigned ? ` and assigned ${assigned} mesh map(s)` : ""}.`;
+      setMessage(text);
+      onStatus(text);
+    });
+  }
+
   async function handleImportManifest() {
     await runAction(async () => {
       const manifestPath = await open({
@@ -279,6 +294,14 @@ export function SubstancePainterPanel({
           onClick={() => void handleChooseExportFolder()}
         >
           Folder…
+        </button>
+        <button
+          type="button"
+          disabled={busy || !isTauri() || !bridge?.connected || !bridge?.projectOpen}
+          title="Import upstream PBR maps (BaseColor, Roughness, Metallic, Normal, AO, etc.) into SP Project resources and assign Normal/AO mesh maps"
+          onClick={() => void handleSendPbrMaps()}
+        >
+          Send PBR Maps to SP
         </button>
         <button type="button" disabled={busy || !isTauri()} onClick={() => void handleImportManifest()}>
           Import SP Manifest

@@ -52,10 +52,21 @@ function Test-OpenUsdInstalled {
     return ((Test-Path -LiteralPath $usd) -or ($env:ORCHFLOW_USD_ROOT -and (Test-Path -LiteralPath (Join-Path $env:ORCHFLOW_USD_ROOT 'lib\python\pxr\UsdImagingGL')))) -and (Test-Path -LiteralPath $py)
 }
 
+function Get-OvrtxRequirements {
+    $bundled = Join-Path $PSScriptRoot 'requirements-ovrtx.txt'
+    if (Test-Path -LiteralPath $bundled) { return $bundled }
+    return (Join-Path $PSScriptRoot '../worker/requirements-ovrtx.txt')
+}
+
 function Test-OvrtxInstalled {
     $manifest = Join-Path $script:RuntimesRoot 'ovrtx\runtime.json'
     $py = Join-Path $script:RuntimesRoot 'venv-ovrtx\Scripts\python.exe'
-    return (Test-Path -LiteralPath $manifest) -and (Test-Path -LiteralPath $py)
+    $pxr = Join-Path $script:RuntimesRoot 'venv-ovrtx\Lib\site-packages\pxr\Usd\__init__.py'
+    if (-not ((Test-Path -LiteralPath $manifest) -and (Test-Path -LiteralPath $py) -and (Test-Path -LiteralPath $pxr))) { return $false }
+    try {
+        $status = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
+        return $status.requirementsHash -eq (Get-FileHash -LiteralPath (Get-OvrtxRequirements)).Hash
+    } catch { return $false }
 }
 
 function Test-AuroraInstalled {
@@ -76,7 +87,7 @@ function Test-AuroraInstalled {
 
 $form = New-Object System.Windows.Forms.Form
 $form.Text = 'Sublayer — Optional Runtime Installer'
-$form.Size = New-Object System.Drawing.Size(720, 560)
+$form.Size = New-Object System.Drawing.Size(720, 600)
 $form.StartPosition = 'CenterScreen'
 $form.FormBorderStyle = 'FixedDialog'
 $form.MaximizeBox = $false
@@ -108,6 +119,19 @@ $logBox.Font = New-Object System.Drawing.Font('Consolas', 8.5)
 $logBox.Location = New-Object System.Drawing.Point(18, 336)
 $logBox.Size = New-Object System.Drawing.Size(668, 132)
 $form.Controls.Add($logBox)
+
+$activityLabel = New-Object System.Windows.Forms.Label
+$activityLabel.Location = New-Object System.Drawing.Point(18, 474)
+$activityLabel.Size = New-Object System.Drawing.Size(668, 22)
+$activityLabel.Text = 'Ready'
+$form.Controls.Add($activityLabel)
+
+$progressBar = New-Object System.Windows.Forms.ProgressBar
+$progressBar.Location = New-Object System.Drawing.Point(18, 498)
+$progressBar.Size = New-Object System.Drawing.Size(668, 12)
+$form.Controls.Add($progressBar)
+$script:Busy = $false
+$form.Add_FormClosing({ param($sender, $eventArgs) $eventArgs.Cancel = $script:Busy })
 
 function Write-Log([string]$msg) {
     if ($logBox.IsDisposed) { return }
@@ -162,7 +186,8 @@ function Add-RuntimeRow([int]$y, [string]$name, [string]$desc, [bool]$defaultChe
 function Invoke-StreamingCommand([string]$command) {
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = 'powershell.exe'
-    $psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -Command `"$($command -replace '"', '\"')`""
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes("`$ProgressPreference='SilentlyContinue';`n$command"))
+    $psi.Arguments = "-NoProfile -NonInteractive -OutputFormat Text -ExecutionPolicy Bypass -EncodedCommand $encoded"
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
     $psi.RedirectStandardOutput = $true
@@ -170,22 +195,90 @@ function Invoke-StreamingCommand([string]$command) {
 
     $proc = New-Object System.Diagnostics.Process
     $proc.StartInfo = $psi
-    $proc.Start() | Out-Null
-    while (-not $proc.HasExited) {
-        while (-not $proc.StandardOutput.EndOfStream) {
-            $line = $proc.StandardOutput.ReadLine()
-            if ($line) { Write-Log $line }
+    $elapsed = [Diagnostics.Stopwatch]::StartNew()
+    $lastOutput = 0
+    $progressBar.Style = 'Marquee'
+    try {
+        $proc.Start() | Out-Null
+        # Drain both pipes concurrently. EndOfStream/ReadLine block the UI thread
+        # during quiet steps, and an unread stderr pipe can deadlock installers.
+        $stdout = $proc.StandardOutput.ReadLineAsync()
+        $stderr = $proc.StandardError.ReadLineAsync()
+        while ($null -ne $stdout -or $null -ne $stderr -or -not $proc.HasExited) {
+            foreach ($stream in @('stdout', 'stderr')) {
+                $pending = Get-Variable -Name $stream -ValueOnly
+                $drained = 0
+                while ($null -ne $pending -and $pending.IsCompleted -and $drained -lt 100) {
+                    $drained++
+                    $line = $pending.GetAwaiter().GetResult()
+                    if ($null -eq $line) {
+                        Set-Variable -Name $stream -Value $null
+                    } else {
+                        $lastOutput = $elapsed.Elapsed.TotalSeconds
+                        if ($stream -eq 'stdout' -and $line -match '^PROGRESS\|(\d+)\|(.*)$') {
+                            $progressBar.Style = 'Continuous'
+                            $progressBar.Value = [Math]::Min(100, [int]$Matches[1])
+                            Write-Log $Matches[2]
+                        } elseif ($line) {
+                            $progressBar.Style = 'Marquee'
+                            Write-Log $line
+                        }
+                        $reader = if ($stream -eq 'stdout') { $proc.StandardOutput } else { $proc.StandardError }
+                        Set-Variable -Name $stream -Value ($reader.ReadLineAsync())
+                    }
+                    $pending = Get-Variable -Name $stream -ValueOnly
+                }
+            }
+            $quiet = [int]($elapsed.Elapsed.TotalSeconds - $lastOutput)
+            $activityLabel.Text = "Running - elapsed $($elapsed.Elapsed.ToString('hh\:mm\:ss')); last output $quiet s ago"
+            [System.Windows.Forms.Application]::DoEvents()
+            Start-Sleep -Milliseconds 60
         }
-        [System.Windows.Forms.Application]::DoEvents()
-        Start-Sleep -Milliseconds 60
+        $proc.WaitForExit()
+        if ($proc.ExitCode -ne 0) {
+            $activityLabel.Text = "Failed after $($elapsed.Elapsed.ToString('hh\:mm\:ss')) - see log"
+            throw "Command failed with exit code $($proc.ExitCode)"
+        }
+        $activityLabel.Text = "Completed in $($elapsed.Elapsed.ToString('hh\:mm\:ss'))"
+    } finally {
+        $progressBar.Style = 'Continuous'
+        $proc.Dispose()
     }
-    $outRest = $proc.StandardOutput.ReadToEnd()
-    $errRest = $proc.StandardError.ReadToEnd()
-    foreach ($l in ($outRest -split "`r?`n")) { if ($l.Trim()) { Write-Log $l } }
-    foreach ($l in ($errRest -split "`r?`n")) { if ($l.Trim()) { Write-Log "ERR: $l" } }
-    if ($proc.ExitCode -ne 0) {
-        throw "Command failed with exit code $($proc.ExitCode)"
-    }
+}
+
+# Sent to the worker process so decompression never runs on the window thread.
+$script:ExtractWithProgress = {
+    param([string]$Archive, [string]$Destination)
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $root = [IO.Path]::GetFullPath($Destination).TrimEnd('\') + '\'
+    [IO.Directory]::CreateDirectory($root) | Out-Null
+    $zip = [IO.Compression.ZipFile]::OpenRead($Archive)
+    try {
+        $total = $zip.Entries.Count
+        $done = 0
+        [long]$bytes = 0
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        $nextReport = 0
+        foreach ($entry in $zip.Entries) {
+            $target = [IO.Path]::GetFullPath([IO.Path]::Combine($root, $entry.FullName))
+            if (-not $target.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) {
+                throw "Archive entry escapes destination: $($entry.FullName)"
+            }
+            if (-not $entry.Name) {
+                [IO.Directory]::CreateDirectory($target) | Out-Null
+            } else {
+                [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($target)) | Out-Null
+                [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $target, $true)
+                $bytes += $entry.Length
+            }
+            $done++
+            if ($clock.Elapsed.TotalSeconds -ge $nextReport -or $done -eq $total) {
+                $percent = [int][Math]::Floor(100.0 * $done / [Math]::Max(1, $total))
+                Write-Output "PROGRESS|$percent|Extracting OpenUSD: $done / $total entries ($percent%); $([Math]::Round($bytes / 1MB)) MB extracted"
+                $nextReport = $clock.Elapsed.TotalSeconds + 1
+            }
+        }
+    } finally { $zip.Dispose() }
 }
 
 function Install-Uv {
@@ -220,7 +313,7 @@ if (-not (Test-Path -LiteralPath '$usdDest\lib\python\pxr\UsdImagingGL')) {
   }
   Write-Output 'Extracting OpenUSD 25.08...'
   New-Item -ItemType Directory -Force -Path '$usdDest' | Out-Null
-  Expand-Archive -LiteralPath '$zipPath' -DestinationPath '$usdDest' -Force
+  & { $($script:ExtractWithProgress.ToString()) } -Archive '$zipPath' -Destination '$usdDest'
   Remove-Item -LiteralPath '$zipPath' -Force -ErrorAction SilentlyContinue
 } else {
   Write-Output 'OpenUSD 25.08 already present.'
@@ -249,6 +342,8 @@ function Install-Ovrtx {
     $venvDir = Join-Path $script:RuntimesRoot 'venv-ovrtx'
     $venvPy = Join-Path $venvDir 'Scripts\python.exe'
     $manifest = Join-Path $ovrtxRoot 'runtime.json'
+    $requirements = Get-OvrtxRequirements
+    $requirementsHash = (Get-FileHash -LiteralPath $requirements).Hash
     Write-Log '--- Installing NVIDIA Omniverse RTX (ovrtx) ---'
     $cmd = @"
 `$ErrorActionPreference='Stop'
@@ -258,12 +353,14 @@ if (-not (Test-Path -LiteralPath '$venvPy')) {
   if (`$LASTEXITCODE -ne 0) { throw 'Failed to create Python 3.12 venv' }
 }
 Write-Output 'Installing ovrtx, ovstage, numpy, pillow...'
-& '$uv' pip install --python '$venvPy' 'ovrtx>=0.5' 'ovstage>=0.2' 'numpy>=1.26' 'pillow>=10.0'
+& '$uv' pip install --python '$venvPy' -r '$requirements'
 if (`$LASTEXITCODE -ne 0) { throw 'Failed to install ovrtx packages' }
 New-Item -ItemType Directory -Force -Path '$ovrtxRoot' | Out-Null
-`$json = & '$venvPy' -c "import json, sys, ovrtx, ovstage; ovrtx.register_schema_paths(); print(json.dumps({'name':'NVIDIA Omniverse RTX','installed':True,'available':True,'ovrtxVersion':str(getattr(ovrtx,'__version__','unknown')),'ovstageVersion':str(getattr(ovstage,'__version__','unknown')),'pythonExecutable':sys.executable,'features':['Real-Time Ray Tracing (RTX)','Path Tracing (RTX)','MaterialX Shading','MDL Shading'],'message':'Omniverse RTX runtime ready.'}, indent=2))"
+`$json = & '$venvPy' -B -c "import json, sys, ovrtx, ovstage; from pxr import Usd; assert Usd.Stage.CreateInMemory(); ovrtx.register_schema_paths(); print(json.dumps({'name':'NVIDIA Omniverse RTX','installed':True,'available':True,'ovrtxVersion':str(getattr(ovrtx,'__version__','unknown')),'ovstageVersion':str(getattr(ovstage,'__version__','unknown')),'pythonExecutable':sys.executable,'features':['Real-Time Ray Tracing (RTX)','Path Tracing (RTX)','MaterialX Shading','MDL Shading'],'message':'Omniverse RTX runtime ready.'}, indent=2))"
 if (`$LASTEXITCODE -ne 0) { throw 'Omniverse RTX probe failed' }
-[System.IO.File]::WriteAllText('$manifest', `$json, [System.Text.UTF8Encoding]::new(`$false))
+`$status = (`$json -join [Environment]::NewLine) | ConvertFrom-Json
+`$status | Add-Member -NotePropertyName requirementsHash -NotePropertyValue '$requirementsHash'
+[System.IO.File]::WriteAllText('$manifest', (`$status | ConvertTo-Json -Depth 4), [System.Text.UTF8Encoding]::new(`$false))
 Write-Output 'NVIDIA Omniverse RTX ready.'
 "@
     Invoke-StreamingCommand $cmd
@@ -301,7 +398,7 @@ $installSelBtn.Text = 'Install Selected'
 $installSelBtn.FlatStyle = 'Flat'
 $installSelBtn.BackColor = [System.Drawing.Color]::FromArgb(37, 135, 88)
 $installSelBtn.ForeColor = [System.Drawing.Color]::White
-$installSelBtn.Location = New-Object System.Drawing.Point(18, 480)
+$installSelBtn.Location = New-Object System.Drawing.Point(18, 520)
 $installSelBtn.Size = New-Object System.Drawing.Size(150, 34)
 $form.Controls.Add($installSelBtn)
 
@@ -310,14 +407,16 @@ $closeBtn.Text = 'Continue / Close'
 $closeBtn.FlatStyle = 'Flat'
 $closeBtn.BackColor = [System.Drawing.Color]::FromArgb(56, 62, 74)
 $closeBtn.ForeColor = [System.Drawing.Color]::White
-$closeBtn.Location = New-Object System.Drawing.Point(536, 480)
+$closeBtn.Location = New-Object System.Drawing.Point(536, 520)
 $closeBtn.Size = New-Object System.Drawing.Size(150, 34)
 $closeBtn.Add_Click({ $form.Close() })
 $form.Controls.Add($closeBtn)
 
 function Set-Busy([bool]$busy) {
+    $script:Busy = $busy
     foreach ($r in @($rowUv, $rowUsd, $rowOvrtx, $rowAurora)) {
         $r.Button.Enabled = -not $busy
+        $r.Check.Enabled = (-not $busy) -and ($r -ne $rowAurora)
     }
     $installSelBtn.Enabled = -not $busy
     $closeBtn.Enabled = -not $busy
@@ -358,6 +457,12 @@ $installSelBtn.Add_Click({
 })
 
 Update-Statuses
-if (-not $Silent) {
+if ($Silent) {
+    # Repair an existing RTX install created by an older wizard. A silent
+    # install on a clean machine does not opt into downloading RTX.
+    if ((Test-Path -LiteralPath (Join-Path $script:RuntimesRoot 'ovrtx\runtime.json')) -and -not (Test-OvrtxInstalled)) {
+        Install-Ovrtx
+    }
+} else {
     [void]$form.ShowDialog()
 }

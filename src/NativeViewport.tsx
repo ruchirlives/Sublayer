@@ -74,7 +74,7 @@ type Frame = {
   vramUsedMb?: number | null;
   vramTotalMb?: number | null;
   cachedScenes?: number;
-  updateKind?: "transform-overlay" | "cache-hit" | "material-delta" | "material-delta-fast" | "full-rebuild" | "hair-delta" | "hair-brush" | "groom-commit" | "groom-xform-delta" | "pose-delta" | "cache-delta" | "postfx-delta";
+  updateKind?: "camera" | "refining" | "transform-overlay" | "cache-hit" | "material-delta" | "material-delta-fast" | "full-rebuild" | "hair-delta" | "hair-brush" | "groom-commit" | "groom-xform-delta" | "pose-delta" | "cache-delta" | "postfx-delta";
   sceneMs?: number;
   stepMs?: number;
   hairGroomDeltas?: Record<string, HairGroomDelta>;

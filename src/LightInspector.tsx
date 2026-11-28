@@ -1,6 +1,7 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import type { CameraWorldTransform, LightOverride, StoredProject } from "./fileRegistry";
+import { graphPreview, type CameraWorldTransform, type LightOverride, type StoredProject } from "./fileRegistry";
+import { sceneHierarchyKey } from "./previewTarget";
 import {
   DEFAULT_METERS_PER_UNIT,
   effectiveLightScale,
@@ -298,13 +299,34 @@ export function LightInspector({
   const [savingPreset, setSavingPreset] = useState(false);
   const [presetNameDraft, setPresetNameDraft] = useState("");
 
+  const projectRef = useRef(project);
+  projectRef.current = project;
+
+  const upstreamInspectKey = useMemo(() => {
+    const raw = graphPreview(project, nodeId);
+    if (!raw) return "";
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed?.nodes)) {
+        parsed.nodes = parsed.nodes.map((n: Record<string, unknown>) =>
+          n?.id === nodeId
+            ? { ...n, lightOverrides: null, scale: 1, lightIntensityScale: 1 }
+            : n,
+        );
+      }
+      return sceneHierarchyKey(JSON.stringify(parsed));
+    } catch {
+      return sceneHierarchyKey(raw);
+    }
+  }, [project, nodeId]);
+
   useEffect(() => {
     let active = true;
     async function loadLights() {
       setLoading(true);
       try {
         const res = (await invoke("inspect_stage_lights", {
-          project,
+          project: projectRef.current,
           nodeId,
         })) as { lights: DiscoveredLight[]; metersPerUnit?: number; upAxis?: string; sceneBounds?: SceneBounds | null };
         if (active && res) {
@@ -327,7 +349,7 @@ export function LightInspector({
     return () => {
       active = false;
     };
-  }, [project, nodeId]);
+  }, [upstreamInspectKey, nodeId]);
 
   const unitScale = effectiveLightScale(stageMetersPerUnit, sceneBounds);
   const linearStep = linearInputStep(stageMetersPerUnit, sceneBounds);
